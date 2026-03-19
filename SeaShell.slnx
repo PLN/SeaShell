@@ -1,0 +1,11 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/SeaShell.Cli/SeaShell.Cli.csproj" />
+    <Project Path="src/SeaShell.Daemon/SeaShell.Daemon.csproj" />
+    <Project Path="src/SeaShell.Elevator/SeaShell.Elevator.csproj" />
+    <Project Path="src/SeaShell.Engine/SeaShell.Engine.csproj" />
+    <Project Path="src/SeaShell.Host/SeaShell.Host.csproj" />
+    <Project Path="src/SeaShell.Protocol/SeaShell.Protocol.csproj" />
+    <Project Path="src/SeaShell.Script/SeaShell.Script.csproj" />
+  </Folder>
+</Solution>

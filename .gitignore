@@ -1,0 +1,13 @@
+bin/
+obj/
+.vs/
+*.user
+*.nupkg
+*.snupkg
+
+# Build artifacts
+/publish/
+/nupkg/
+
+# SeaShell temp/cache
+/tmp/

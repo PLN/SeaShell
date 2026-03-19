@@ -1,0 +1,9 @@
+<Project Sdk="Microsoft.NET.Sdk">
+	<!-- Runtime context for scripts. Loaded into every script process. Zero external deps. -->
+	<PropertyGroup>
+		<NoWarn>CA2255</NoWarn>
+		<Description>Runtime context library for SeaShell scripts. Provides the Sea static class with script identity, environment info, hot-swap lifecycle, and reload state.</Description>
+		<PackageTags>scripting;seashell;runtime;context</PackageTags>
+		<GenerateDocumentationFile>true</GenerateDocumentationFile>
+	</PropertyGroup>
+</Project>

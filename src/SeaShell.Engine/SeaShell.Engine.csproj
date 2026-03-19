@@ -1,0 +1,13 @@
+<Project Sdk="Microsoft.NET.Sdk">
+	<PropertyGroup>
+		<Description>SeaShell compilation engine. Roslyn-based C# and VB.NET compiler, NuGet resolver with transitive dependency resolution, .deps.json generation, and background package updater.</Description>
+		<PackageTags>scripting;seashell;roslyn;compiler;nuget;engine</PackageTags>
+		<GenerateDocumentationFile>true</GenerateDocumentationFile>
+		<NoWarn>CS1591</NoWarn>
+	</PropertyGroup>
+	<ItemGroup>
+		<PackageReference Include="Microsoft.CodeAnalysis.CSharp" Version="5.3.0" />
+		<PackageReference Include="Microsoft.CodeAnalysis.VisualBasic" Version="5.3.0" />
+		<PackageReference Include="Serilog" Version="4.3.1" />
+	</ItemGroup>
+</Project>

@@ -1,0 +1,17 @@
+<Project Sdk="Microsoft.NET.Sdk">
+	<PropertyGroup>
+		<OutputType>WinExe</OutputType>
+		<AssemblyName>seashell-daemon</AssemblyName>
+	</PropertyGroup>
+	<ItemGroup>
+		<ProjectReference Include="..\SeaShell.Protocol\SeaShell.Protocol.csproj" />
+		<ProjectReference Include="..\SeaShell.Engine\SeaShell.Engine.csproj" />
+		<ProjectReference Include="..\SeaShell.Script\SeaShell.Script.csproj" />
+	</ItemGroup>
+	<ItemGroup>
+		<PackageReference Include="Microsoft.CodeAnalysis.CSharp.Scripting" Version="5.3.0" />
+		<PackageReference Include="Serilog.Sinks.Console" Version="6.1.1" />
+		<PackageReference Include="Serilog.Sinks.EventLog" Version="4.0.0" />
+		<PackageReference Include="Serilog.Sinks.SyslogMessages" Version="4.1.0" />
+	</ItemGroup>
+</Project>

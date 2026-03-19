@@ -1,0 +1,9 @@
+<Project Sdk="Microsoft.NET.Sdk">
+	<!-- Shared IPC types and cross-platform transport. -->
+	<PropertyGroup>
+		<NoWarn>NU1510</NoWarn>
+	</PropertyGroup>
+	<ItemGroup>
+		<PackageReference Include="System.IO.Pipes.AccessControl" Version="5.0.0" />
+	</ItemGroup>
+</Project>

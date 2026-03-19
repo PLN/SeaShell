@@ -1,0 +1,16 @@
+<Project>
+	<PropertyGroup>
+		<TargetFramework>net10.0</TargetFramework>
+		<LangVersion>latest</LangVersion>
+		<Nullable>enable</Nullable>
+		<ImplicitUsings>disable</ImplicitUsings>
+		<Version>0.1.0</Version>
+
+		<!-- Shared NuGet metadata -->
+		<Authors>PLN;Claude (Anthropic)</Authors>
+		<PackageLicenseExpression>MIT</PackageLicenseExpression>
+		<PackageProjectUrl>https://github.com/PLN/SeaShell</PackageProjectUrl>
+		<RepositoryUrl>https://github.com/PLN/SeaShell</RepositoryUrl>
+		<RepositoryType>git</RepositoryType>
+	</PropertyGroup>
+</Project>
