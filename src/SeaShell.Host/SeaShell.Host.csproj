@@ -1,0 +1,12 @@
+<Project Sdk="Microsoft.NET.Sdk">
+	<PropertyGroup>
+		<Description>Embeddable C# and VB.NET scripting host. Compile and run scripts with full NuGet support, transitive dependency resolution, and runtime context. No daemon required.</Description>
+		<PackageTags>scripting;seashell;roslyn;host;csharp;vb;repl</PackageTags>
+		<GenerateDocumentationFile>true</GenerateDocumentationFile>
+		<NoWarn>CS1591</NoWarn>
+	</PropertyGroup>
+	<ItemGroup>
+		<ProjectReference Include="..\SeaShell.Engine\SeaShell.Engine.csproj" />
+		<ProjectReference Include="..\SeaShell.Script\SeaShell.Script.csproj" />
+	</ItemGroup>
+</Project>
