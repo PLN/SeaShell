@@ -1,5 +1,6 @@
 <Solution>
   <Folder Name="/src/">
+    <Project Path="src/SeaShell.Ipc/SeaShell.Ipc.csproj" />
     <Project Path="src/SeaShell.Cli/SeaShell.Cli.csproj" />
     <Project Path="src/SeaShell.Daemon/SeaShell.Daemon.csproj" />
     <Project Path="src/SeaShell.Elevator/SeaShell.Elevator.csproj" />

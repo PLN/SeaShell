@@ -1,5 +1,6 @@
 using System;
 using System.IO;
+using SeaShell.Ipc;
 using SeaShell.Protocol;
 using SeaShell.Cli;
 

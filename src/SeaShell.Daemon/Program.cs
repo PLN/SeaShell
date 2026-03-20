@@ -4,6 +4,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using Serilog;
 using Serilog.Events;
+using SeaShell.Ipc;
 using SeaShell.Protocol;
 using SeaShell.Daemon;
 
