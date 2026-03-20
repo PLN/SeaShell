@@ -5,12 +5,16 @@ using System.IO;
 using System.IO.Pipelines;
 using System.Threading;
 using System.Threading.Tasks;
+using MessagePack;
+using MessagePack.Resolvers;
 
 namespace SeaShell.Ipc;
 
 /// <summary>
-/// Bidirectional message channel over a stream, using System.IO.Pipelines for
-/// efficient buffered I/O. Wire format: 4-byte LE length prefix + Envelope JSON.
+/// Bidirectional binary message channel over a stream, using System.IO.Pipelines
+/// for efficient buffered I/O and MessagePack for serialization.
+///
+/// Wire format: [4-byte LE length][1-byte MessageType tag][MessagePack payload]
 ///
 /// Supports concurrent send + receive (PipeReader and PipeWriter are independent).
 /// A write lock prevents interleaved sends from concurrent callers.
@@ -23,8 +27,13 @@ public sealed class MessageChannel : IAsyncDisposable
 	private readonly bool _leaveOpen;
 	private readonly SemaphoreSlim _writeLock = new(1, 1);
 
-	private const int HeaderSize = 4;
+	private const int HeaderSize = 4; // length prefix
+	private const int TagSize = 1;    // MessageType byte
 	private const uint MaxMessageSize = 4 * 1024 * 1024; // 4 MB
+
+	private static readonly MessagePackSerializerOptions MsgPackOpts =
+		MessagePackSerializerOptions.Standard
+			.WithResolver(ContractlessStandardResolver.Instance);
 
 	public MessageChannel(Stream stream, bool leaveOpen = false)
 	{
@@ -34,19 +43,59 @@ public sealed class MessageChannel : IAsyncDisposable
 		_writer = PipeWriter.Create(stream, new StreamPipeWriterOptions(leaveOpen: true));
 	}
 
-	/// <summary>Send a typed message as a length-prefixed Envelope.</summary>
+	/// <summary>Send a typed message as a length-prefixed binary frame.</summary>
 	public async ValueTask SendAsync<T>(T message, CancellationToken ct = default) where T : notnull
 	{
-		var payload = Envelope.Wrap(message).ToBytes();
+		var tag = MessageTypeMap.GetTag<T>();
+		var payload = MessagePackSerializer.Serialize(message, MsgPackOpts, ct);
+
 		await _writeLock.WaitAsync(ct);
 		try
 		{
-			// Write header (4-byte LE length)
+			var frameLength = TagSize + payload.Length;
+
+			// Write header (4-byte LE length of tag + payload)
 			var header = _writer.GetMemory(HeaderSize);
-			BinaryPrimitives.WriteUInt32LittleEndian(header.Span, (uint)payload.Length);
+			BinaryPrimitives.WriteUInt32LittleEndian(header.Span, (uint)frameLength);
 			_writer.Advance(HeaderSize);
 
-			// Write payload
+			// Write type tag (1 byte)
+			var tagMem = _writer.GetMemory(TagSize);
+			tagMem.Span[0] = (byte)tag;
+			_writer.Advance(TagSize);
+
+			// Write MessagePack payload
+			var dest = _writer.GetMemory(payload.Length);
+			payload.CopyTo(dest);
+			_writer.Advance(payload.Length);
+
+			await _writer.FlushAsync(ct);
+		}
+		finally
+		{
+			_writeLock.Release();
+		}
+	}
+
+	/// <summary>Send a message using a runtime type (for forwarding).</summary>
+	public async ValueTask SendAsync(MessageType tag, object message, CancellationToken ct = default)
+	{
+		var clrType = MessageTypeMap.GetClrType(tag);
+		var payload = MessagePackSerializer.Serialize(clrType, message, MsgPackOpts, ct);
+
+		await _writeLock.WaitAsync(ct);
+		try
+		{
+			var frameLength = TagSize + payload.Length;
+
+			var header = _writer.GetMemory(HeaderSize);
+			BinaryPrimitives.WriteUInt32LittleEndian(header.Span, (uint)frameLength);
+			_writer.Advance(HeaderSize);
+
+			var tagMem = _writer.GetMemory(TagSize);
+			tagMem.Span[0] = (byte)tag;
+			_writer.Advance(TagSize);
+
 			var dest = _writer.GetMemory(payload.Length);
 			payload.CopyTo(dest);
 			_writer.Advance(payload.Length);
@@ -61,11 +110,11 @@ public sealed class MessageChannel : IAsyncDisposable
 
 	/// <summary>
 	/// Receive the next message. Returns null on clean disconnect.
+	/// The returned object is the deserialized message, cast based on MessageType.
 	/// </summary>
-	public async ValueTask<Envelope?> ReceiveAsync(CancellationToken ct = default)
+	public async ValueTask<(MessageType Type, object Message)?> ReceiveAsync(CancellationToken ct = default)
 	{
-		// Read until we have a complete message (header + payload)
-		uint payloadLength = 0;
+		uint frameLength = 0;
 		bool headerRead = false;
 
 		while (true)
@@ -81,54 +130,74 @@ public sealed class MessageChannel : IAsyncDisposable
 				if (buffer.Length < HeaderSize)
 				{
 					if (result.IsCompleted)
-						return null; // peer disconnected before header
+						return null;
 					_reader.AdvanceTo(buffer.Start, buffer.End);
 					continue;
 				}
 
-				// Parse header
 				Span<byte> headerBytes = stackalloc byte[HeaderSize];
 				buffer.Slice(0, HeaderSize).CopyTo(headerBytes);
-				payloadLength = BinaryPrimitives.ReadUInt32LittleEndian(headerBytes);
+				frameLength = BinaryPrimitives.ReadUInt32LittleEndian(headerBytes);
 
-				if (payloadLength > MaxMessageSize)
-					throw new InvalidOperationException($"Message too large: {payloadLength} bytes");
+				if (frameLength > MaxMessageSize)
+					throw new InvalidOperationException($"Message too large: {frameLength} bytes");
+				if (frameLength < TagSize)
+					throw new InvalidOperationException("Message frame too small for type tag");
 
 				headerRead = true;
 			}
 
-			var totalNeeded = HeaderSize + payloadLength;
+			var totalNeeded = HeaderSize + frameLength;
 			if (buffer.Length < totalNeeded)
 			{
 				if (result.IsCompleted)
-					return null; // peer disconnected mid-message
+					return null;
 				_reader.AdvanceTo(buffer.Start, buffer.End);
 				continue;
 			}
 
-			// Parse payload
-			var payloadSlice = buffer.Slice(HeaderSize, (int)payloadLength);
-			Envelope envelope;
-			if (payloadSlice.IsSingleSegment)
+			// Read type tag
+			var tagSlice = buffer.Slice(HeaderSize, TagSize);
+			Span<byte> tagByte = stackalloc byte[1];
+			tagSlice.CopyTo(tagByte);
+			var messageType = (MessageType)tagByte[0];
+
+			// Read MessagePack payload
+			var payloadLength = (int)frameLength - TagSize;
+			var payloadSlice = buffer.Slice(HeaderSize + TagSize, payloadLength);
+
+			object message;
+			if (MessageTypeMap.TryGetClrType(messageType, out var clrType))
 			{
-				envelope = Envelope.FromBytes(payloadSlice.FirstSpan);
+				ReadOnlyMemory<byte> payloadMemory;
+				if (payloadSlice.IsSingleSegment)
+				{
+					payloadMemory = payloadSlice.First;
+				}
+				else
+				{
+					payloadMemory = payloadSlice.ToArray();
+				}
+
+				message = MessagePackSerializer.Deserialize(clrType, payloadMemory, MsgPackOpts, ct)
+					?? throw new InvalidOperationException($"MessagePack deserialization returned null for {messageType}");
 			}
 			else
 			{
-				var temp = payloadSlice.ToArray();
-				envelope = Envelope.FromBytes(temp);
+				// Unknown type — return raw bytes so caller can decide
+				message = payloadSlice.ToArray();
 			}
 
 			_reader.AdvanceTo(buffer.GetPosition(totalNeeded));
-			return envelope;
+			return (messageType, message);
 		}
 	}
 
-	/// <summary>Receive and unwrap to the expected type. Returns default if disconnected.</summary>
+	/// <summary>Receive and cast to the expected type. Returns default if disconnected.</summary>
 	public async ValueTask<T?> ReceiveAsync<T>(CancellationToken ct = default) where T : class
 	{
-		var envelope = await ReceiveAsync(ct);
-		return envelope?.Unwrap<T>();
+		var result = await ReceiveAsync(ct);
+		return result?.Message as T;
 	}
 
 	public async ValueTask DisposeAsync()

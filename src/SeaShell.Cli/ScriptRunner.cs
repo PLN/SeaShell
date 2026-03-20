@@ -52,15 +52,15 @@ static class ScriptRunner
 		);
 
 		await using var conn = await TransportClient.ConnectAsync(daemonAddress);
-		await conn.SendAsync(Envelope.Wrap(request).ToBytes());
-		var replyBytes = await conn.ReceiveAsync();
-		if (replyBytes == null)
+		await conn.Channel.SendAsync(request);
+		var reply = await conn.Channel.ReceiveAsync();
+		if (reply == null)
 		{
 			Console.Error.WriteLine("sea: daemon disconnected");
 			return 1;
 		}
 
-		var response = Envelope.FromBytes(replyBytes).Unwrap<RunResponse>();
+		var response = (RunResponse)reply.Value.Message;
 		if (!response.Success)
 		{
 			Console.Error.WriteLine(response.Error);
@@ -216,7 +216,7 @@ static class ScriptRunner
 			// Single channel reader task — handles ScriptExit and ScriptState.
 			// This is the ONLY reader on the PipeReader to avoid concurrent read corruption.
 			var channelTask = ReceiveUntilExitOrStateAsync(scriptChannel);
-			var hotSwapTask = daemonConn.ReceiveAsync();
+			var hotSwapTask = daemonConn.Channel.ReceiveAsync().AsTask();
 
 			var completed = await Task.WhenAny(channelTask, hotSwapTask);
 
@@ -232,22 +232,21 @@ static class ScriptRunner
 			}
 
 			// Hot-swap: daemon sent new artifacts
-			var swapBytes = await hotSwapTask;
-			if (swapBytes == null)
+			var swapResult = await hotSwapTask;
+			if (swapResult == null)
 			{
 				Console.Error.WriteLine("sea: daemon disconnected during watch");
 				try { currentProc.Kill(entireProcessTree: false); } catch { }
 				return 1;
 			}
 
-			var envelope = Envelope.FromBytes(swapBytes);
-			if (envelope.Type != nameof(HotSwapNotify))
+			if (swapResult.Value.Type != MessageType.HotSwapNotify)
 			{
-				Console.Error.WriteLine($"sea: unexpected message during watch: {envelope.Type}");
+				Console.Error.WriteLine($"sea: unexpected message during watch: {swapResult.Value.Type}");
 				continue;
 			}
 
-			var notify = envelope.Unwrap<HotSwapNotify>();
+			var notify = (HotSwapNotify)swapResult.Value.Message;
 			reloadCount++;
 			Console.Error.WriteLine($"sea: reloading ({notify.Reason})...");
 
@@ -363,9 +362,9 @@ static class ScriptRunner
 			var msg = await channel.ReceiveAsync();
 			if (msg == null) return 1; // disconnected
 
-			if (msg.Type == nameof(ScriptExit))
+			if (msg.Value.Type == MessageType.ScriptExit)
 			{
-				var exit = msg.Unwrap<ScriptExit>();
+				var exit = (ScriptExit)msg.Value.Message;
 				LastExitDelay = exit.ExitDelay;
 				return exit.ExitCode;
 			}
@@ -381,15 +380,15 @@ static class ScriptRunner
 			var msg = await channel.ReceiveAsync();
 			if (msg == null) return (1, state);
 
-			if (msg.Type == nameof(ScriptExit))
+			if (msg.Value.Type == MessageType.ScriptExit)
 			{
-				var exit = msg.Unwrap<ScriptExit>();
+				var exit = (ScriptExit)msg.Value.Message;
 				LastExitDelay = exit.ExitDelay;
 				return (exit.ExitCode, state);
 			}
-			if (msg.Type == nameof(ScriptState))
+			if (msg.Value.Type == MessageType.ScriptState)
 			{
-				var s = msg.Unwrap<ScriptState>();
+				var s = (ScriptState)msg.Value.Message;
 				if (!string.IsNullOrEmpty(s.Data))
 					state = s.Data;
 			}

@@ -1,4 +1,4 @@
-// All message types and Envelope are now in SeaShell.Ipc.
+// All message types are in SeaShell.Ipc.
 // Re-exported here for backward compatibility with existing code
 // that uses `SeaShell.Protocol` namespace.
 

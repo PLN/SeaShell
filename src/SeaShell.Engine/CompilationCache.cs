@@ -28,7 +28,7 @@ static class CompilationCache
 			if (!string.IsNullOrEmpty(engineDll) && File.Exists(engineDll))
 				ticks += File.GetLastWriteTimeUtc(engineDll).Ticks;
 
-			foreach (var name in new[] { "SeaShell.Script.dll", "SeaShell.Ipc.dll" })
+			foreach (var name in new[] { "SeaShell.Script.dll", "SeaShell.Ipc.dll", "MessagePack.dll" })
 			{
 				var path = Path.Combine(AppContext.BaseDirectory, name);
 				if (File.Exists(path))

@@ -1,11 +1,14 @@
 <Project Sdk="Microsoft.NET.Sdk">
-	<!-- Shared IPC messaging: MessageChannel (System.IO.Pipelines), Envelope, message types.
-	     Zero NuGet dependencies — uses only BCL. Referenced by both Script and Protocol. -->
+	<!-- Shared IPC messaging: MessageChannel (System.IO.Pipelines + MessagePack), message types.
+	     Referenced by both Script and Protocol. -->
 	<PropertyGroup>
-		<Description>Shared IPC messaging infrastructure for SeaShell. Length-prefixed Envelope protocol over System.IO.Pipelines.</Description>
-		<PackageTags>ipc;messaging;pipelines;seashell</PackageTags>
+		<Description>Binary IPC messaging infrastructure for SeaShell. Length-prefixed MessagePack protocol over System.IO.Pipelines.</Description>
+		<PackageTags>ipc;messaging;pipelines;messagepack;seashell</PackageTags>
 		<PackageReadmeFile>README.md</PackageReadmeFile>
 	</PropertyGroup>
+	<ItemGroup>
+		<PackageReference Include="MessagePack" Version="3.1.3" />
+	</ItemGroup>
 	<ItemGroup>
 		<None Include="README.md" Pack="true" PackagePath="/" />
 	</ItemGroup>

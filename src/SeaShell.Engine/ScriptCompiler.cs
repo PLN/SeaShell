@@ -249,8 +249,8 @@ public sealed class ScriptCompiler
 		if (!File.Exists(depsPath))
 			DepsJsonWriter.Write(depsPath, assemblyName, resolvedPackages);
 
-		// Copy SeaShell.Script.dll and SeaShell.Ipc.dll to output dir (for runtime loading)
-		foreach (var dllName in new[] { "SeaShell.Script.dll", "SeaShell.Ipc.dll" })
+		// Copy SeaShell runtime DLLs to output dir (for runtime loading)
+		foreach (var dllName in new[] { "SeaShell.Script.dll", "SeaShell.Ipc.dll", "MessagePack.dll", "MessagePack.Annotations.dll" })
 		{
 			var src = Path.Combine(AppContext.BaseDirectory, dllName);
 			var dest = Path.Combine(outputDir, dllName);
@@ -342,8 +342,13 @@ public sealed class ScriptCompiler
 			}
 		}
 
-		// SeaShell runtime libraries — Sea static class + IPC messaging
-		foreach (var name in new[] { scriptAssemblyPath, Path.Combine(AppContext.BaseDirectory, "SeaShell.Ipc.dll") })
+		// SeaShell runtime libraries — Sea static class + IPC messaging + MessagePack
+		foreach (var name in new[] {
+			scriptAssemblyPath,
+			Path.Combine(AppContext.BaseDirectory, "SeaShell.Ipc.dll"),
+			Path.Combine(AppContext.BaseDirectory, "MessagePack.dll"),
+			Path.Combine(AppContext.BaseDirectory, "MessagePack.Annotations.dll"),
+		})
 		{
 			if (File.Exists(name))
 			{

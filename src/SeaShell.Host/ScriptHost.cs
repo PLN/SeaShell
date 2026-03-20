@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.IO.Pipes;
+using System.Text;
 using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
@@ -57,13 +58,14 @@ public sealed class ScriptHost
 		string[]? args = null,
 		string? workingDirectory = null,
 		Dictionary<string, string>? environmentVars = null,
+		ScriptConnection? connection = null,
 		CancellationToken ct = default)
 	{
 		var compiled = _compiler.Compile(scriptPath, args ?? Array.Empty<string>());
 		if (!compiled.Success)
 			return new ScriptResult(-1, "", compiled.Error ?? "Compilation failed");
 
-		return await ExecuteAsync(compiled, args, workingDirectory, environmentVars, ct);
+		return await ExecuteAsync(compiled, args, workingDirectory, environmentVars, connection, ct);
 	}
 
 	/// <summary>
@@ -74,6 +76,7 @@ public sealed class ScriptHost
 		string[]? args = null,
 		string? workingDirectory = null,
 		Dictionary<string, string>? environmentVars = null,
+		ScriptConnection? connection = null,
 		CancellationToken ct = default)
 	{
 		var tempDir = Path.Combine(Path.GetTempPath(), "seashell", "snippets");
@@ -83,7 +86,7 @@ public sealed class ScriptHost
 		try
 		{
 			File.WriteAllText(tempFile, code);
-			return await RunAsync(tempFile, args, workingDirectory, environmentVars, ct);
+			return await RunAsync(tempFile, args, workingDirectory, environmentVars, connection, ct);
 		}
 		finally
 		{
@@ -100,6 +103,7 @@ public sealed class ScriptHost
 		string[]? args = null,
 		string? workingDirectory = null,
 		Dictionary<string, string>? environmentVars = null,
+		ScriptConnection? connection = null,
 		CancellationToken ct = default)
 	{
 		if (!compiled.Success)
@@ -150,6 +154,10 @@ public sealed class ScriptHost
 		pipe.Connect(5000);
 		await using var channel = new MessageChannel(pipe);
 
+		// Wire up ScriptConnection
+		if (connection != null)
+			connection.Channel = channel;
+
 		// Send ScriptInit with manifest data
 		await channel.SendAsync(BuildScriptInit(compiled, args, workingDirectory), ct);
 
@@ -157,12 +165,16 @@ public sealed class ScriptHost
 		// Must drain the channel to unblock the script's ProcessExit flush.
 		var stdoutTask = proc.StandardOutput.ReadToEndAsync(ct);
 		var stderrTask = proc.StandardError.ReadToEndAsync(ct);
-		var channelTask = DrainChannelAsync(channel, ct);
+		var channelTask = DrainChannelAsync(channel, connection, ct);
 
 		await proc.WaitForExitAsync(ct);
 
 		var stdout = await stdoutTask;
 		var stderr = await stderrTask;
+
+		// Disconnect ScriptConnection
+		if (connection != null)
+			connection.Channel = null;
 
 		return new ScriptResult(proc.ExitCode, stdout, stderr);
 	}
@@ -202,7 +214,7 @@ public sealed class ScriptHost
 			false, 0, 0, null, false);
 	}
 
-	private static async Task DrainChannelAsync(MessageChannel channel, CancellationToken ct)
+	private static async Task DrainChannelAsync(MessageChannel channel, ScriptConnection? connection, CancellationToken ct)
 	{
 		try
 		{
@@ -210,6 +222,12 @@ public sealed class ScriptHost
 			{
 				var msg = await channel.ReceiveAsync(ct);
 				if (msg == null) break;
+
+				if (msg.Value.Type == MessageType.ScriptMessage && connection != null)
+				{
+					var sm = (ScriptMessage)msg.Value.Message;
+					try { connection.RaiseMessageReceived(sm.Payload, sm.Topic); } catch { }
+				}
 			}
 		}
 		catch { }
@@ -247,5 +265,38 @@ public sealed class ScriptHost
 		string StandardError)
 	{
 		public bool Success => ExitCode == 0;
+	}
+
+	// ── ScriptConnection ────────────────────────────────────────────────
+
+	/// <summary>
+	/// Bidirectional application messaging between Host and Script.
+	/// Create an instance, subscribe to MessageReceived, and pass it to
+	/// ExecuteAsync/RunAsync/RunSnippetAsync.
+	/// </summary>
+	public sealed class ScriptConnection
+	{
+		/// <summary>
+		/// Fires when the script sends an application message.
+		/// Parameters: payload (raw bytes), topic (optional routing key).
+		/// Called on the channel-drain thread.
+		/// </summary>
+		public event Action<byte[], string?>? MessageReceived;
+
+		internal MessageChannel? Channel;
+
+		/// <summary>Send a binary message to the running script.</summary>
+		public async Task SendAsync(byte[] payload, string? topic = null, CancellationToken ct = default)
+		{
+			var ch = Channel ?? throw new InvalidOperationException("Script is not connected");
+			await ch.SendAsync(new HostMessage(payload, topic), ct);
+		}
+
+		/// <summary>Send a string message (UTF-8) to the running script.</summary>
+		public async Task SendAsync(string payload, string? topic = null, CancellationToken ct = default) =>
+			await SendAsync(Encoding.UTF8.GetBytes(payload), topic, ct);
+
+		internal void RaiseMessageReceived(byte[] payload, string? topic) =>
+			MessageReceived?.Invoke(payload, topic);
 	}
 }

@@ -1,6 +1,102 @@
+using System;
 using System.Collections.Generic;
 
 namespace SeaShell.Ipc;
+
+// ── Wire type tags ─────────────────────────────────────────────────────
+
+/// <summary>
+/// 1-byte type discriminator on the wire.
+/// Format: [4-byte LE length][1-byte MessageType][MessagePack payload]
+/// </summary>
+public enum MessageType : byte
+{
+	// Script pipe (launcher ↔ script)
+	ScriptInit    = 1,
+	ScriptReload  = 2,
+	ScriptStop    = 3,
+	ScriptExit    = 4,
+	ScriptState   = 5,
+	HostMessage   = 6,
+	ScriptMessage = 7,
+
+	// Daemon protocol (CLI ↔ daemon)
+	PingRequest     = 20,
+	PingResponse    = 21,
+	StopRequest     = 22,
+	RunRequest      = 23,
+	RunResponse     = 24,
+	HotSwapNotify   = 25,
+	ReplStartReq    = 26,
+	ReplStartResp   = 27,
+	ReplEvalReq     = 28,
+	ReplEvalResp    = 29,
+
+	// Elevator protocol (daemon ↔ elevator)
+	ElevatorHello   = 40,
+	ElevatorAck     = 41,
+	SpawnRequest    = 42,
+	SpawnResponse   = 43,
+}
+
+// ── Type ↔ Tag mapping ─────────────────────────────────────────────────
+
+/// <summary>
+/// Bidirectional lookup between CLR types and MessageType wire tags.
+/// </summary>
+public static class MessageTypeMap
+{
+	private static readonly Dictionary<Type, MessageType> _typeToTag = new()
+	{
+		[typeof(ScriptInit)]      = MessageType.ScriptInit,
+		[typeof(ScriptReload)]    = MessageType.ScriptReload,
+		[typeof(ScriptStop)]      = MessageType.ScriptStop,
+		[typeof(ScriptExit)]      = MessageType.ScriptExit,
+		[typeof(ScriptState)]     = MessageType.ScriptState,
+		[typeof(HostMessage)]     = MessageType.HostMessage,
+		[typeof(ScriptMessage)]   = MessageType.ScriptMessage,
+		[typeof(PingRequest)]     = MessageType.PingRequest,
+		[typeof(PingResponse)]    = MessageType.PingResponse,
+		[typeof(StopRequest)]     = MessageType.StopRequest,
+		[typeof(RunRequest)]      = MessageType.RunRequest,
+		[typeof(RunResponse)]     = MessageType.RunResponse,
+		[typeof(HotSwapNotify)]   = MessageType.HotSwapNotify,
+		[typeof(ReplStartRequest)]  = MessageType.ReplStartReq,
+		[typeof(ReplStartResponse)] = MessageType.ReplStartResp,
+		[typeof(ReplEvalRequest)]   = MessageType.ReplEvalReq,
+		[typeof(ReplEvalResponse)]  = MessageType.ReplEvalResp,
+		[typeof(ElevatorHello)]   = MessageType.ElevatorHello,
+		[typeof(ElevatorAck)]     = MessageType.ElevatorAck,
+		[typeof(SpawnRequest)]    = MessageType.SpawnRequest,
+		[typeof(SpawnResponse)]   = MessageType.SpawnResponse,
+	};
+
+	private static readonly Dictionary<MessageType, Type> _tagToType = new();
+
+	static MessageTypeMap()
+	{
+		foreach (var (type, tag) in _typeToTag)
+			_tagToType[tag] = type;
+	}
+
+	public static MessageType GetTag<T>() =>
+		_typeToTag.TryGetValue(typeof(T), out var tag)
+			? tag
+			: throw new InvalidOperationException($"No MessageType tag registered for {typeof(T).Name}");
+
+	public static MessageType GetTag(Type type) =>
+		_typeToTag.TryGetValue(type, out var tag)
+			? tag
+			: throw new InvalidOperationException($"No MessageType tag registered for {type.Name}");
+
+	public static Type GetClrType(MessageType tag) =>
+		_tagToType.TryGetValue(tag, out var type)
+			? type
+			: throw new InvalidOperationException($"Unknown MessageType tag: {(byte)tag}");
+
+	public static bool TryGetClrType(MessageType tag, out Type type) =>
+		_tagToType.TryGetValue(tag, out type!);
+}
 
 // ── Launcher ↔ Script (over the script pipe) ────────────────────────────
 
@@ -30,6 +126,12 @@ public sealed record ScriptExit(int ExitCode, int ExitDelay);
 
 /// <summary>Script → Launcher: reload state (response to ScriptReload).</summary>
 public sealed record ScriptState(string? Data);
+
+/// <summary>Launcher → Script: application message during execution.</summary>
+public sealed record HostMessage(byte[] Payload, string? Topic);
+
+/// <summary>Script → Launcher: application message during execution.</summary>
+public sealed record ScriptMessage(byte[] Payload, string? Topic);
 
 // ── CLI → Daemon ────────────────────────────────────────────────────────
 
