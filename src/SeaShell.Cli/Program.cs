@@ -26,6 +26,10 @@ if (args.Length > 0 && args[0] is "--help" or "-h")
 	Console.WriteLine("  --start               Start registered tasks");
 	Console.WriteLine("  --stop                Stop registered tasks");
 	Console.WriteLine();
+	Console.WriteLine("  File association (Windows):");
+	Console.WriteLine("  --associate [.ext]    Associate extension with sea (default: .cs)");
+	Console.WriteLine("  --unassociate [.ext]  Remove association");
+	Console.WriteLine();
 	Console.WriteLine("  Dev/debug:");
 	Console.WriteLine("  --daemon-start        Start daemon directly");
 	Console.WriteLine("  --daemon-stop         Stop daemon via pipe");
@@ -65,6 +69,12 @@ switch (args[0])
 		return ScheduledTasks.UninstallDaemon();
 	case "--uninstall-elevator":
 		return ScheduledTasks.UninstallElevator();
+	case "--associate":
+		var ext = args.Length > 1 ? args[1] : ".cs";
+		return FileAssoc.Associate(ext);
+	case "--unassociate":
+		var uext = args.Length > 1 ? args[1] : ".cs";
+		return FileAssoc.Unassociate(uext);
 }
 
 // ── Run script ──────────────────────────────────────────────────────────
