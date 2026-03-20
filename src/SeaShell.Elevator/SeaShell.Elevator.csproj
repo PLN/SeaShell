@@ -2,6 +2,7 @@
 	<PropertyGroup>
 		<OutputType>WinExe</OutputType>
 		<AssemblyName>seashell-elevator</AssemblyName>
+		<ApplicationIcon>..\..\content\icon\seashell-dark.ico</ApplicationIcon>
 	</PropertyGroup>
 	<ItemGroup>
 		<ProjectReference Include="..\SeaShell.Protocol\SeaShell.Protocol.csproj" />

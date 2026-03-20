@@ -2,6 +2,7 @@
 	<PropertyGroup>
 		<OutputType>Exe</OutputType>
 		<AssemblyName>sea</AssemblyName>
+		<ApplicationIcon>..\..\content\icon\seashell-dark.ico</ApplicationIcon>
 		<PackageId>SeaShell</PackageId>
 		<PackAsTool>true</PackAsTool>
 		<ToolCommandName>sea</ToolCommandName>
