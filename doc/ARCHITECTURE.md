@@ -55,24 +55,37 @@ SeaShell has five components that communicate over platform-native IPC:
 
 There are two distinct IPC layers:
 
-### 1. Daemon protocol (TransportStream)
+Both layers use the same binary wire format:
 
-CLI ↔ Daemon and Daemon ↔ Elevator communication. Length-prefixed JSON envelopes
-over named pipes (Windows) or Unix domain sockets (Linux). Defined in `SeaShell.Protocol`.
+```
+[4-byte LE length][1-byte MessageType tag][MessagePack payload]
+```
+
+`MessageType` is a byte enum. MessagePack (contractless resolver) serializes plain C# records
+without attributes. `byte[]` fields are native binary — no Base64 encoding.
+
+### 1. Daemon protocol
+
+CLI ↔ Daemon and Daemon ↔ Elevator communication. `TransportStream` wraps platform IPC
+(named pipes on Windows, Unix domain sockets on Linux) and exposes a `MessageChannel`.
+Defined in `SeaShell.Protocol`.
 
 Messages: `RunRequest`/`RunResponse`, `PingRequest`/`PingResponse`, `HotSwapNotify`,
 `SpawnRequest`/`SpawnResponse`, `ElevatorHello`/`ElevatorAck`, `ReplStartRequest`/`ReplEvalRequest`.
 
-### 2. Script pipe (MessageChannel)
+### 2. Script pipe
 
 Launcher ↔ Script communication. Bidirectional named pipe with the script as server
-and the CLI (or Host) as client. Uses `MessageChannel` from `SeaShell.Ipc` —
-`PipeReader`/`PipeWriter` with 4-byte length-prefixed `Envelope` framing.
+and the CLI (or Host) as client. Uses `MessageChannel` from `SeaShell.Ipc`.
 
-Messages: `ScriptInit`, `ScriptReload`, `ScriptStop`, `ScriptExit`, `ScriptState`.
+Messages: `ScriptInit`, `ScriptReload`, `ScriptStop`, `ScriptExit`, `ScriptState`,
+`HostMessage`, `ScriptMessage`.
 
 The script creates the pipe server with a GUID-based name passed via the `SEASHELL_PIPE`
 environment variable. The launcher connects as client after spawning the process.
+
+`HostMessage`/`ScriptMessage` enable bidirectional application messaging between
+Host and Script during execution. Binary `byte[]` payload with optional topic routing.
 
 ## Compilation Pipeline
 

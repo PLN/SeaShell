@@ -1,5 +1,24 @@
 # History
 
+## v0.1.2 (2026-03-20)
+
+**Binary IPC and Host↔Script messaging.**
+
+- **Binary wire format** — Replaced JSON Envelope framing with binary MessagePack
+  serialization. Wire format: `[4-byte LE length][1-byte type tag][MessagePack payload]`.
+  `MessageType` byte enum replaces string-based type discrimination.
+- **MessagePack** — Contractless resolver (plain C# records, no attributes). Zero-copy
+  `byte[]` payloads, no Base64 encoding for binary data. ~2-10x faster than JSON.
+- **Host↔Script messaging** — New `HostMessage`/`ScriptMessage` records with binary payload
+  and optional topic. `Sea.MessageReceived` event + `Sea.SendMessage`/`SendMessageAsync` on
+  the script side. `ScriptHost.ScriptConnection` with event-based receive + `SendAsync` on
+  the Host side. CLI silently ignores script messages.
+- **TransportStream simplified** — Now a thin wrapper exposing `MessageChannel`. Raw
+  `SendAsync(byte[])`/`ReceiveAsync()` replaced with typed binary messaging.
+- **`Envelope.cs` deleted** — All JSON serialization removed from IPC layer.
+- **GitHub Actions CI** — Build + smoke tests on Windows and Linux. Tag-triggered
+  NuGet publish (`v*` tags push to nuget.org).
+
 ## v0.1.1 (2026-03-20)
 
 **Unified IPC and branding.**

@@ -1,5 +1,7 @@
 # {~} SeaShell
 
+[![CI](https://github.com/PLN/SeaShell/actions/workflows/ci.yml/badge.svg)](https://github.com/PLN/SeaShell/actions/workflows/ci.yml)
+
 A C# and VB.NET scripting engine with a persistent daemon, NuGet support, hot-swap, REPL, and an embeddable host library. Built on Roslyn.
 
 ## Install
@@ -112,6 +114,12 @@ Sea.SetReloadState(bytes)       // Pass state to next instance
 Sea.SetReloadState(string)      // String convenience overload
 Sea.GetReloadState()            // Retrieve state from previous instance
 Sea.GetReloadStateString()      // String convenience overload
+
+// Host↔Script messaging (when running via ScriptHost)
+Sea.MessageReceived             // Event: Host sent a message (byte[] payload, string? topic)
+Sea.SendMessage(bytes, topic)   // Send binary message to Host
+Sea.SendMessage(string, topic)  // Send string message to Host (UTF-8)
+Sea.SendMessageAsync(...)       // Async variants
 ```
 
 ## Hot-Swap Example
@@ -161,6 +169,28 @@ await updater.CheckForUpdatesAsync();
 
 `Sea.IsConsoleEphemeral` is always `false` when running via Host. `Sea.ExitDelay` has no effect — the Host does not perform exit delays.
 
+### Host↔Script Messaging
+
+The Host and script can exchange binary messages during execution over the existing pipe:
+
+```csharp
+var conn = new ScriptHost.ScriptConnection();
+conn.MessageReceived += (payload, topic) =>
+    Console.WriteLine($"Script [{topic}]: {Encoding.UTF8.GetString(payload)}");
+
+var result = await host.RunAsync("script.cs", connection: conn);
+```
+
+Script side:
+```csharp
+Sea.MessageReceived += (payload, topic) =>
+    Sea.SendMessage("acknowledged", "reply");
+
+Sea.SendMessage("{\"status\":\"ready\"}", "status");
+```
+
+Messages are binary (`byte[]`) with an optional `string` topic for routing. String convenience overloads encode as UTF-8.
+
 ## Task Scheduler (Windows)
 
 Register the daemon and optionally the elevator for automatic startup. Each is a separate, explicit registration:
@@ -185,7 +215,7 @@ SeaShell.Daemon    Persistent compilation server, REPL host, file watcher
 SeaShell.Elevator  Pre-elevated worker (connects to daemon, no public pipe)
 SeaShell.Engine    Roslyn compiler, NuGet resolver, include system, .deps.json writer
 SeaShell.Script    Sea runtime context (loaded into every script process)
-SeaShell.Ipc       Shared message types + MessageChannel (System.IO.Pipelines)
+SeaShell.Ipc       Binary IPC: MessageChannel (MessagePack over System.IO.Pipelines)
 SeaShell.Protocol  Daemon/Elevator protocol messages + transport (named pipes / UDS)
 SeaShell.Host      Embeddable library for other applications
 ```
