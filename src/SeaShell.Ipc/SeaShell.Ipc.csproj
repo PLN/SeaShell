@@ -4,5 +4,9 @@
 	<PropertyGroup>
 		<Description>Shared IPC messaging infrastructure for SeaShell. Length-prefixed Envelope protocol over System.IO.Pipelines.</Description>
 		<PackageTags>ipc;messaging;pipelines;seashell</PackageTags>
+		<PackageReadmeFile>README.md</PackageReadmeFile>
 	</PropertyGroup>
+	<ItemGroup>
+		<None Include="README.md" Pack="true" PackagePath="/" />
+	</ItemGroup>
 </Project>
