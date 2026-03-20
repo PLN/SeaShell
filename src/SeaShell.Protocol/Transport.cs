@@ -9,6 +9,8 @@ using System.Security.Principal;
 using System.Threading;
 using System.Threading.Tasks;
 
+using SeaShell.Ipc;
+
 namespace SeaShell.Protocol;
 
 // ── Abstract transport ──────────────────────────────────────────────────

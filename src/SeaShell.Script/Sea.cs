@@ -2,13 +2,12 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.IO.Pipes;
-using System.Linq;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Security.Principal;
 using System.Text;
-using System.Text.Json;
 using System.Threading;
+using SeaShell.Ipc;
 
 namespace SeaShell;
 
@@ -106,9 +105,9 @@ public static class Sea
 	public static CancellationToken ShutdownToken => _shutdownCts.Token;
 
 	private static readonly CancellationTokenSource _shutdownCts = new();
-	private static Thread? _controlThread;
-	private static BinaryWriter? _controlWriter;
-	private static bool _stateSent;
+	private static MessageChannel? _channel;
+	private static Thread? _receiveThread;
+	private static byte[]? _reloadState;
 	private const int MaxStateSize = 8192;
 
 	/// <summary>
@@ -120,8 +119,7 @@ public static class Sea
 	{
 		if (state.Length > MaxStateSize)
 			throw new ArgumentException($"Reload state too large: {state.Length} bytes (max {MaxStateSize})");
-		_stateSent = true;
-		try { _controlWriter?.Write(state.Length); _controlWriter?.Write(state); _controlWriter?.Flush(); }
+		try { _channel?.SendAsync(new ScriptState(Convert.ToBase64String(state))).AsTask().GetAwaiter().GetResult(); }
 		catch { }
 	}
 
@@ -136,12 +134,7 @@ public static class Sea
 	/// Retrieve state passed from the previous instance via SetReloadState().
 	/// Returns null on first run or if no state was passed.
 	/// </summary>
-	public static byte[]? GetReloadState()
-	{
-		var path = Environment.GetEnvironmentVariable("SEASHELL_STATE");
-		if (string.IsNullOrEmpty(path) || !File.Exists(path)) return null;
-		try { return File.ReadAllBytes(path); } catch { return null; }
-	}
+	public static byte[]? GetReloadState() => _reloadState;
 
 	/// <summary>
 	/// Retrieve string state passed from the previous instance.
@@ -155,97 +148,95 @@ public static class Sea
 
 	// ── Initialization ──────────────────────────────────────────────────
 
+	private static bool _initialized;
+
+	/// <summary>
+	/// Called by the script assembly's module initializer (_SeaShellBoot) to guarantee
+	/// initialization runs before any script code, regardless of whether the script
+	/// references Sea.* types directly.
+	/// </summary>
+	public static void EnsureInitialized()
+	{
+		if (_initialized) return;
+		Initialize();
+	}
+
 	[ModuleInitializer]
 	internal static void Initialize()
 	{
+		if (_initialized) return;
+		_initialized = true;
+
 		IsElevated = CheckElevation();
-		// The CLI is the single source of truth — it checks GetConsoleProcessList
-		// before spawning us and passes the result. We can't check ourselves
-		// because as a child process we inflate the console process count.
-		IsConsoleEphemeral = Environment.GetEnvironmentVariable("SEASHELL_CONSOLE_EPHEMERAL") == "1";
 
-		// Script args passed by CLI via env var (manifest is compile-time, doesn't know runtime args)
-		var argsEnv = Environment.GetEnvironmentVariable("SEASHELL_ARGS");
-		if (!string.IsNullOrEmpty(argsEnv))
-			Args = argsEnv.Split('\n', StringSplitOptions.RemoveEmptyEntries);
+		// Elevated scripts spawned by the Elevator: attach to the CLI's console
+		// so Console.Title, stdout, stderr all target the correct window.
+		var cliPidStr = Environment.GetEnvironmentVariable("SEASHELL_CLI_PID");
+		if (int.TryParse(cliPidStr, out var cliPid) && cliPid > 0
+			&& RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+		{
+			FreeConsole();
+			if (!AttachConsole((uint)cliPid))
+				AllocConsole(); // fallback: at least get a console
+		}
 
-		// Write ExitDelay for the CLI to read after we exit
-		AppDomain.CurrentDomain.ProcessExit += (_, _) =>
+		// Create pipe server — the launcher (CLI or Host) connects as client.
+		var pipeName = Environment.GetEnvironmentVariable("SEASHELL_PIPE");
+		if (!string.IsNullOrEmpty(pipeName))
 		{
 			try
 			{
-				var mp = Environment.GetEnvironmentVariable("SEASHELL_MANIFEST");
-				if (!string.IsNullOrEmpty(mp))
-					File.WriteAllText(mp + ".exitdelay", ExitDelay.ToString());
+				var pipe = CreateServerPipe(pipeName);
+				pipe.WaitForConnection();
+				_channel = new MessageChannel(pipe);
+
+				// Receive ScriptInit (first message, blocks until CLI sends it)
+				var init = _channel.ReceiveAsync<ScriptInit>().AsTask().GetAwaiter().GetResult();
+				if (init != null)
+					ApplyInit(init);
+
+				// Send ScriptExit when process exits
+				AppDomain.CurrentDomain.ProcessExit += (_, _) =>
+				{
+					try { _channel.SendAsync(new ScriptExit(Environment.ExitCode, ExitDelay)).AsTask().GetAwaiter().GetResult(); }
+					catch { }
+				};
+
+				// Background receive loop for ScriptReload/ScriptStop
+				_receiveThread = new Thread(ReceiveLoop)
+				{
+					IsBackground = true,
+					Name = "SeaShell.Channel",
+				};
+				_receiveThread.Start();
 			}
-			catch { }
-		};
-
-		// Load manifest
-		var manifestPath = Environment.GetEnvironmentVariable("SEASHELL_MANIFEST");
-		if (!string.IsNullOrEmpty(manifestPath) && File.Exists(manifestPath))
-		{
-			try
+			catch
 			{
-				var json = File.ReadAllText(manifestPath);
-				var manifest = JsonSerializer.Deserialize<ScriptManifest>(json, ManifestJsonOpts);
-				if (manifest != null)
-					ApplyManifest(manifest);
+				// Pipe connection failed — script runs without launcher communication.
 			}
-			catch { }
-		}
-
-		// Hot-swap metadata from env vars (set by CLI on reload)
-		var reloadStr = Environment.GetEnvironmentVariable("SEASHELL_RELOAD_COUNT");
-		if (int.TryParse(reloadStr, out var count) && count > 0)
-		{
-			IsReload = true;
-			ReloadCount = count;
-		}
-
-		// Connect to CLI's control pipe for reload/stop signals
-		var controlPipe = Environment.GetEnvironmentVariable("SEASHELL_CONTROL");
-		if (!string.IsNullOrEmpty(controlPipe))
-		{
-			_controlThread = new Thread(() => ControlPipeLoop(controlPipe))
-			{
-				IsBackground = true,
-				Name = "SeaShell.Control",
-			};
-			_controlThread.Start();
 		}
 	}
 
-	// ── Control pipe ────────────────────────────────────────────────────
+	// ── Receive loop ────────────────────────────────────────────────────
 
-	private static void ControlPipeLoop(string pipeName)
+	private static void ReceiveLoop()
 	{
 		try
 		{
-			using var pipe = new NamedPipeClientStream(".", pipeName, PipeDirection.InOut);
-			pipe.Connect(5000);
-
-			var reader = new StreamReader(pipe, Encoding.UTF8);
-			_controlWriter = new BinaryWriter(pipe, Encoding.UTF8, leaveOpen: true);
-
 			while (!IsShuttingDown)
 			{
-				var line = reader.ReadLine();
-				if (line == null) break; // pipe closed
+				var envelope = _channel!.ReceiveAsync().AsTask().GetAwaiter().GetResult();
+				if (envelope == null) break; // disconnected
 
-				switch (line.Trim().ToUpperInvariant())
+				switch (envelope.Type)
 				{
-					case "RELOAD":
+					case nameof(ScriptReload):
 						IsShuttingDown = true;
 						_shutdownCts.Cancel();
-						_stateSent = false;
 						try { Reloading?.Invoke(); } catch { }
-						// If the handler didn't call SetReloadState, send zero-length to unblock CLI
-						if (!_stateSent)
-							try { _controlWriter.Write(0); _controlWriter.Flush(); } catch { }
 						break;
 
-					case "STOP":
+					case nameof(ScriptStop):
 						IsShuttingDown = true;
 						_shutdownCts.Cancel();
 						try { Stopping?.Invoke(); } catch { }
@@ -255,27 +246,77 @@ public static class Sea
 		}
 		catch
 		{
-			// Control pipe failed — script runs without hot-swap support.
-			// This is fine for scripts started directly (not via watch mode).
+			// Channel error — script continues without signal support.
 		}
 	}
 
-	// ── Manifest ────────────────────────────────────────────────────────
+	// ── Pipe creation ───────────────────────────────────────────────────
 
-	private static void ApplyManifest(ScriptManifest m)
+	private static NamedPipeServerStream CreateServerPipe(string pipeName)
 	{
-		if (!string.IsNullOrEmpty(m.ScriptPath))
-			ScriptPath = m.ScriptPath;
-		if (!string.IsNullOrEmpty(m.StartDir))
-			StartDir = m.StartDir;
-		if (m.Args != null)
-			Args = m.Args;
-		if (m.Sources != null)
-			Sources = m.Sources;
-		if (m.Packages != null)
-			Packages = m.Packages;
-		if (m.Assemblies != null)
-			Assemblies = m.Assemblies;
+		if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+		{
+			// Explicit ACL: allow the current user full access regardless of
+			// integrity level. Elevated scripts run as the same user as the
+			// non-elevated CLI, so current-user ACL works across elevation.
+			var security = new PipeSecurity();
+			security.AddAccessRule(new PipeAccessRule(
+				WindowsIdentity.GetCurrent().User!,
+				PipeAccessRights.FullControl,
+				System.Security.AccessControl.AccessControlType.Allow));
+			return NamedPipeServerStreamAcl.Create(
+				pipeName, PipeDirection.InOut, 1,
+				PipeTransmissionMode.Byte, PipeOptions.Asynchronous, 0, 0, security);
+		}
+
+		var pipe = new NamedPipeServerStream(pipeName, PipeDirection.InOut, 1,
+			PipeTransmissionMode.Byte, PipeOptions.Asynchronous);
+
+		// Restrict socket to owner only (matches daemon security model)
+		if (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+		{
+			try
+			{
+				var socketPath = Path.Combine(Path.GetTempPath(), $"CoreFxPipe_{pipeName}");
+				if (File.Exists(socketPath))
+					File.SetUnixFileMode(socketPath, UnixFileMode.UserRead | UnixFileMode.UserWrite);
+			}
+			catch { }
+		}
+
+		return pipe;
+	}
+
+	// ── Init ────────────────────────────────────────────────────────────
+
+	private static void ApplyInit(ScriptInit init)
+	{
+		if (!string.IsNullOrEmpty(init.ScriptPath))
+			ScriptPath = init.ScriptPath;
+		if (!string.IsNullOrEmpty(init.StartDir))
+			StartDir = init.StartDir;
+		if (init.Args != null)
+			Args = init.Args;
+		if (init.Sources != null)
+			Sources = init.Sources;
+		if (init.Packages != null)
+			Packages = init.Packages;
+		if (init.Assemblies != null)
+			Assemblies = init.Assemblies;
+
+		IsConsoleEphemeral = init.IsConsoleEphemeral;
+
+		if (init.ReloadCount > 0)
+		{
+			IsReload = true;
+			ReloadCount = init.ReloadCount;
+		}
+
+		if (!string.IsNullOrEmpty(init.State))
+		{
+			try { _reloadState = Convert.FromBase64String(init.State); }
+			catch { }
+		}
 	}
 
 	private static bool CheckElevation()
@@ -289,21 +330,17 @@ public static class Sea
 		return Environment.UserName == "root" || GetEuid() == 0;
 	}
 
+	// ── P/Invoke ────────────────────────────────────────────────────────
+
 	[DllImport("libc", EntryPoint = "geteuid", SetLastError = true)]
 	private static extern uint GetEuid();
 
-	private static readonly JsonSerializerOptions ManifestJsonOpts = new()
-	{
-		PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
-	};
+	[DllImport("kernel32.dll", SetLastError = true)]
+	private static extern bool FreeConsole();
 
-	internal sealed class ScriptManifest
-	{
-		public string? ScriptPath { get; set; }
-		public string? StartDir { get; set; }
-		public string[]? Args { get; set; }
-		public string[]? Sources { get; set; }
-		public Dictionary<string, string>? Packages { get; set; }
-		public string[]? Assemblies { get; set; }
-	}
+	[DllImport("kernel32.dll", SetLastError = true)]
+	private static extern bool AttachConsole(uint dwProcessId);
+
+	[DllImport("kernel32.dll", SetLastError = true)]
+	private static extern bool AllocConsole();
 }

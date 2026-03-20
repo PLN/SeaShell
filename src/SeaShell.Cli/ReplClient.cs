@@ -1,5 +1,6 @@
 using System;
 using System.Threading.Tasks;
+using SeaShell.Ipc;
 using SeaShell.Protocol;
 
 namespace SeaShell.Cli;

@@ -1,11 +1,11 @@
 using System;
 using System.Diagnostics;
-using System.IO;
 using System.Runtime.InteropServices;
 using System.Security.Principal;
 using System.Threading;
 using System.Threading.Tasks;
 using Serilog;
+using SeaShell.Ipc;
 using SeaShell.Protocol;
 
 namespace SeaShell.Elevator;
@@ -114,7 +114,13 @@ public sealed class ElevatorWorker
 				FileName = "dotnet",
 				WorkingDirectory = request.WorkingDirectory,
 				UseShellExecute = false,
+				// Hidden window — the process needs a console handle to initialize,
+				// but the window is invisible. Sea.Initialize immediately calls
+				// FreeConsole + AttachConsole to switch to the CLI's console.
+				WindowStyle = ProcessWindowStyle.Hidden,
 			};
+			if (request.CliPid > 0)
+				psi.Environment["SEASHELL_CLI_PID"] = request.CliPid.ToString();
 			psi.ArgumentList.Add("exec");
 			if (request.RuntimeConfigPath != null)
 			{
@@ -137,12 +143,13 @@ public sealed class ElevatorWorker
 					psi.Environment[envVar[..eq]] = envVar[(eq + 1)..];
 			}
 
-			var proc = Process.Start(psi);
+			using var proc = Process.Start(psi);
 			if (proc == null || proc.HasExited)
 				return new SpawnResponse(false, 0, "Failed to start process");
 
-			_log.Information("Spawned pid {ProcessId}", proc.Id);
-			return new SpawnResponse(true, proc.Id, null);
+			var pid = proc.Id;
+			_log.Information("Spawned pid {ProcessId}", pid);
+			return new SpawnResponse(true, pid, null);
 		}
 		catch (Exception ex)
 		{

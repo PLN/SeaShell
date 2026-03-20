@@ -2,10 +2,11 @@ using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
-using System.Text;
+using System.IO.Pipes;
 using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
+using SeaShell.Ipc;
 using SeaShell.Engine;
 
 namespace SeaShell.Host;
@@ -75,7 +76,6 @@ public sealed class ScriptHost
 		Dictionary<string, string>? environmentVars = null,
 		CancellationToken ct = default)
 	{
-		// Write snippet to a temp file, compile it, run it, clean up
 		var tempDir = Path.Combine(Path.GetTempPath(), "seashell", "snippets");
 		Directory.CreateDirectory(tempDir);
 		var tempFile = Path.Combine(tempDir, $"snippet_{Guid.NewGuid():N}.cs");
@@ -105,6 +105,8 @@ public sealed class ScriptHost
 		if (!compiled.Success)
 			return new ScriptResult(-1, "", compiled.Error ?? "Compilation failed");
 
+		var pipeName = $"seashell-{Guid.NewGuid():N}";
+
 		var psi = new ProcessStartInfo
 		{
 			FileName = "dotnet",
@@ -115,8 +117,7 @@ public sealed class ScriptHost
 			CreateNoWindow = true,
 		};
 
-		if (compiled.ManifestPath != null)
-			psi.Environment["SEASHELL_MANIFEST"] = compiled.ManifestPath;
+		psi.Environment["SEASHELL_PIPE"] = pipeName;
 
 		if (environmentVars != null)
 		{
@@ -144,9 +145,19 @@ public sealed class ScriptHost
 
 		using var proc = Process.Start(psi)!;
 
-		// Read output concurrently to avoid deadlocks
+		// Connect to script's pipe server
+		var pipe = new NamedPipeClientStream(".", pipeName, PipeDirection.InOut, PipeOptions.Asynchronous);
+		pipe.Connect(5000);
+		await using var channel = new MessageChannel(pipe);
+
+		// Send ScriptInit with manifest data
+		await channel.SendAsync(BuildScriptInit(compiled, args, workingDirectory), ct);
+
+		// Read output and pipe messages concurrently.
+		// Must drain the channel to unblock the script's ProcessExit flush.
 		var stdoutTask = proc.StandardOutput.ReadToEndAsync(ct);
 		var stderrTask = proc.StandardError.ReadToEndAsync(ct);
+		var channelTask = DrainChannelAsync(channel, ct);
 
 		await proc.WaitForExitAsync(ct);
 
@@ -154,6 +165,62 @@ public sealed class ScriptHost
 		var stderr = await stderrTask;
 
 		return new ScriptResult(proc.ExitCode, stdout, stderr);
+	}
+
+	// ── Helpers ─────────────────────────────────────────────────────────
+
+	private static ScriptInit BuildScriptInit(ScriptCompiler.CompileResult compiled, string[]? args, string? workingDirectory)
+	{
+		string? scriptPath = null;
+		string[]? sources = null;
+		Dictionary<string, string>? packages = null;
+		string[]? assemblies = null;
+
+		if (compiled.ManifestPath != null && File.Exists(compiled.ManifestPath))
+		{
+			try
+			{
+				var json = File.ReadAllText(compiled.ManifestPath);
+				var opts = new JsonSerializerOptions { PropertyNamingPolicy = JsonNamingPolicy.CamelCase };
+				var manifest = JsonSerializer.Deserialize<ManifestData>(json, opts);
+				if (manifest != null)
+				{
+					scriptPath = manifest.ScriptPath;
+					sources = manifest.Sources;
+					packages = manifest.Packages;
+					assemblies = manifest.Assemblies;
+				}
+			}
+			catch { }
+		}
+
+		return new ScriptInit(
+			scriptPath,
+			workingDirectory ?? Environment.CurrentDirectory,
+			args ?? Array.Empty<string>(),
+			sources, packages, assemblies,
+			false, 0, 0, null, false);
+	}
+
+	private static async Task DrainChannelAsync(MessageChannel channel, CancellationToken ct)
+	{
+		try
+		{
+			while (true)
+			{
+				var msg = await channel.ReceiveAsync(ct);
+				if (msg == null) break;
+			}
+		}
+		catch { }
+	}
+
+	private sealed class ManifestData
+	{
+		public string? ScriptPath { get; set; }
+		public string[]? Sources { get; set; }
+		public Dictionary<string, string>? Packages { get; set; }
+		public string[]? Assemblies { get; set; }
 	}
 
 	// ── NuGet ───────────────────────────────────────────────────────────

@@ -3,6 +3,7 @@ using System.IO;
 using System.Threading;
 using System.Threading.Tasks;
 using Serilog;
+using SeaShell.Ipc;
 using SeaShell.Protocol;
 using SeaShell.Engine;
 

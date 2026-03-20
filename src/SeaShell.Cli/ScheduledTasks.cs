@@ -16,8 +16,8 @@ namespace SeaShell.Cli;
 /// </summary>
 static class ScheduledTasks
 {
-	private const string DaemonTaskName = "SeaShell Daemon";
-	private const string ElevatorTaskName = "SeaShell Elevator";
+	private static readonly string DaemonTaskName = $"SeaShell Daemon ({Environment.UserName})";
+	private static readonly string ElevatorTaskName = $"SeaShell Elevator ({Environment.UserName})";
 	private const string TaskFolder = "\\SeaShell\\";
 
 	/// <summary>Start both tasks via schtasks /Run. No elevation needed.</summary>

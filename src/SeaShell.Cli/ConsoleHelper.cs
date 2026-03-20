@@ -1,5 +1,4 @@
 using System;
-using System.IO;
 using System.Runtime.InteropServices;
 
 namespace SeaShell.Cli;
@@ -8,35 +7,14 @@ static class ConsoleHelper
 {
 	/// <summary>
 	/// If the console is ephemeral (double-clicked), show an interactive countdown
-	/// before the window closes. The script controls the duration via Sea.ExitDelay.
+	/// before the window closes. The script controls the duration via Sea.ExitDelay,
+	/// which is reported back through the script pipe's EXIT message.
 	/// </summary>
 	public static void ExitDelay(bool isConsoleEphemeral)
 	{
 		if (!isConsoleEphemeral) return;
 
-		// Read the delay the script requested (written by Sea's ProcessExit handler)
-		var delay = 7; // default
-		try
-		{
-			var manifestPath = Environment.GetEnvironmentVariable("SEASHELL_MANIFEST");
-			if (manifestPath == null)
-			{
-				// No manifest (compilation failed before artifacts were written).
-				// Check if ScriptRunner stored it for us.
-				manifestPath = ScriptRunner.LastManifestPath;
-			}
-			if (manifestPath != null)
-			{
-				var delayFile = manifestPath + ".exitdelay";
-				if (File.Exists(delayFile))
-				{
-					int.TryParse(File.ReadAllText(delayFile).Trim(), out delay);
-					try { File.Delete(delayFile); } catch { }
-				}
-			}
-		}
-		catch { }
-
+		var delay = ScriptRunner.LastExitDelay;
 		if (delay > 0 && RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
 			ConsoleDelayer.Delay(delay);
 	}
