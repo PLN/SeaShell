@@ -4,7 +4,11 @@
 		<PackageTags>scripting;seashell;roslyn;host;csharp;vb;repl</PackageTags>
 		<GenerateDocumentationFile>true</GenerateDocumentationFile>
 		<NoWarn>CS1591</NoWarn>
+		<PackageReadmeFile>README.md</PackageReadmeFile>
 	</PropertyGroup>
+	<ItemGroup>
+		<None Include="..\..\README.md" Pack="true" PackagePath="/" />
+	</ItemGroup>
 	<ItemGroup>
 		<ProjectReference Include="..\SeaShell.Engine\SeaShell.Engine.csproj" />
 		<ProjectReference Include="..\SeaShell.Script\SeaShell.Script.csproj" />

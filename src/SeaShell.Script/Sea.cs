@@ -89,6 +89,13 @@ public static class Sea
 	/// </summary>
 	public static event Action? Stopping;
 
+	/// <summary>
+	/// Fires when the Host sends an application message during execution.
+	/// Parameters: payload (raw bytes), topic (optional routing key).
+	/// Only fires when running via ScriptHost, not CLI.
+	/// </summary>
+	public static event Action<byte[], string?>? MessageReceived;
+
 	/// <summary>True if this instance was started as a hot-swap replacement (not the first run).</summary>
 	public static bool IsReload { get; private set; }
 
@@ -145,6 +152,33 @@ public static class Sea
 		var bytes = GetReloadState();
 		return bytes != null ? Encoding.UTF8.GetString(bytes) : null;
 	}
+
+	// ── Application messaging ──────────────────────────────────────────
+
+	/// <summary>Send a binary message to the Host. No-op if not connected.</summary>
+	public static async System.Threading.Tasks.Task SendMessageAsync(byte[] payload, string? topic = null)
+	{
+		var ch = _channel;
+		if (ch == null) return;
+		await ch.SendAsync(new ScriptMessage(payload, topic));
+	}
+
+	/// <summary>Send a string message to the Host (UTF-8 encoded). No-op if not connected.</summary>
+	public static async System.Threading.Tasks.Task SendMessageAsync(string payload, string? topic = null) =>
+		await SendMessageAsync(Encoding.UTF8.GetBytes(payload), topic);
+
+	/// <summary>Send a binary message to the Host (synchronous). No-op if not connected.</summary>
+	public static void SendMessage(byte[] payload, string? topic = null)
+	{
+		var ch = _channel;
+		if (ch == null) return;
+		try { ch.SendAsync(new ScriptMessage(payload, topic)).AsTask().GetAwaiter().GetResult(); }
+		catch { }
+	}
+
+	/// <summary>Send a string message to the Host (synchronous, UTF-8). No-op if not connected.</summary>
+	public static void SendMessage(string payload, string? topic = null) =>
+		SendMessage(Encoding.UTF8.GetBytes(payload), topic);
 
 	// ── Initialization ──────────────────────────────────────────────────
 
@@ -225,21 +259,26 @@ public static class Sea
 		{
 			while (!IsShuttingDown)
 			{
-				var envelope = _channel!.ReceiveAsync().AsTask().GetAwaiter().GetResult();
-				if (envelope == null) break; // disconnected
+				var result = _channel!.ReceiveAsync().AsTask().GetAwaiter().GetResult();
+				if (result == null) break; // disconnected
 
-				switch (envelope.Type)
+				switch (result.Value.Type)
 				{
-					case nameof(ScriptReload):
+					case MessageType.ScriptReload:
 						IsShuttingDown = true;
 						_shutdownCts.Cancel();
 						try { Reloading?.Invoke(); } catch { }
 						break;
 
-					case nameof(ScriptStop):
+					case MessageType.ScriptStop:
 						IsShuttingDown = true;
 						_shutdownCts.Cancel();
 						try { Stopping?.Invoke(); } catch { }
+						break;
+
+					case MessageType.HostMessage:
+						var hm = (HostMessage)result.Value.Message;
+						try { MessageReceived?.Invoke(hm.Payload, hm.Topic); } catch { }
 						break;
 				}
 			}

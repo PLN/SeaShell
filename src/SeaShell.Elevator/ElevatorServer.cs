@@ -61,45 +61,43 @@ public sealed class ElevatorWorker
 		_log.Debug("Connecting to daemon...");
 		await using var conn = await TransportClient.ConnectAsync(daemonAddress, timeoutMs: 5000, ct);
 
-		var hello = Envelope.Wrap(new ElevatorHello(_isElevated));
-		await conn.SendAsync(hello.ToBytes(), ct);
+		await conn.Channel.SendAsync(new ElevatorHello(_isElevated), ct);
 
-		var ackBytes = await conn.ReceiveAsync(ct);
-		if (ackBytes == null) throw new InvalidOperationException("Daemon disconnected during handshake");
+		var ackResult = await conn.Channel.ReceiveAsync(ct);
+		if (ackResult == null) throw new InvalidOperationException("Daemon disconnected during handshake");
 
-		var ack = Envelope.FromBytes(ackBytes).Unwrap<ElevatorAck>();
+		var ack = (ElevatorAck)ackResult.Value.Message;
 		if (!ack.Accepted) throw new InvalidOperationException($"Daemon rejected registration: {ack.Reason}");
 
 		_log.Information("Registered with daemon, waiting for spawn requests");
 
 		while (!ct.IsCancellationRequested)
 		{
-			var bytes = await conn.ReceiveAsync(ct);
-			if (bytes == null)
+			var msg = await conn.Channel.ReceiveAsync(ct);
+			if (msg == null)
 			{
 				_log.Information("Daemon closed connection");
 				break;
 			}
 
-			var envelope = Envelope.FromBytes(bytes);
-			Envelope response;
+			var (type, message) = msg.Value;
 
-			if (envelope.Type == nameof(SpawnRequest))
-				response = Envelope.Wrap(await HandleSpawnAsync(envelope.Unwrap<SpawnRequest>()));
-			else if (envelope.Type == nameof(StopRequest))
+			if (type == MessageType.SpawnRequest)
+			{
+				var spawnResp = await HandleSpawnAsync((SpawnRequest)message);
+				await conn.Channel.SendAsync(spawnResp, ct);
+			}
+			else if (type == MessageType.StopRequest)
 			{
 				_log.Information("Stop requested via daemon");
 				Environment.SetEnvironmentVariable("SEASHELL_STOP", "1");
-				response = Envelope.Wrap(new SpawnResponse(true, 0, null));
-				await conn.SendAsync(response.ToBytes(), ct);
+				await conn.Channel.SendAsync(new SpawnResponse(true, 0, null), ct);
 				break;
 			}
 			else
 			{
-				response = Envelope.Wrap(new SpawnResponse(false, 0, $"Unknown message: {envelope.Type}"));
+				await conn.Channel.SendAsync(new SpawnResponse(false, 0, $"Unknown message: {type}"), ct);
 			}
-
-			await conn.SendAsync(response.ToBytes(), ct);
 		}
 	}
 

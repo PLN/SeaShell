@@ -5,7 +5,11 @@
 		<Description>Runtime context library for SeaShell scripts. Provides the Sea static class with script identity, environment info, hot-swap lifecycle, and reload state.</Description>
 		<PackageTags>scripting;seashell;runtime;context</PackageTags>
 		<GenerateDocumentationFile>true</GenerateDocumentationFile>
+		<PackageReadmeFile>README.md</PackageReadmeFile>
 	</PropertyGroup>
+	<ItemGroup>
+		<None Include="README.md" Pack="true" PackagePath="/" />
+	</ItemGroup>
 	<ItemGroup>
 		<ProjectReference Include="..\SeaShell.Ipc\SeaShell.Ipc.csproj" />
 	</ItemGroup>

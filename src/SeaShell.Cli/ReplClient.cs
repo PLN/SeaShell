@@ -30,11 +30,11 @@ static class ReplClient
 		await using var conn = await TransportClient.ConnectAsync(daemonAddress, timeoutMs: 10000);
 
 		// Start REPL session
-		await conn.SendAsync(Envelope.Wrap(new ReplStartRequest(packages)).ToBytes());
-		var startBytes = await conn.ReceiveAsync();
-		if (startBytes == null) { Console.Error.WriteLine("sea: daemon disconnected"); return 1; }
+		await conn.Channel.SendAsync(new ReplStartRequest(packages));
+		var startResult = await conn.Channel.ReceiveAsync();
+		if (startResult == null) { Console.Error.WriteLine("sea: daemon disconnected"); return 1; }
 
-		var startResp = Envelope.FromBytes(startBytes).Unwrap<ReplStartResponse>();
+		var startResp = (ReplStartResponse)startResult.Value.Message;
 		if (!startResp.Success) { Console.Error.WriteLine(startResp.Error); return 1; }
 
 		// Banner
@@ -72,11 +72,11 @@ static class ReplClient
 			}
 
 			// Send to daemon for evaluation
-			await conn.SendAsync(Envelope.Wrap(new ReplEvalRequest(line)).ToBytes());
-			var evalBytes = await conn.ReceiveAsync();
-			if (evalBytes == null) { Console.Error.WriteLine("\nsea: daemon disconnected"); return 1; }
+			await conn.Channel.SendAsync(new ReplEvalRequest(line));
+			var evalResult = await conn.Channel.ReceiveAsync();
+			if (evalResult == null) { Console.Error.WriteLine("\nsea: daemon disconnected"); return 1; }
 
-			var eval = Envelope.FromBytes(evalBytes).Unwrap<ReplEvalResponse>();
+			var eval = (ReplEvalResponse)evalResult.Value.Message;
 
 			if (!eval.IsComplete)
 			{

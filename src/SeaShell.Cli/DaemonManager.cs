@@ -16,11 +16,11 @@ static class DaemonManager
 		try
 		{
 			await using var conn = await TransportClient.ConnectAsync(daemonAddress, timeoutMs: 2000);
-			await conn.SendAsync(Envelope.Wrap(new PingRequest()).ToBytes());
-			var reply = await conn.ReceiveAsync();
+			await conn.Channel.SendAsync(new PingRequest());
+			var reply = await conn.Channel.ReceiveAsync();
 			if (reply == null) { Console.WriteLine("  daemon: not responding"); return 1; }
 
-			var ping = Envelope.FromBytes(reply).Unwrap<PingResponse>();
+			var ping = (PingResponse)reply.Value.Message;
 			Console.WriteLine($"  daemon:   v{ping.Version}, uptime {ping.UptimeSeconds}s, {ping.ActiveScripts} active");
 			Console.WriteLine($"  elevator: {(ping.ElevatorConnected ? "connected" : "not connected")}");
 			return 0;
@@ -39,8 +39,8 @@ static class DaemonManager
 		try
 		{
 			await using var conn = await TransportClient.ConnectAsync(address, timeoutMs: 2000);
-			await conn.SendAsync(Envelope.Wrap(new StopRequest()).ToBytes());
-			await conn.ReceiveAsync();
+			await conn.Channel.SendAsync(new StopRequest());
+			await conn.Channel.ReceiveAsync();
 			Console.WriteLine("daemon: stop requested");
 			return 0;
 		}
@@ -135,11 +135,11 @@ static class DaemonManager
 		try
 		{
 			await using var conn = await TransportClient.ConnectAsync(daemonAddress, timeoutMs: 5000);
-			await conn.SendAsync(Envelope.Wrap(request).ToBytes());
-			var replyBytes = await conn.ReceiveAsync();
-			if (replyBytes == null)
+			await conn.Channel.SendAsync(request);
+			var reply = await conn.Channel.ReceiveAsync();
+			if (reply == null)
 				return new SpawnResponse(false, 0, "Daemon disconnected");
-			return Envelope.FromBytes(replyBytes).Unwrap<SpawnResponse>();
+			return (SpawnResponse)reply.Value.Message;
 		}
 		catch (Exception ex)
 		{

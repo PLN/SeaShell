@@ -2,6 +2,7 @@
 	<!-- Cross-platform transport (named pipes, Unix sockets). Depends on Ipc for message types. -->
 	<PropertyGroup>
 		<NoWarn>NU1510</NoWarn>
+		<IsPackable>false</IsPackable>
 	</PropertyGroup>
 	<ItemGroup>
 		<PackageReference Include="System.IO.Pipes.AccessControl" Version="5.0.0" />
