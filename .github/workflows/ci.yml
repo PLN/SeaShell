@@ -60,8 +60,23 @@ jobs:
       - name: Lifecycle — stop when already stopped (idempotent)
         run: dotnet run --project src/SeaShell.Cli -- --stop
 
+      # Upload platform-specific apphosts for cross-platform NuGet package
+      - name: Upload apphosts
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: actions/upload-artifact@v4
+        with:
+          name: apphosts-${{ runner.os }}
+          path: |
+            src/SeaShell.Cli/bin/Release/net10.0/sea
+            src/SeaShell.Cli/bin/Release/net10.0/sea.exe
+            src/SeaShell.Cli/bin/Release/net10.0/seashell-daemon
+            src/SeaShell.Cli/bin/Release/net10.0/seashell-daemon.exe
+            src/SeaShell.Cli/bin/Release/net10.0/seashell-elevator
+            src/SeaShell.Cli/bin/Release/net10.0/seashell-elevator.exe
+          if-no-files-found: warn
+
   # Publish to nuget.org on version tags (v*)
-  # Runs after build succeeds on both platforms
+  # Combines apphosts from both platforms into one package
   publish:
     needs: build
     if: startsWith(github.ref, 'refs/tags/v')
@@ -76,8 +91,23 @@ jobs:
           dotnet-version: '10.0.x'
           dotnet-quality: 'preview'
 
-      - name: Pack
-        run: dotnet pack -c Release -o ./nupkg
+      - name: Build
+        run: dotnet build -c Release
+
+      - name: Download Windows apphosts
+        uses: actions/download-artifact@v4
+        with:
+          name: apphosts-Windows
+          path: src/SeaShell.Cli/bin/Release/net10.0/
+
+      - name: Download Linux apphosts
+        uses: actions/download-artifact@v4
+        with:
+          name: apphosts-Linux
+          path: src/SeaShell.Cli/bin/Release/net10.0/
+
+      - name: Pack (with cross-platform apphosts)
+        run: dotnet pack -c Release -o ./nupkg --no-build
 
       - name: Push to nuget.org
         run: dotnet nuget push "./nupkg/*.nupkg" --api-key ${{ secrets.NUGET_API_KEY }} --source https://api.nuget.org/v3/index.json --skip-duplicate
