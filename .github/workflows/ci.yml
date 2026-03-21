@@ -150,7 +150,11 @@ jobs:
           $zip.Dispose()
 
       - name: Push to nuget.org
-        shell: bash
-        run: dotnet nuget push "nupkg/*.nupkg" --api-key "$NUGET_API_KEY" --source https://api.nuget.org/v3/index.json --skip-duplicate
+        shell: pwsh
+        run: |
+          foreach ($pkg in Get-ChildItem nupkg/*.nupkg) {
+            Write-Host "Pushing $($pkg.Name)"
+            dotnet nuget push $pkg.FullName --api-key $env:NUGET_API_KEY --source https://api.nuget.org/v3/index.json --skip-duplicate
+          }
         env:
           NUGET_API_KEY: ${{ secrets.NUGET_API_KEY }}
