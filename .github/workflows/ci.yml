@@ -99,7 +99,7 @@ jobs:
       - name: Inject Linux apphosts into nupkg
         shell: pwsh
         run: |
-          $nupkg = (Get-ChildItem nupkg/SeaShell.*.nupkg).FullName
+          $nupkg = (Get-ChildItem nupkg/SeaShell.0.*.nupkg).FullName
           Write-Host "Injecting Linux apphosts into $nupkg"
 
           Add-Type -AssemblyName System.IO.Compression.FileSystem
