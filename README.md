@@ -6,6 +6,17 @@ A C# and VB.NET scripting engine with a persistent daemon, NuGet support, hot-sw
 
 ## Install
 
+**Windows** (PowerShell):
+```powershell
+iex (irm https://raw.githubusercontent.com/PLN/SeaShell/main/install.ps1)
+```
+
+**Linux**:
+```bash
+curl -fsSL https://raw.githubusercontent.com/PLN/SeaShell/main/install.sh | sh
+```
+
+**Manual**:
 ```
 dotnet tool install -g SeaShell
 ```
@@ -201,11 +212,15 @@ sea --install-elevator            Register elevator (requires elevation once)
 sea --uninstall-daemon            Remove daemon task
 sea --uninstall-elevator          Remove elevator task
 sea --start                       Start registered tasks
-sea --stop                        Stop registered tasks
+sea --stop                        Stop daemon and elevator
 sea --status                      Show daemon and elevator status
 ```
 
-The daemon starts automatically on first `sea` invocation even without Task Scheduler. The elevator is optional — without it, elevated scripts fall back to `gsudo sea script.cs`.
+The daemon starts automatically on first `sea` invocation even without Task Scheduler. When a task is registered, `sea` prefers starting it over spawning a separate process — this keeps the daemon under Task Scheduler management.
+
+`--stop` uses IPC first (works for any running daemon, including on Linux), then ends Task Scheduler tasks. It reports actual state — no misleading output when nothing is running.
+
+The elevator is optional — without it, elevated scripts fall back to `gsudo sea script.cs`. When the elevator task is registered but not running, `sea` auto-starts it on demand when an `//sea_elevate` script is run.
 
 ## Project Structure
 
@@ -308,7 +323,8 @@ Edit, save — the new version is serving on the same port in seconds. No downti
 When a script has `//sea_elevate`, the CLI resolves it in order:
 1. Already elevated? (e.g., `gsudo sea script.cs`) — spawn directly
 2. Elevator worker connected to daemon? — delegate to it (no UAC prompt)
-3. Neither — error with a helpful message suggesting `gsudo` or `sea --install-elevator`
+3. Elevator task registered but not running? — auto-start it, wait for it to connect (up to 15s), then delegate
+4. None of the above — error with a helpful message suggesting `gsudo` or `sea --install-elevator`
 
 On Linux, `//sea_elevate` is silently ignored.
 

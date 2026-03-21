@@ -1,5 +1,33 @@
 # History
 
+## v0.1.5 (2026-03-22)
+
+**Daemon lifecycle, cross-platform packaging, and one-liner installers.**
+
+- **`--stop` via IPC** — `sea --stop` now uses IPC first (works for any running daemon,
+  including on Linux), then ends Task Scheduler tasks if registered. Reports actual state
+  — no misleading output when nothing is running. Output aligned with `--status` format.
+- **Task preference** — `StartDaemon` prefers a registered Task Scheduler task over
+  `Process.Start`. Falls back to spawning a process if no task is registered.
+- **Elevator auto-start** — When a `//sea_elevate` script fails because the elevator isn't
+  connected, the CLI starts the elevator task and the daemon waits internally for the
+  elevator's `ElevatorHello` (`AwaitElevatorMs` on `SpawnRequest`). One round trip, no
+  CLI polling.
+- **Independent binary search** — `--install-daemon` only searches for the daemon binary,
+  `--install-elevator` only for the elevator. No more confusing cross-errors.
+- **Dotnet tool mode** — `FindBinary` detects `.dll` (dotnet tool store) and registers
+  tasks with `dotnet exec` as fallback. `BuildTaskXml` supports `<Arguments>` element.
+- **Cross-platform nupkg** — CI packs on Windows (gets `.exe` WinExe apphosts natively),
+  then injects Linux ELF apphosts into the nupkg. Both platforms get native executables
+  — daemon and elevator use WinExe subsystem on Windows (no console window).
+- **CI lifecycle tests** — `--status`, `--stop`, and idempotent stop tested on both
+  Windows and Linux runners.
+- **`install.ps1`** — One-liner Windows installer: checks .NET 10, installs/updates tool,
+  stops running instances, registers daemon task, optionally registers elevator via gsudo,
+  associates `.cs`. Usage: `iex (irm https://raw.githubusercontent.com/PLN/SeaShell/main/install.ps1)`
+- **`install.sh`** — One-liner Linux installer: checks .NET 10, stops running instances,
+  installs/updates tool. Usage: `curl -fsSL https://raw.githubusercontent.com/PLN/SeaShell/main/install.sh | sh`
+
 ## v0.1.2 (2026-03-20)
 
 **Binary IPC and Host↔Script messaging.**
