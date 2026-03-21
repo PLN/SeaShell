@@ -60,7 +60,7 @@ switch (args[0])
 	case "--start":
 		return ScheduledTasks.Start();
 	case "--stop":
-		return ScheduledTasks.Stop();
+		return await ScheduledTasks.Stop();
 	case "--install-daemon":
 		return ScheduledTasks.InstallDaemon();
 	case "--install-elevator":
