@@ -147,6 +147,16 @@ static class ScriptRunner
 			Environment.ProcessId);
 
 		var spawnResult = await DaemonManager.RequestElevatedSpawnAsync(daemonAddress, spawnReq);
+
+		// Elevator not connected — try starting it via Task Scheduler,
+		// then let the daemon wait for it to connect
+		if (!spawnResult.Success && ScheduledTasks.TryRunElevatorTask())
+		{
+			Console.Error.WriteLine("sea: starting elevator...");
+			var retryReq = spawnReq with { AwaitElevatorMs = 15_000 };
+			spawnResult = await DaemonManager.RequestElevatedSpawnAsync(daemonAddress, retryReq);
+		}
+
 		if (!spawnResult.Success)
 		{
 			Console.Error.WriteLine("sea: script requires elevation (//sea_elevate)");

@@ -47,6 +47,19 @@ jobs:
       - name: Smoke test — interactive_ok.cs
         run: dotnet run --project src/SeaShell.Cli -- test/interactive_ok.cs
 
+      # Lifecycle tests — daemon start/stop/status
+      - name: Lifecycle — status (daemon running after smoke tests)
+        run: dotnet run --project src/SeaShell.Cli -- --status
+
+      - name: Lifecycle — stop
+        run: dotnet run --project src/SeaShell.Cli -- --stop
+
+      - name: Lifecycle — status after stop
+        run: dotnet run --project src/SeaShell.Cli -- --status || true
+
+      - name: Lifecycle — stop when already stopped (idempotent)
+        run: dotnet run --project src/SeaShell.Cli -- --stop
+
   # Publish to nuget.org on version tags (v*)
   # Runs after build succeeds on both platforms
   publish:

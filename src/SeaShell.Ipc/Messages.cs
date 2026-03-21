@@ -235,7 +235,8 @@ public sealed record SpawnRequest(
 	string[] Args,
 	string WorkingDirectory,
 	string[] EnvironmentVars,
-	int CliPid
+	int CliPid,
+	int AwaitElevatorMs = 0
 );
 
 /// <summary>Elevator → Daemon: result of the spawn.</summary>

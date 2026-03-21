@@ -2,7 +2,10 @@ using System;
 using System.Diagnostics;
 using System.IO;
 using System.Runtime.InteropServices;
+using System.Threading.Tasks;
 using System.Xml.Linq;
+using SeaShell.Ipc;
+using SeaShell.Protocol;
 
 namespace SeaShell.Cli;
 
@@ -20,6 +23,40 @@ static class ScheduledTasks
 	private static readonly string ElevatorTaskName = $"SeaShell Elevator ({Environment.UserName})";
 	private const string TaskFolder = "\\SeaShell\\";
 
+	// ── On-demand task start (silent, used by DaemonManager/ScriptRunner) ──
+
+	/// <summary>Try to start the daemon via Task Scheduler. Returns true if task was started.</summary>
+	public static bool TryRunDaemonTask() => TryRunTask(DaemonTaskName);
+
+	/// <summary>Try to start the elevator via Task Scheduler. Returns true if task was started.</summary>
+	public static bool TryRunElevatorTask() => TryRunTask(ElevatorTaskName);
+
+	private static bool TryRunTask(string name)
+	{
+		if (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows)) return false;
+		var fullName = TaskFolder + name;
+		var psi = new ProcessStartInfo
+		{
+			FileName = "schtasks.exe",
+			UseShellExecute = false,
+			RedirectStandardOutput = true,
+			RedirectStandardError = true,
+		};
+		psi.ArgumentList.Add("/Run");
+		psi.ArgumentList.Add("/TN");
+		psi.ArgumentList.Add(fullName);
+
+		try
+		{
+			using var proc = Process.Start(psi)!;
+			proc.WaitForExit(5_000);
+			return proc.ExitCode == 0;
+		}
+		catch { return false; }
+	}
+
+	// ── Explicit start/stop ────────────────────────────────────────────
+
 	/// <summary>Start both tasks via schtasks /Run. No elevation needed.</summary>
 	public static int Start()
 	{
@@ -35,39 +72,65 @@ static class ScheduledTasks
 		return ok ? 0 : 1;
 	}
 
-	/// <summary>Stop both tasks via schtasks /End. No elevation needed.</summary>
-	public static int Stop()
+	/// <summary>Stop daemon and elevator. IPC stop first (any daemon), then schtasks /End for tasks.</summary>
+	public static async Task<int> Stop()
 	{
-		if (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+		// IPC stop — works on any platform, for any running daemon
+		var daemonAddress = TransportEndpoint.GetDaemonAddress(TransportEndpoint.CurrentUserIdentity);
+		var daemonStopped = await StopDaemonIpcAsync(daemonAddress);
+
+		// Task Scheduler — also end registered tasks (Windows only)
+		var elevatorStopped = false;
+		var daemonTaskStopped = false;
+		if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
 		{
-			Console.WriteLine("Task Scheduler is Windows-only. On Linux, use systemd user services.");
-			return 1;
+			elevatorStopped = EndTask(ElevatorTaskName);
+			if (!daemonStopped)
+				daemonTaskStopped = EndTask(DaemonTaskName);
 		}
 
-		var ok = true;
-		ok &= EndTask(ElevatorTaskName);
-		ok &= EndTask(DaemonTaskName);
-		return ok ? 0 : 1;
+		// Unified output, matching --status format
+		Console.WriteLine(daemonStopped ? "  daemon:   stopped"
+			: daemonTaskStopped            ? "  daemon:   stopped (task)"
+			:                                "  daemon:   not running");
+		Console.WriteLine(elevatorStopped ? "  elevator: stopped"
+			:                               "  elevator: not running");
+		return 0;
 	}
+
+	/// <summary>Try IPC graceful stop. Returns true if daemon was running and accepted the stop.</summary>
+	private static async Task<bool> StopDaemonIpcAsync(string address)
+	{
+		try
+		{
+			await using var conn = await TransportClient.ConnectAsync(address, timeoutMs: 2000);
+			await conn.Channel.SendAsync(new StopRequest());
+			await conn.Channel.ReceiveAsync();
+			return true;
+		}
+		catch { return false; }
+	}
+
+	// ── Install / uninstall ────────────────────────────────────────────
 
 	public static int InstallDaemon()
 	{
 		if (!RequireWindows()) return 1;
-		var (daemonExe, _) = FindBinaries();
-		if (daemonExe == null) return 1;
-		Console.WriteLine($"  binary: {daemonExe}");
-		return RegisterTask(DaemonTaskName, daemonExe, elevated: false) ? 0 : 1;
+		var result = FindBinary("SeaShell.Daemon", "seashell-daemon");
+		if (result == null) return 1;
+		Console.WriteLine($"  binary: {result.Value.command}{(result.Value.arguments != null ? " " + result.Value.arguments : "")}");
+		return RegisterTask(DaemonTaskName, result.Value.command, result.Value.arguments, elevated: false) ? 0 : 1;
 	}
 
 	public static int InstallElevator()
 	{
 		if (!RequireWindows()) return 1;
-		var (_, elevatorExe) = FindBinaries();
-		if (elevatorExe == null) return 1;
-		Console.WriteLine($"  binary: {elevatorExe}");
+		var result = FindBinary("SeaShell.Elevator", "seashell-elevator");
+		if (result == null) return 1;
+		Console.WriteLine($"  binary: {result.Value.command}{(result.Value.arguments != null ? " " + result.Value.arguments : "")}");
 		Console.WriteLine("  NOTE: This registers a task with highest privileges.");
 		Console.WriteLine("        Requires an elevated shell to register.");
-		return RegisterTask(ElevatorTaskName, elevatorExe, elevated: true) ? 0 : 1;
+		return RegisterTask(ElevatorTaskName, result.Value.command, result.Value.arguments, elevated: true) ? 0 : 1;
 	}
 
 	public static int UninstallDaemon()
@@ -82,6 +145,8 @@ static class ScheduledTasks
 		return DeleteTask(ElevatorTaskName) ? 0 : 1;
 	}
 
+	// ── Helpers ────────────────────────────────────────────────────────
+
 	private static bool RequireWindows()
 	{
 		if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows)) return true;
@@ -89,11 +154,9 @@ static class ScheduledTasks
 		return false;
 	}
 
-	private static bool RegisterTask(string name, string exePath, bool elevated)
+	private static bool RegisterTask(string name, string command, string? arguments, bool elevated)
 	{
-		// Build the task XML. Using XML directly gives us full control over RunLevel
-		// without needing the COM TaskScheduler API.
-		var xml = BuildTaskXml(exePath, elevated);
+		var xml = BuildTaskXml(command, arguments, elevated);
 		var tempXml = Path.Combine(Path.GetTempPath(), $"seashell-task-{(elevated ? "elev" : "daemon")}.xml");
 
 		try
@@ -172,10 +235,60 @@ static class ScheduledTasks
 		return RunSchtasks($"Starting {name}", "/Run", "/TN", fullName);
 	}
 
+	/// <summary>Stop a task if it's running. Returns true if a running task was stopped.</summary>
 	private static bool EndTask(string name)
 	{
 		var fullName = TaskFolder + name;
-		return RunSchtasks($"Stopping {name}", "/End", "/TN", fullName);
+
+		// Query task state first — only attempt stop if actually running
+		var state = QueryTaskState(fullName);
+		if (state == null) return false; // not registered
+		if (!state.Equals("Running", StringComparison.OrdinalIgnoreCase))
+			return false; // registered but not running
+
+		// Task is running — stop it
+		var psi = new ProcessStartInfo
+		{
+			FileName = "schtasks.exe",
+			UseShellExecute = false,
+			RedirectStandardOutput = true,
+			RedirectStandardError = true,
+		};
+		psi.ArgumentList.Add("/End");
+		psi.ArgumentList.Add("/TN");
+		psi.ArgumentList.Add(fullName);
+
+		using var proc = Process.Start(psi)!;
+		proc.WaitForExit(10_000);
+		return proc.ExitCode == 0;
+	}
+
+	/// <summary>Query a task's status. Returns "Running", "Ready", etc., or null if not registered.</summary>
+	private static string? QueryTaskState(string fullName)
+	{
+		var psi = new ProcessStartInfo
+		{
+			FileName = "schtasks.exe",
+			ArgumentList = { "/Query", "/TN", fullName, "/FO", "CSV", "/NH" },
+			UseShellExecute = false,
+			RedirectStandardOutput = true,
+			RedirectStandardError = true,
+		};
+
+		try
+		{
+			using var proc = Process.Start(psi)!;
+			var stdout = proc.StandardOutput.ReadToEnd();
+			proc.WaitForExit(5_000);
+			if (proc.ExitCode != 0) return null; // not registered
+
+			// CSV format: "TaskName","Next Run Time","Status"
+			var parts = stdout.Trim().Split(',');
+			if (parts.Length >= 3)
+				return parts[2].Trim('"', ' ', '\r', '\n');
+			return null;
+		}
+		catch { return null; }
 	}
 
 	private static bool RunSchtasks(string label, params string[] args)
@@ -204,13 +317,23 @@ static class ScheduledTasks
 		return false;
 	}
 
-	private static string BuildTaskXml(string exePath, bool elevated)
+	// ── Task XML ───────────────────────────────────────────────────────
+
+	private static string BuildTaskXml(string command, string? arguments, bool elevated)
 	{
 		var runLevel = elevated ? "HighestAvailable" : "LeastPrivilege";
 		var userId = $"{Environment.UserDomainName}\\{Environment.UserName}";
 
 		// Task Scheduler 1.2 XML schema (Vista+)
 		XNamespace ns = "http://schemas.microsoft.com/windows/2004/02/mit/task";
+
+		var execContent = new System.Collections.Generic.List<XElement>
+		{
+			new XElement(ns + "Command", command)
+		};
+		if (arguments != null)
+			execContent.Add(new XElement(ns + "Arguments", arguments));
+
 		var doc = new XDocument(
 			new XElement(ns + "Task",
 				new XAttribute("version", "1.2"),
@@ -245,9 +368,7 @@ static class ScheduledTasks
 					new XElement(ns + "Hidden", "false")
 				),
 				new XElement(ns + "Actions",
-					new XElement(ns + "Exec",
-						new XElement(ns + "Command", exePath)
-					)
+					new XElement(ns + "Exec", execContent.ToArray())
 				)
 			)
 		);
@@ -256,25 +377,27 @@ static class ScheduledTasks
 			?? "<?xml version=\"1.0\" encoding=\"UTF-16\"?>" + doc.ToString();
 	}
 
-	private static (string? daemonExe, string? elevatorExe) FindBinaries()
-	{
-		var daemon = FindBinary("SeaShell.Daemon", "seashell-daemon");
-		var elevator = FindBinary("SeaShell.Elevator", "seashell-elevator");
-		return (daemon, elevator);
-	}
+	// ── Binary discovery ───────────────────────────────────────────────
 
-	private static string? FindBinary(string projectName, string assemblyName)
+	private static (string command, string? arguments)? FindBinary(string projectName, string assemblyName)
 	{
 		var baseDir = AppContext.BaseDirectory;
 		var ext = RuntimeInformation.IsOSPlatform(OSPlatform.Windows) ? ".exe" : "";
 
-		// Published mode: binary is a sibling of the CLI
+		// Published mode: native apphost sibling
 		var candidate = Path.Combine(baseDir, assemblyName + ext);
-		if (File.Exists(candidate)) return candidate;
+		if (File.Exists(candidate))
+			return (candidate, null);
+
+		// Dotnet tool mode: DLL sibling, no apphost
+		var dllCandidate = Path.Combine(baseDir, assemblyName + ".dll");
+		if (File.Exists(dllCandidate))
+			return ("dotnet", $"exec \"{dllCandidate}\"");
 
 		// Dev mode: sibling project build output
 		var dev = FindDevBinary(projectName, assemblyName);
-		if (dev != null) return dev;
+		if (dev != null)
+			return (dev, null);
 
 		Console.Error.WriteLine($"sea: could not find {assemblyName}");
 		Console.Error.WriteLine("     build the solution first: dotnet build");

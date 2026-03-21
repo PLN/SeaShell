@@ -26,6 +26,7 @@ public sealed class DaemonServer : IAsyncDisposable
 	private TransportStream? _elevator;
 	private bool _elevatorIsElevated;
 	private readonly SemaphoreSlim _elevatorLock = new(1, 1);
+	private TaskCompletionSource<bool>? _elevatorArrived;
 
 	private static readonly TimeSpan UpdateInterval = TimeSpan.FromHours(8);
 	private static readonly string Version = typeof(DaemonServer).Assembly.GetName().Version?.ToString(3) ?? "0.1.0";
@@ -163,6 +164,9 @@ public sealed class DaemonServer : IAsyncDisposable
 		}
 
 		_log.Information("Elevator connected (elevated={IsElevated})", hello.IsElevated);
+
+		// Signal anyone waiting for elevator (e.g. SpawnRequest with AwaitElevatorMs)
+		_elevatorArrived?.TrySetResult(true);
 
 		await conn.Channel.SendAsync(new ElevatorAck(true, null), ct);
 
@@ -346,8 +350,34 @@ public sealed class DaemonServer : IAsyncDisposable
 			_elevatorLock.Release();
 		}
 
+		// Wait for elevator to connect if requested (CLI started the elevator task)
+		if (elevator == null && request.AwaitElevatorMs > 0)
+		{
+			_log.Information("Waiting up to {Ms}ms for elevator to connect...", request.AwaitElevatorMs);
+			var tcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+			_elevatorArrived = tcs;
+			try
+			{
+				await tcs.Task.WaitAsync(TimeSpan.FromMilliseconds(request.AwaitElevatorMs), ct);
+			}
+			catch (TimeoutException)
+			{
+				_log.Warning("Elevator did not connect in time");
+				return new SpawnResponse(false, 0, "Elevator did not connect in time");
+			}
+			finally
+			{
+				_elevatorArrived = null;
+			}
+
+			// Re-acquire elevator reference
+			await _elevatorLock.WaitAsync(ct);
+			try { elevator = _elevator; }
+			finally { _elevatorLock.Release(); }
+		}
+
 		if (elevator == null)
-			return new SpawnResponse(false, 0, "No elevator connected. Is the SeaShell Elevator task running?");
+			return new SpawnResponse(false, 0, "No elevator connected");
 
 		try
 		{

@@ -51,9 +51,16 @@ static class DaemonManager
 		}
 	}
 
-	/// <summary>Start the daemon process (dev, published, or dotnet-tool mode).</summary>
+	/// <summary>Start the daemon process. Prefers Task Scheduler if registered, else Process.Start.</summary>
 	public static int StartDaemon()
 	{
+		// Prefer Task Scheduler if the daemon is registered as a task
+		if (ScheduledTasks.TryRunDaemonTask())
+		{
+			Console.Error.WriteLine("sea: daemon starting (task)");
+			return 0;
+		}
+
 		var cliDir = AppContext.BaseDirectory;
 
 		// Priority 1: dev mode — dotnet run --project
