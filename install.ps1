@@ -13,7 +13,33 @@ if (-not $dotnetVersion -or -not $dotnetVersion.StartsWith('10.')) {
 }
 Write-Host "  .NET SDK:  $dotnetVersion" -ForegroundColor Gray
 
-# 2. Install or update
+# 2. Stop running SeaShell processes before install/update
+#    Daemon and elevator lock DLLs in the tool store.
+$taskFolder = '\SeaShell\'
+$daemonTask = "SeaShell Daemon ($env:USERNAME)"
+$elevatorTask = "SeaShell Elevator ($env:USERNAME)"
+
+# Stop via IPC (works for any running daemon)
+if (Get-Command sea -ErrorAction SilentlyContinue) {
+	try { sea --daemon-stop 2>$null | Out-Null } catch {}
+}
+
+# Stop via Task Scheduler (in case IPC didn't reach it)
+try { schtasks /End /TN "$taskFolder$daemonTask" 2>$null | Out-Null } catch {}
+try { schtasks /End /TN "$taskFolder$elevatorTask" 2>$null | Out-Null } catch {}
+
+# Kill any remaining seashell processes
+Get-Process seashell-daemon -ErrorAction SilentlyContinue | Stop-Process -Force
+Get-Process seashell-elevator -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+
+# Shut down MSBuild server nodes (they can also lock tool store DLLs)
+try { dotnet build-server shutdown 2>$null | Out-Null } catch {}
+
+Start-Sleep -Milliseconds 500
+
+Write-Host "  Stopped running instances." -ForegroundColor Gray
+
+# 3. Install or update
 $installed = dotnet tool list -g 2>$null | Select-String -Pattern '^seashell\s'
 if ($installed) {
 	Write-Host "  Updating SeaShell..." -ForegroundColor Gray
@@ -32,11 +58,11 @@ if (-not $version) {
 }
 Write-Host "  $version" -ForegroundColor Gray
 
-# 3. Register daemon task
+# 4. Register daemon task
 Write-Host "  Registering daemon task..." -ForegroundColor Gray
 sea --install-daemon
 
-# 4. Register elevator task (optional, needs elevation)
+# 5. Register elevator task (optional, needs elevation)
 if (Get-Command gsudo -ErrorAction SilentlyContinue) {
 	Write-Host "  Registering elevator task (UAC prompt)..." -ForegroundColor Gray
 	try { gsudo sea --install-elevator } catch {
@@ -47,7 +73,7 @@ if (Get-Command gsudo -ErrorAction SilentlyContinue) {
 	Write-Host "  Install gsudo and run: sea --install-elevator" -ForegroundColor Yellow
 }
 
-# 5. Associate .cs
+# 6. Associate .cs
 Write-Host "  Associating .cs extension..." -ForegroundColor Gray
 sea --associate .cs
 
