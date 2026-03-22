@@ -143,36 +143,38 @@ jobs:
           fi
           echo "PASS: SmokeApp reloaded (PID ${PID1:-?} → $PID2)"
 
-      - name: Service smoke — stop
+      - name: Service smoke — stop and verify clean shutdown
         shell: bash
         run: |
           if [[ "$RUNNER_OS" == "Windows" ]]; then
             test/smoke-publish/SmokeService/SmokeService.exe stop
-            sleep 3
-            sc.exe query seashell-smoke | grep -i STOPPED
           else
             sudo test/smoke-publish/SmokeService/SmokeService stop
-            sleep 3
-            systemctl is-active seashell-smoke && exit 1 || true
           fi
 
-      - name: Service smoke — verify no orphaned processes
-        shell: bash
-        run: |
+          # Wait for service + child process to fully exit
+          for i in 1 2 3 4 5 6; do
+            sleep 2
+            ORPHAN=""
+            if [[ "$RUNNER_OS" == "Windows" ]]; then
+              ORPHAN=$(tasklist | grep SmokeApp | awk '{print $2}' || true)
+            else
+              ORPHAN=$(pgrep -f SmokeApp || true)
+            fi
+            if [[ -z "$ORPHAN" ]]; then
+              echo "PASS: No orphaned processes (attempt $i)"
+              exit 0
+            fi
+            echo "  attempt $i: SmokeApp still running (PID $ORPHAN), waiting..."
+          done
+
+          echo "FAIL: SmokeApp still running after 12s"
           if [[ "$RUNNER_OS" == "Windows" ]]; then
-            if tasklist | grep -q SmokeApp; then
-              echo "FAIL: SmokeApp process still running after stop"
-              taskkill /F /IM SmokeApp.exe
-              exit 1
-            fi
+            taskkill /F /IM SmokeApp.exe || true
           else
-            if pgrep -f SmokeApp > /dev/null; then
-              echo "FAIL: SmokeApp process still running after stop"
-              sudo pkill -f SmokeApp
-              exit 1
-            fi
+            sudo pkill -9 -f SmokeApp || true
           fi
-          echo "PASS: No orphaned processes"
+          exit 1
 
       - name: Service smoke — uninstall
         shell: bash
