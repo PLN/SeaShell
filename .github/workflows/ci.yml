@@ -186,18 +186,13 @@ jobs:
           fi
 
       # ── Existing lifecycle tests ────────────────────────────────────────
-      # Kill any daemon left from smoke tests (prevents DLL locks during rebuild)
-      - name: Lifecycle — kill stale daemon
-        shell: bash
-        run: |
-          if [[ "$RUNNER_OS" == "Windows" ]]; then
-            taskkill /F /IM seashell-daemon.exe 2>/dev/null || true
-          else
-            pkill -f seashell-daemon 2>/dev/null || true
-          fi
-          sleep 1
+      # Stop daemon cleanly via IPC (prevents DLL locks during rebuild).
+      # Use --no-build to avoid the very lock we're trying to clear.
+      - name: Lifecycle — stop daemon before rebuild
+        run: dotnet run --no-build --project src/SeaShell.Cli -- --stop
+        continue-on-error: true
 
-      # Restart daemon via a quick script run, then test lifecycle
+      # Restart daemon via a quick script run
       - name: Lifecycle — restart daemon
         run: dotnet run --project src/SeaShell.Cli -- test/hello.cs
 
