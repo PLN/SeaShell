@@ -251,8 +251,9 @@ jobs:
           SEASHELL_NUPKG_DIR: ${{ github.workspace }}/nupkg
         run: |
           if [[ "$RUNNER_OS" == "Windows" ]]; then RID=win-x64; else RID=linux-x64; fi
+          # No single-file: SmokeApp uses ScriptHost which needs physical DLLs for compilation
           dotnet publish test/SmokeApp --configfile test/nuget.config \
-            -r $RID -p:PublishSingleFile=true -o test/smoke-publish/SmokeApp
+            -r $RID -o test/smoke-publish/SmokeApp
 
       - name: Service smoke — publish SmokeService
         shell: bash
