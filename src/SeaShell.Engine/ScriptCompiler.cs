@@ -29,22 +29,19 @@ public sealed class ScriptCompiler
 
 	public ScriptCompiler()
 	{
-		// Secure the temp root on Linux — owner-only access prevents other local
-		// users from reading compiled scripts or poisoning the cache.
-		var tempRoot = Path.Combine(Path.GetTempPath(), "seashell");
-		Directory.CreateDirectory(tempRoot);
+		_cacheDir = SeaShellPaths.CacheDir;
+		Directory.CreateDirectory(_cacheDir);
+
+		// Secure the data root on Linux — owner-only access
 		if (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
 		{
 			try
 			{
-				File.SetUnixFileMode(tempRoot,
+				File.SetUnixFileMode(SeaShellPaths.DataDir,
 					UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
 			}
 			catch { }
 		}
-
-		_cacheDir = Path.Combine(tempRoot, "cache");
-		Directory.CreateDirectory(_cacheDir);
 
 		// Locate SeaShell.Script.dll — shipped alongside the daemon
 		_scriptAssemblyPath = Path.Combine(AppContext.BaseDirectory, "SeaShell.Script.dll");

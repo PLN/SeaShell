@@ -185,18 +185,9 @@ jobs:
             sudo test/smoke-publish/SmokeService/SmokeService uninstall
           fi
 
-      # ── Existing lifecycle tests ────────────────────────────────────────
-      # Stop daemon cleanly via IPC (prevents DLL locks during rebuild).
-      # Use --no-build to avoid the very lock we're trying to clear.
-      - name: Lifecycle — stop daemon before rebuild
-        run: dotnet run --no-build --project src/SeaShell.Cli -- --stop
-        continue-on-error: true
-
-      # Restart daemon via a quick script run
-      - name: Lifecycle — restart daemon
-        run: dotnet run --project src/SeaShell.Cli -- test/hello.cs
-
-      - name: Lifecycle — status (daemon running)
+      # ── Lifecycle tests ────────────────────────────────────────────────
+      # Daemon runs from staged data dir — no DLL locks on bin/.
+      - name: Lifecycle — status (daemon running after smoke tests)
         run: dotnet run --project src/SeaShell.Cli -- --status
 
       - name: Lifecycle — stop

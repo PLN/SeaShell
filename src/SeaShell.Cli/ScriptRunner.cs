@@ -26,21 +26,12 @@ static class ScriptRunner
 	/// </summary>
 	public static async Task<int> RunScriptAsync(string scriptPath, string[] scriptArgs, string daemonAddress, bool isConsoleEphemeral)
 	{
-		// Ensure daemon is running
+		// Ensure daemon is running (and matches current build)
+		await EnsureDaemonAsync(daemonAddress);
 		if (!await TransportClient.ProbeAsync(daemonAddress))
 		{
-			DaemonManager.StartDaemon();
-			for (int i = 0; i < 20; i++)
-			{
-				await Task.Delay(250);
-				if (await TransportClient.ProbeAsync(daemonAddress))
-					break;
-			}
-			if (!await TransportClient.ProbeAsync(daemonAddress))
-			{
-				Console.Error.WriteLine("sea: daemon failed to start");
-				return 1;
-			}
+			Console.Error.WriteLine("sea: daemon failed to start");
+			return 1;
 		}
 
 		// Send run request — the Daemon compiles and returns artifacts
@@ -538,6 +529,37 @@ static class ScriptRunner
 					reloadWriter?.TryWrite((req.Reason, req.ClearCache));
 					break;
 			}
+		}
+	}
+
+	// ── Daemon lifecycle ────────────────────────────────────────────────
+
+	/// <summary>
+	/// Ensure a daemon is running and matches the current build.
+	/// Stages if needed, version-checks, restarts on mismatch.
+	/// </summary>
+	private static async Task EnsureDaemonAsync(string daemonAddress)
+	{
+		if (await TransportClient.ProbeAsync(daemonAddress))
+		{
+			// Daemon is running — check if it matches our staged hash
+			var (sourceDir, _) = DaemonManager.FindDaemonSourcePublic();
+			if (sourceDir != null)
+			{
+				var (_, hash) = DaemonManager.StageBinary(sourceDir, "daemon");
+				var stopped = await DaemonManager.EnsureDaemonMatchesAsync(daemonAddress, hash);
+				if (!stopped)
+					return; // same version, already running
+			}
+		}
+
+		// Not running (or was stopped for version mismatch) — start
+		DaemonManager.StartDaemon();
+		for (int i = 0; i < 20; i++)
+		{
+			await Task.Delay(250);
+			if (await TransportClient.ProbeAsync(daemonAddress))
+				return;
 		}
 	}
 

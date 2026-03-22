@@ -80,7 +80,7 @@ public sealed class ScriptHost
 		ScriptConnection? connection = null,
 		CancellationToken ct = default)
 	{
-		var tempDir = Path.Combine(Path.GetTempPath(), "seashell", "snippets");
+		var tempDir = SeaShellPaths.SnippetsDir;
 		Directory.CreateDirectory(tempDir);
 		var tempFile = Path.Combine(tempDir, $"snippet_{Guid.NewGuid():N}.cs");
 
@@ -145,7 +145,7 @@ public sealed class ScriptHost
 				{
 					_compiler.NuGetResolver.InvalidateCache();
 					CompilationCache.ClearScript(
-						Path.Combine(Path.GetTempPath(), "seashell", "cache"),
+						SeaShellPaths.CacheDir,
 						Path.GetFileNameWithoutExtension(scriptPath));
 				}
 

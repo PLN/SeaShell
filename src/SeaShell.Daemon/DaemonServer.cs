@@ -273,7 +273,7 @@ public sealed class DaemonServer : IAsyncDisposable
 					pendingClearCache = false;
 					_compiler.NuGetResolver.InvalidateCache();
 					CompilationCache.ClearScript(
-						Path.Combine(Path.GetTempPath(), "seashell", "cache"),
+						SeaShellPaths.CacheDir,
 						Path.GetFileNameWithoutExtension(request.ScriptPath));
 				}
 
@@ -360,7 +360,9 @@ public sealed class DaemonServer : IAsyncDisposable
 	private PingResponse MakePingResponse()
 	{
 		var uptime = (int)(DateTime.UtcNow - _startTime).TotalSeconds;
-		return new PingResponse(Version, false, _elevator != null, uptime, 0);
+		var daemonHash = Environment.GetEnvironmentVariable("SEASHELL_DAEMON_HASH");
+		return new PingResponse(Version, false, _elevator != null, uptime, 0,
+			Environment.ProcessId, daemonHash);
 	}
 
 	private RunResponse HandleRun(RunRequest request)
@@ -372,7 +374,7 @@ public sealed class DaemonServer : IAsyncDisposable
 			_log.Information("Clearing cache for {ScriptName}", Path.GetFileNameWithoutExtension(request.ScriptPath));
 			_compiler.NuGetResolver.InvalidateCache();
 			CompilationCache.ClearScript(
-				Path.Combine(Path.GetTempPath(), "seashell", "cache"),
+				SeaShellPaths.CacheDir,
 				Path.GetFileNameWithoutExtension(request.ScriptPath));
 		}
 

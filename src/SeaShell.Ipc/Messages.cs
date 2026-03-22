@@ -192,7 +192,9 @@ public sealed record PingResponse(
 	bool IsElevated,
 	bool ElevatorConnected,
 	int UptimeSeconds,
-	int ActiveScripts
+	int ActiveScripts,
+	int Pid = 0,
+	string? DaemonHash = null
 );
 
 public sealed record StopRequest();

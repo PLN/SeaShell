@@ -2,7 +2,7 @@
 
 ## v0.1.6 (2026-03-22)
 
-**Binary running, script-initiated reload, and cross-platform service hosting.**
+**Binary running, script-initiated reload, cross-platform service hosting, and daemon staging.**
 
 - **Binary running** — `sea myapp.dll` and `host.RunAsync("myapp.dll")` run pre-compiled
   assemblies with full Sea context. `ScriptCompiler.Compile()` detects `.dll`/`.exe`/extensionless
@@ -40,6 +40,20 @@
   (same as Tier 2/3 .exe on Windows).
 - **`HotSwapNotify` extended** — Carries `StartupHookPath` and `DirectExe` fields so watch-mode
   restarts preserve binary execution mode.
+- **`SeaShellPaths`** — New static class centralizing all data directory paths. Per-user
+  `%LOCALAPPDATA%\seashell\` (Windows) or `~/.local/share/seashell/` (Linux). System accounts
+  (SYSTEM/root) use `%ProgramData%\seashell\` or `/var/lib/seashell/`. Override with `SEASHELL_DATA`
+  env var. Compilation cache moved from `%TEMP%` to persistent AppData.
+- **Daemon staging** — `DaemonManager.StartDaemon()` copies daemon binaries to
+  `{DataDir}/daemon/{hash}/` before launching. Eliminates DLL lock conflicts: `dotnet build`
+  succeeds while daemon is running. Same for elevator via `{DataDir}/elevator/{hash}/`.
+  `--install-daemon`/`--install-elevator` register staged paths with Task Scheduler.
+- **Daemon version-check** — `PingResponse` gains `Pid` and `DaemonHash` fields. On script run,
+  CLI compares running daemon's hash with staged hash. Mismatch triggers automatic restart.
+  Last-resort PID kill if IPC stop fails.
+- **`.runtimeconfig.dev.json` generation** — Staged binaries get a dev config with
+  `additionalProbingPaths` pointing to the NuGet cache, so package dependencies (EventLog,
+  Serilog sinks, etc.) resolve correctly from the staging directory.
 
 ## v0.1.5 (2026-03-22)
 

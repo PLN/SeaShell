@@ -318,9 +318,24 @@ dotnet tool install -g --add-source ./nupkg SeaShell
 
 ## Notes
 
+### Data Directory
+
+All runtime data lives in a persistent per-user directory (not temp):
+
+| Context | Path |
+|---------|------|
+| Windows user | `%LOCALAPPDATA%\seashell\` |
+| Windows SYSTEM | `%ProgramData%\seashell\` |
+| Linux user | `~/.local/share/seashell/` |
+| Linux root | `/var/lib/seashell/` |
+
+Override with `SEASHELL_DATA` environment variable. Contains: `cache/` (compiled scripts), `daemon/` (staged daemon), `elevator/` (staged elevator), `snippets/` (REPL temp files).
+
+The daemon and elevator binaries are staged to this directory before launching. This eliminates DLL lock conflicts — `dotnet build` always succeeds, even while the daemon is running.
+
 ### Compilation Cache
 
-Compiled scripts are cached in `%TEMP%/seashell/cache/`. The cache key is a SHA256 hash of:
+Compiled scripts are cached in `{DataDir}/cache/`. The cache key is a SHA256 hash of:
 - All source files (main script + includes, by content)
 - All resolved NuGet package versions (name@version)
 - The Engine and Script assembly timestamps
