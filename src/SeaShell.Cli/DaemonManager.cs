@@ -137,8 +137,7 @@ static class DaemonManager
 			return 1;
 		}
 
-		// Pass the hash so the daemon can report it via PingResponse
-		psi.Environment["SEASHELL_DAEMON_HASH"] = hash;
+		// (Daemon computes its own hash from AppContext.BaseDirectory)
 
 		try
 		{

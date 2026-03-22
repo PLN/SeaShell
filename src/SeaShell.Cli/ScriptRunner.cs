@@ -534,26 +534,12 @@ static class ScriptRunner
 
 	// ── Daemon lifecycle ────────────────────────────────────────────────
 
-	/// <summary>
-	/// Ensure a daemon is running and matches the current build.
-	/// Stages if needed, version-checks, restarts on mismatch.
-	/// </summary>
+	/// <summary>Ensure a daemon is running. Starts one if not.</summary>
 	private static async Task EnsureDaemonAsync(string daemonAddress)
 	{
 		if (await TransportClient.ProbeAsync(daemonAddress))
-		{
-			// Daemon is running — check if it matches our staged hash
-			var (sourceDir, _) = DaemonManager.FindDaemonSourcePublic();
-			if (sourceDir != null)
-			{
-				var (_, hash) = DaemonManager.StageBinary(sourceDir, "daemon");
-				var stopped = await DaemonManager.EnsureDaemonMatchesAsync(daemonAddress, hash);
-				if (!stopped)
-					return; // same version, already running
-			}
-		}
+			return; // already running
 
-		// Not running (or was stopped for version mismatch) — start
 		DaemonManager.StartDaemon();
 		for (int i = 0; i < 20; i++)
 		{

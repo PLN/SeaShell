@@ -357,12 +357,27 @@ public sealed class DaemonServer : IAsyncDisposable
 
 	// ── Request handlers ────────────────────────────────────────────────
 
+	private static readonly string? _daemonHash = ComputeSelfHash();
+
 	private PingResponse MakePingResponse()
 	{
 		var uptime = (int)(DateTime.UtcNow - _startTime).TotalSeconds;
-		var daemonHash = Environment.GetEnvironmentVariable("SEASHELL_DAEMON_HASH");
 		return new PingResponse(Version, false, _elevator != null, uptime, 0,
-			Environment.ProcessId, daemonHash);
+			Environment.ProcessId, _daemonHash);
+	}
+
+	/// <summary>Compute hash of our own directory — matches DaemonManager.StageBinary's hash.</summary>
+	private static string? ComputeSelfHash()
+	{
+		try
+		{
+			var ticks = 0L;
+			foreach (var f in System.Linq.Enumerable.OrderBy(
+				Directory.GetFiles(AppContext.BaseDirectory, "*.dll"), f => f))
+				ticks += File.GetLastWriteTimeUtc(f).Ticks;
+			return ticks.ToString("x");
+		}
+		catch { return null; }
 	}
 
 	private RunResponse HandleRun(RunRequest request)
