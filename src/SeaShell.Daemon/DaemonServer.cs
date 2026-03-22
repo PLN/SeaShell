@@ -217,18 +217,44 @@ public sealed class DaemonServer : IAsyncDisposable
 
 		using var watcher = new ScriptWatcher(sourceFiles);
 		var changeSignal = new SemaphoreSlim(0);
+		var pendingClearCache = false;
+		var lastReason = "file_changed";
 
 		watcher.Changed += file =>
 		{
 			_log.Information("File changed: {FileName}", Path.GetFileName(file));
+			lastReason = "file_changed";
 			changeSignal.Release();
 		};
+
+		// Background: read CLI messages (RecompileRequest from script-initiated reload)
+		_ = Task.Run(async () =>
+		{
+			try
+			{
+				while (!ct.IsCancellationRequested)
+				{
+					var msg = await conn.Channel.ReceiveAsync(ct);
+					if (msg == null) break;
+					if (msg.Value.Type == MessageType.RecompileRequest)
+					{
+						var req = (RecompileRequest)msg.Value.Message;
+						_log.Information("Script requested recompile (clearCache={ClearCache})", req.ClearCache);
+						if (req.ClearCache) pendingClearCache = true;
+						lastReason = "script_requested";
+						changeSignal.Release();
+					}
+				}
+			}
+			catch (OperationCanceledException) { }
+			catch { }
+		}, ct);
 
 		await using (conn)
 		{
 			while (!ct.IsCancellationRequested)
 			{
-				// Wait for file change (or cancellation)
+				// Wait for file change or recompile request
 				try
 				{
 					await changeSignal.WaitAsync(ct);
@@ -239,13 +265,32 @@ public sealed class DaemonServer : IAsyncDisposable
 				while (changeSignal.CurrentCount > 0)
 					await changeSignal.WaitAsync(TimeSpan.Zero);
 
+				var reason = lastReason;
+
+				// Clear cache if script requested it
+				if (pendingClearCache)
+				{
+					pendingClearCache = false;
+					_compiler.NuGetResolver.InvalidateCache();
+					CompilationCache.ClearScript(
+						Path.Combine(Path.GetTempPath(), "seashell", "cache"),
+						Path.GetFileNameWithoutExtension(request.ScriptPath));
+				}
+
 				// Recompile
-				_log.Information("Recompiling {ScriptName}", Path.GetFileName(request.ScriptPath));
+				_log.Information("Recompiling {ScriptName} ({Reason})", Path.GetFileName(request.ScriptPath), reason);
 				var recompile = _compiler.Compile(request.ScriptPath, request.Args);
 
 				if (!recompile.Success)
 				{
 					_log.Warning("Recompile failed: {Error}", recompile.Error);
+					// For script-requested reloads, notify CLI so it doesn't hang
+					if (reason == "script_requested")
+					{
+						try { await conn.Channel.SendAsync(
+							new HotSwapNotify("", null, null, null, "compile_failed"), ct); }
+						catch { break; }
+					}
 					continue; // keep watching, don't swap
 				}
 
@@ -255,7 +300,9 @@ public sealed class DaemonServer : IAsyncDisposable
 					recompile.DepsJsonPath,
 					recompile.RuntimeConfigPath,
 					recompile.ManifestPath,
-					"file_changed");
+					reason,
+					recompile.StartupHookPath,
+					recompile.DirectExe);
 
 				try
 				{
@@ -320,6 +367,15 @@ public sealed class DaemonServer : IAsyncDisposable
 	{
 		_log.Information("Run request: {ScriptPath}", request.ScriptPath);
 
+		if (request.ClearCache)
+		{
+			_log.Information("Clearing cache for {ScriptName}", Path.GetFileNameWithoutExtension(request.ScriptPath));
+			_compiler.NuGetResolver.InvalidateCache();
+			CompilationCache.ClearScript(
+				Path.Combine(Path.GetTempPath(), "seashell", "cache"),
+				Path.GetFileNameWithoutExtension(request.ScriptPath));
+		}
+
 		var result = _compiler.Compile(request.ScriptPath, request.Args);
 		if (!result.Success)
 			return new RunResponse(false, false, false, null, null, null, null, 0, result.Error);
@@ -330,7 +386,9 @@ public sealed class DaemonServer : IAsyncDisposable
 			result.DepsJsonPath,
 			result.RuntimeConfigPath,
 			result.ManifestPath,
-			0, null);
+			0, null,
+			result.StartupHookPath,
+			result.DirectExe);
 	}
 
 	/// <summary>

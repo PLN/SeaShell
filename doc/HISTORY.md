@@ -1,5 +1,46 @@
 # History
 
+## v0.1.6 (2026-03-22)
+
+**Binary running, script-initiated reload, and cross-platform service hosting.**
+
+- **Binary running** — `sea myapp.dll` and `host.RunAsync("myapp.dll")` run pre-compiled
+  assemblies with full Sea context. `ScriptCompiler.Compile()` detects `.dll`/`.exe`/extensionless
+  binaries and stages them with companion files — both CLI and Host get this for free.
+  Three .exe tiers: Tier 1 (apphost → redirect to .dll), Tier 2 (framework-dependent single-file),
+  Tier 3 (self-contained single-file). Companion `.sea.json` file enables directives for binaries
+  (`{"watch": true}`). ASP.NET Core auto-detected from PE assembly references.
+- **`Sea.RequestReload()`** — Scripts can programmatically trigger their own reload with optional
+  cache clearing. Works in both direct and watch mode. In direct mode the CLI opens a new daemon
+  connection; in watch mode it sends `RecompileRequest` over the held connection. The Host handles
+  it internally (it owns the compiler). New IPC messages: `ScriptReloadRequest` (tag 8),
+  `RecompileRequest` (tag 30). `RunRequest` gained `ClearCache` field.
+- **`CompilationCache.ClearScript()`** — Deletes all cache directories for a script, used by
+  `RequestReload(clearCache: true)`.
+- **`Sea.IsWatchMode`** — Public property set from `ScriptInit.Watch`.
+- **`StartupHook`** — `DOTNET_STARTUP_HOOKS` contract class in SeaShell.Script for injecting
+  Sea context into .dll binaries that don't reference SeaShell.Script.
+- **`AssemblyInspector`** — PE metadata inspection via `System.Reflection.Metadata`. Checks for
+  SeaShell.Script and ASP.NET Core references without loading the assembly.
+- **`ScriptHost` reload loop** — `ExecuteAsync` now handles `ScriptReloadRequest` internally with
+  a restart loop. Watch mode (`//sea_watch`) starts `ScriptWatcher` embedded in the Host — no
+  daemon needed. `ScriptConnection.StopAsync()` sends `ScriptStop` for graceful shutdown.
+- **`SeaShell.ServiceHost`** — New NuGet package. Cross-platform service hosting with a 6-line
+  consumer API (`ServiceHostBuilder`). Auto-detects init system (Windows Service, systemd, runit,
+  OpenRC, sysvinit). `install`/`uninstall`/`start`/`stop`/`status` management commands built into
+  the binary. `ServiceHostWorker` runs scripts with crash recovery and optional NuGet update loop
+  for zero-locking automatic updates. Embedded init script templates.
+- **Graceful service shutdown** — `RunOneInstanceAsync` sends `ScriptStop` through IPC on
+  cancellation token, waits for graceful exit, kills after timeout. No orphaned child processes.
+- **systemd `KillMode=process`** — Only the main PID receives SIGTERM; child script process gets
+  graceful `ScriptStop` via IPC instead of direct signal kill.
+- **CI service smoke test** — Full install/start/reload/stop/uninstall cycle on both Windows and
+  Linux runners. Verifies PID change (reload worked) and no orphaned processes.
+- **Linux binary support** — Extensionless ELF binaries detected and handled as direct executables
+  (same as Tier 2/3 .exe on Windows).
+- **`HotSwapNotify` extended** — Carries `StartupHookPath` and `DirectExe` fields so watch-mode
+  restarts preserve binary execution mode.
+
 ## v0.1.5 (2026-03-22)
 
 **Daemon lifecycle, cross-platform packaging, and one-liner installers.**

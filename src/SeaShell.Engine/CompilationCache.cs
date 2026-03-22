@@ -11,7 +11,7 @@ namespace SeaShell.Engine;
 /// Computes cache-key hashes for compiled scripts. Incorporates source content,
 /// NuGet package versions, and engine identity so stale artifacts are invalidated.
 /// </summary>
-static class CompilationCache
+public static class CompilationCache
 {
 	// Engine identity — changes when the daemon/engine is rebuilt.
 	// Included in the cache hash so stale compiled scripts are invalidated.
@@ -65,5 +65,34 @@ static class CompilationCache
 
 		sha.TransformFinalBlock(Array.Empty<byte>(), 0, 0);
 		return Convert.ToHexString(sha.Hash!).ToLowerInvariant();
+	}
+
+	/// <summary>Compute cache hash for a pre-compiled binary (engine fingerprint + file content).</summary>
+	public static string ComputeBinaryHash(string binaryPath)
+	{
+		using var sha = SHA256.Create();
+
+		var fp = Encoding.UTF8.GetBytes(_engineFingerprint);
+		sha.TransformBlock(fp, 0, fp.Length, null, 0);
+
+		var bytes = File.ReadAllBytes(binaryPath);
+		sha.TransformBlock(bytes, 0, bytes.Length, null, 0);
+
+		sha.TransformFinalBlock(Array.Empty<byte>(), 0, 0);
+		return Convert.ToHexString(sha.Hash!).ToLowerInvariant();
+	}
+
+	/// <summary>Delete all cache directories for a script (name_* pattern).</summary>
+	public static void ClearScript(string cacheDir, string scriptName)
+	{
+		try
+		{
+			foreach (var dir in Directory.GetDirectories(cacheDir, $"{scriptName}_*"))
+			{
+				try { Directory.Delete(dir, recursive: true); }
+				catch { } // locked by running process — will be cleaned up on next run
+			}
+		}
+		catch { }
 	}
 }

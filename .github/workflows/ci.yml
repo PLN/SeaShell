@@ -48,6 +48,130 @@ jobs:
         run: dotnet run --project src/SeaShell.Cli -- test/interactive_ok.cs
 
       # Lifecycle tests — daemon start/stop/status
+      # ── Service smoke test ─────────────────────────────────────────────
+      # Exercises all three new features: binary running, RequestReload, ServiceHost.
+      # Publishes SmokeApp as a single-file exe, runs it via ServiceHost as a
+      # platform service, verifies the reload cycle, then stops and uninstalls.
+
+      - name: Service smoke — publish SmokeApp (single-file)
+        shell: bash
+        run: |
+          if [[ "$RUNNER_OS" == "Windows" ]]; then
+            RID=win-x64
+          else
+            RID=linux-x64
+          fi
+          dotnet publish test/SmokeApp -r $RID -p:PublishSingleFile=true -o test/smoke-publish/SmokeApp
+
+      - name: Service smoke — publish SmokeService
+        shell: bash
+        run: |
+          if [[ "$RUNNER_OS" == "Windows" ]]; then
+            RID=win-x64
+          else
+            RID=linux-x64
+          fi
+          dotnet publish test/SmokeService -r $RID -o test/smoke-publish/SmokeService
+
+      - name: Service smoke — create companion .sea.json
+        shell: bash
+        run: echo '{"watch":true}' > test/smoke-publish/SmokeApp/SmokeApp.sea.json
+
+      - name: Service smoke — install
+        shell: bash
+        run: |
+          if [[ "$RUNNER_OS" == "Windows" ]]; then
+            test/smoke-publish/SmokeService/SmokeService.exe install
+          else
+            sudo test/smoke-publish/SmokeService/SmokeService install
+          fi
+
+      - name: Service smoke — start
+        shell: bash
+        run: |
+          if [[ "$RUNNER_OS" == "Windows" ]]; then
+            test/smoke-publish/SmokeService/SmokeService.exe start
+          else
+            sudo test/smoke-publish/SmokeService/SmokeService start
+          fi
+
+      - name: Service smoke — verify running + reload cycle
+        shell: bash
+        run: |
+          sleep 5
+          echo "=== Verify service is running ==="
+          if [[ "$RUNNER_OS" == "Windows" ]]; then
+            sc.exe query seashell-smoke | grep -i RUNNING
+          else
+            systemctl is-active seashell-smoke
+          fi
+
+          echo "=== Record initial SmokeApp PID ==="
+          if [[ "$RUNNER_OS" == "Windows" ]]; then
+            PID1=$(tasklist | grep SmokeApp | awk '{print $2}')
+          else
+            PID1=$(pgrep -f 'SmokeApp' | head -1)
+          fi
+          echo "PID before reload: $PID1"
+
+          echo "=== Wait for first RequestReload (5s + margin) ==="
+          sleep 15
+
+          echo "=== Verify SmokeApp reloaded (PID changed) ==="
+          if [[ "$RUNNER_OS" == "Windows" ]]; then
+            PID2=$(tasklist | grep SmokeApp | awk '{print $2}')
+          else
+            PID2=$(pgrep -f 'SmokeApp' | head -1)
+          fi
+          echo "PID after reload: $PID2"
+
+          if [[ "$PID1" == "$PID2" ]]; then
+            echo "FAIL: SmokeApp PID did not change — reload did not happen"
+            exit 1
+          fi
+          echo "PASS: SmokeApp reloaded (PID $PID1 → $PID2)"
+
+      - name: Service smoke — stop
+        shell: bash
+        run: |
+          if [[ "$RUNNER_OS" == "Windows" ]]; then
+            test/smoke-publish/SmokeService/SmokeService.exe stop
+            sleep 3
+            sc.exe query seashell-smoke | grep -i STOPPED
+          else
+            sudo test/smoke-publish/SmokeService/SmokeService stop
+            sleep 3
+            systemctl is-active seashell-smoke && exit 1 || true
+          fi
+
+      - name: Service smoke — verify no orphaned processes
+        shell: bash
+        run: |
+          if [[ "$RUNNER_OS" == "Windows" ]]; then
+            if tasklist | grep -q SmokeApp; then
+              echo "FAIL: SmokeApp process still running after stop"
+              taskkill /F /IM SmokeApp.exe
+              exit 1
+            fi
+          else
+            if pgrep -f SmokeApp > /dev/null; then
+              echo "FAIL: SmokeApp process still running after stop"
+              sudo pkill -f SmokeApp
+              exit 1
+            fi
+          fi
+          echo "PASS: No orphaned processes"
+
+      - name: Service smoke — uninstall
+        shell: bash
+        run: |
+          if [[ "$RUNNER_OS" == "Windows" ]]; then
+            test/smoke-publish/SmokeService/SmokeService.exe uninstall
+          else
+            sudo test/smoke-publish/SmokeService/SmokeService uninstall
+          fi
+
+      # ── Existing lifecycle tests ────────────────────────────────────────
       - name: Lifecycle — status (daemon running after smoke tests)
         run: dotnet run --project src/SeaShell.Cli -- --status
 

@@ -6,6 +6,7 @@ using System.IO.Pipes;
 using System.Runtime.InteropServices;
 using System.Text.Json;
 using System.Threading;
+using System.Threading.Channels;
 using System.Threading.Tasks;
 using SeaShell.Ipc;
 using SeaShell.Protocol;
@@ -70,7 +71,7 @@ static class ScriptRunner
 		if (response.Elevated && RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
 		{
 			if (DaemonManager.IsCurrentProcessElevated())
-				return await RunDirectAsync(response, scriptArgs, isConsoleEphemeral);
+				return await RunDirectAsync(response, scriptArgs, daemonAddress, scriptPath, isConsoleEphemeral);
 
 			return await RunElevatedAsync(response, scriptArgs, isConsoleEphemeral, daemonAddress);
 		}
@@ -80,49 +81,122 @@ static class ScriptRunner
 		}
 		else
 		{
-			return await RunDirectAsync(response, scriptArgs, isConsoleEphemeral);
+			return await RunDirectAsync(response, scriptArgs, daemonAddress, scriptPath, isConsoleEphemeral);
 		}
 	}
 
 	// ── Direct execution (non-elevated, or already-elevated CLI) ────────
 
-	public static async Task<int> RunDirectAsync(RunResponse response, string[] scriptArgs, bool isConsoleEphemeral = false)
+	public static async Task<int> RunDirectAsync(RunResponse response, string[] scriptArgs,
+		string? daemonAddress = null, string? scriptPath = null, bool isConsoleEphemeral = false)
 	{
-		var pipeName = $"seashell-{Guid.NewGuid():N}";
-
-		var psi = BuildProcessStartInfo(response, scriptArgs);
-		psi.Environment["SEASHELL_PIPE"] = pipeName;
-
-		using var proc = Process.Start(psi)!;
+		var reloadCount = 0;
+		var currentResponse = response;
+		string? stateBase64 = null;
+		Process? currentProc = null;
 
 		Console.CancelKeyPress += (_, e) =>
 		{
 			e.Cancel = true;
-			try { proc.Kill(entireProcessTree: false); } catch { }
+			try { currentProc?.Kill(entireProcessTree: false); } catch { }
 		};
 
-		// Connect to script's pipe server (created by Sea.Initialize).
-		// Connect() uses WaitNamedPipe internally — polls until server appears.
-		var pipe = new NamedPipeClientStream(".", pipeName, PipeDirection.InOut, PipeOptions.Asynchronous);
-		try
+		while (true)
 		{
-			pipe.Connect(5000);
-		}
-		catch
-		{
-			Console.Error.WriteLine("sea: script pipe connect failed");
-			await proc.WaitForExitAsync();
-			return proc.ExitCode;
-		}
+			var pipeName = $"seashell-{Guid.NewGuid():N}";
+			var psi = BuildProcessStartInfo(currentResponse, scriptArgs);
+			psi.Environment["SEASHELL_PIPE"] = pipeName;
 
-		await using var channel = new MessageChannel(pipe);
-		await channel.SendAsync(BuildScriptInit(response, scriptArgs, isConsoleEphemeral));
+			currentProc = Process.Start(psi)!;
 
-		// Read from pipe concurrently — the script's ProcessExit sends ScriptExit,
-		// and PipeWriter.Flush blocks until we read. Must read before awaiting proc exit.
-		var exitCode = await ReceiveUntilExitAsync(channel);
-		await proc.WaitForExitAsync();
-		return exitCode;
+			// Connect to script's pipe server (created by Sea.Initialize).
+			var pipe = new NamedPipeClientStream(".", pipeName, PipeDirection.InOut, PipeOptions.Asynchronous);
+			try
+			{
+				pipe.Connect(5000);
+			}
+			catch
+			{
+				Console.Error.WriteLine("sea: script pipe connect failed");
+				await currentProc.WaitForExitAsync();
+				return currentProc.ExitCode;
+			}
+
+			await using var channel = new MessageChannel(pipe);
+			await channel.SendAsync(BuildScriptInit(currentResponse, scriptArgs,
+				isConsoleEphemeral, reloadCount: reloadCount, stateBase64: stateBase64));
+
+			// Read from pipe with reload awareness
+			var reloadRequests = Channel.CreateUnbounded<(string? reason, bool clearCache)>();
+			var channelTask = ReceiveUntilExitOrStateAsync(channel, reloadRequests.Writer);
+			var reloadTask = reloadRequests.Reader.ReadAsync().AsTask();
+
+			var completed = await Task.WhenAny(channelTask, reloadTask);
+
+			if (completed == channelTask)
+			{
+				// Script exited on its own
+				var (exitCode, _) = await channelTask;
+				await currentProc.WaitForExitAsync();
+				return exitCode;
+			}
+
+			// Script requested reload — open new daemon connection to recompile
+			if (daemonAddress == null || scriptPath == null)
+			{
+				// No daemon address — can't recompile, just wait for exit
+				var (exitCode, _) = await channelTask;
+				await currentProc.WaitForExitAsync();
+				return exitCode;
+			}
+
+			var (reason, clearCache) = await reloadTask;
+			Console.Error.WriteLine($"sea: reload requested ({reason ?? "script"})...");
+
+			// Recompile via daemon
+			var runReq = new RunRequest(scriptPath, scriptArgs, Environment.CurrentDirectory,
+				Array.Empty<string>(), Environment.ProcessId, clearCache);
+			RunResponse? newResponse = null;
+
+			try
+			{
+				await using var conn = await TransportClient.ConnectAsync(daemonAddress);
+				await conn.Channel.SendAsync(runReq);
+				var reply = await conn.Channel.ReceiveAsync();
+				if (reply != null)
+					newResponse = (RunResponse)reply.Value.Message;
+			}
+			catch { }
+
+			if (newResponse == null || !newResponse.Success)
+			{
+				Console.Error.WriteLine($"sea: recompile failed{(newResponse?.Error != null ? $": {newResponse.Error}" : "")}");
+				// Keep running old script — wait for exit or next reload request
+				var (exitCode, _) = await channelTask;
+				await currentProc.WaitForExitAsync();
+				return exitCode;
+			}
+
+			reloadCount++;
+
+			// Signal old script to reload, collect state, kill
+			try { await channel.SendAsync(new ScriptReload()); } catch { }
+
+			stateBase64 = null;
+			try
+			{
+				using var cts = new CancellationTokenSource(5000);
+				var (_, state) = await channelTask.WaitAsync(cts.Token);
+				stateBase64 = state;
+			}
+			catch { }
+
+			if (!currentProc.WaitForExit(3000))
+				try { currentProc.Kill(entireProcessTree: false); } catch { }
+			await currentProc.WaitForExitAsync();
+
+			currentResponse = newResponse;
+		}
 	}
 
 	// ── Elevated execution via Elevator ─────────────────────────────────
@@ -223,49 +297,83 @@ static class ScriptRunner
 				isConsoleEphemeral: false, reloadCount: reloadCount,
 				stateBase64: stateBase64, watch: true));
 
-			// Single channel reader task — handles ScriptExit and ScriptState.
-			// This is the ONLY reader on the PipeReader to avoid concurrent read corruption.
-			var channelTask = ReceiveUntilExitOrStateAsync(scriptChannel);
+			// Channel reader with reload request signaling
+			var reloadRequests = Channel.CreateUnbounded<(string? reason, bool clearCache)>();
+			var channelTask = ReceiveUntilExitOrStateAsync(scriptChannel, reloadRequests.Writer);
+			HotSwapNotify? swapNotify = null;
+
+			// hotSwapTask must be created ONCE and reused — PipeReader doesn't
+			// support concurrent reads. Only recreate after it completes.
 			var hotSwapTask = daemonConn.Channel.ReceiveAsync().AsTask();
 
-			var completed = await Task.WhenAny(channelTask, hotSwapTask);
-
-			if (completed == channelTask)
+			// Inner event loop for this process instance
+			while (!exitRequested)
 			{
-				// Script exited on its own
-				var (exitCode, _) = await channelTask;
-				await currentProc.WaitForExitAsync();
-				await scriptChannel.DisposeAsync();
+				var reloadTask = reloadRequests.Reader.ReadAsync().AsTask();
 
-				if (exitRequested) break;
-				return currentProc.ExitCode;
+				var completed = await Task.WhenAny(channelTask, hotSwapTask, reloadTask);
+
+				if (completed == channelTask)
+				{
+					// Script exited on its own
+					var (exitCode, _) = await channelTask;
+					await currentProc.WaitForExitAsync();
+					await scriptChannel.DisposeAsync();
+					if (exitRequested) break;
+					return currentProc.ExitCode;
+				}
+
+				if (completed == reloadTask)
+				{
+					// Script requested reload — ask daemon to recompile
+					var (reason, clearCache) = await reloadTask;
+					Console.Error.WriteLine($"sea: reload requested ({reason ?? "script"})...");
+					try { await daemonConn.Channel.SendAsync(new RecompileRequest(clearCache)); }
+					catch
+					{
+						Console.Error.WriteLine("sea: daemon disconnected");
+						try { currentProc.Kill(entireProcessTree: false); } catch { }
+						return 1;
+					}
+					continue; // wait for HotSwapNotify from daemon
+				}
+
+				// completed == hotSwapTask (file change or recompile response from daemon)
+				var swapResult = await hotSwapTask;
+				if (swapResult == null)
+				{
+					Console.Error.WriteLine("sea: daemon disconnected during watch");
+					try { currentProc.Kill(entireProcessTree: false); } catch { }
+					return 1;
+				}
+
+				if (swapResult.Value.Type != MessageType.HotSwapNotify)
+				{
+					Console.Error.WriteLine($"sea: unexpected message during watch: {swapResult.Value.Type}");
+					continue;
+				}
+
+				var notify = (HotSwapNotify)swapResult.Value.Message;
+
+				// Compile failure? Skip swap, keep running.
+				if (string.IsNullOrEmpty(notify.AssemblyPath))
+				{
+					Console.Error.WriteLine("sea: recompile failed, continuing...");
+					continue;
+				}
+
+				swapNotify = notify;
+				break; // exit inner loop to do the swap
 			}
 
-			// Hot-swap: daemon sent new artifacts
-			var swapResult = await hotSwapTask;
-			if (swapResult == null)
-			{
-				Console.Error.WriteLine("sea: daemon disconnected during watch");
-				try { currentProc.Kill(entireProcessTree: false); } catch { }
-				return 1;
-			}
+			if (swapNotify == null) break; // exitRequested or error
 
-			if (swapResult.Value.Type != MessageType.HotSwapNotify)
-			{
-				Console.Error.WriteLine($"sea: unexpected message during watch: {swapResult.Value.Type}");
-				continue;
-			}
-
-			var notify = (HotSwapNotify)swapResult.Value.Message;
 			reloadCount++;
-			Console.Error.WriteLine($"sea: reloading ({notify.Reason})...");
+			Console.Error.WriteLine($"sea: reloading ({swapNotify.Reason})...");
 
-			// Send ScriptReload to the script. The script fires Reloading,
-			// sends ScriptState, then exits (sending ScriptExit).
-			// channelTask (the ONLY reader) reads both messages and returns.
+			// Signal old script to reload, collect state, kill
 			try { await scriptChannel.SendAsync(new ScriptReload()); } catch { }
 
-			// Await the channel reader — it picks up ScriptState + ScriptExit
 			stateBase64 = null;
 			try
 			{
@@ -275,22 +383,21 @@ static class ScriptRunner
 			}
 			catch { }
 
-			// Ensure process is dead
 			if (!currentProc.WaitForExit(3000))
-			{
 				try { currentProc.Kill(entireProcessTree: false); } catch { }
-			}
 			await currentProc.WaitForExitAsync();
 
 			await scriptChannel.DisposeAsync();
 
 			currentResponse = new RunResponse(
 				true, false, true,
-				notify.AssemblyPath,
-				notify.DepsJsonPath,
-				notify.RuntimeConfigPath,
-				notify.ManifestPath,
-				0, null);
+				swapNotify.AssemblyPath,
+				swapNotify.DepsJsonPath,
+				swapNotify.RuntimeConfigPath,
+				swapNotify.ManifestPath,
+				0, null,
+				swapNotify.StartupHookPath,
+				swapNotify.DirectExe);
 		}
 
 		return 0;
@@ -300,23 +407,42 @@ static class ScriptRunner
 
 	private static ProcessStartInfo BuildProcessStartInfo(RunResponse response, string[] scriptArgs)
 	{
-		var psi = new ProcessStartInfo
+		ProcessStartInfo psi;
+
+		if (response.DirectExe)
 		{
-			FileName = "dotnet",
-			WorkingDirectory = Environment.CurrentDirectory,
-		};
-		psi.ArgumentList.Add("exec");
-		if (response.RuntimeConfigPath != null)
-		{
-			psi.ArgumentList.Add("--runtimeconfig");
-			psi.ArgumentList.Add(response.RuntimeConfigPath);
+			// Tier 2/3 .exe — run directly, not via dotnet exec
+			psi = new ProcessStartInfo
+			{
+				FileName = response.AssemblyPath!,
+				WorkingDirectory = Environment.CurrentDirectory,
+			};
 		}
-		if (response.DepsJsonPath != null)
+		else
 		{
-			psi.ArgumentList.Add("--depsfile");
-			psi.ArgumentList.Add(response.DepsJsonPath);
+			psi = new ProcessStartInfo
+			{
+				FileName = "dotnet",
+				WorkingDirectory = Environment.CurrentDirectory,
+			};
+			psi.ArgumentList.Add("exec");
+			if (response.RuntimeConfigPath != null)
+			{
+				psi.ArgumentList.Add("--runtimeconfig");
+				psi.ArgumentList.Add(response.RuntimeConfigPath);
+			}
+			if (response.DepsJsonPath != null)
+			{
+				psi.ArgumentList.Add("--depsfile");
+				psi.ArgumentList.Add(response.DepsJsonPath);
+			}
+			psi.ArgumentList.Add(response.AssemblyPath!);
 		}
-		psi.ArgumentList.Add(response.AssemblyPath!);
+
+		// Startup hook for binaries that don't reference SeaShell.Script
+		if (response.StartupHookPath != null)
+			psi.Environment["DOTNET_STARTUP_HOOKS"] = response.StartupHookPath;
+
 		foreach (var a in scriptArgs)
 			psi.ArgumentList.Add(a);
 		return psi;
@@ -381,8 +507,12 @@ static class ScriptRunner
 		}
 	}
 
-	/// <summary>Receive messages until ScriptExit. Returns (exitCode, state).</summary>
-	private static async Task<(int exitCode, string? state)> ReceiveUntilExitOrStateAsync(MessageChannel channel)
+	/// <summary>
+	/// Receive messages until ScriptExit. Returns (exitCode, state).
+	/// If reloadWriter is provided, signals it on ScriptReloadRequest (continues reading).
+	/// </summary>
+	private static async Task<(int exitCode, string? state)> ReceiveUntilExitOrStateAsync(
+		MessageChannel channel, ChannelWriter<(string?, bool)>? reloadWriter = null)
 	{
 		string? state = null;
 		while (true)
@@ -390,17 +520,23 @@ static class ScriptRunner
 			var msg = await channel.ReceiveAsync();
 			if (msg == null) return (1, state);
 
-			if (msg.Value.Type == MessageType.ScriptExit)
+			switch (msg.Value.Type)
 			{
-				var exit = (ScriptExit)msg.Value.Message;
-				LastExitDelay = exit.ExitDelay;
-				return (exit.ExitCode, state);
-			}
-			if (msg.Value.Type == MessageType.ScriptState)
-			{
-				var s = (ScriptState)msg.Value.Message;
-				if (!string.IsNullOrEmpty(s.Data))
-					state = s.Data;
+				case MessageType.ScriptExit:
+					var exit = (ScriptExit)msg.Value.Message;
+					LastExitDelay = exit.ExitDelay;
+					return (exit.ExitCode, state);
+
+				case MessageType.ScriptState:
+					var s = (ScriptState)msg.Value.Message;
+					if (!string.IsNullOrEmpty(s.Data))
+						state = s.Data;
+					break;
+
+				case MessageType.ScriptReloadRequest:
+					var req = (ScriptReloadRequest)msg.Value.Message;
+					reloadWriter?.TryWrite((req.Reason, req.ClearCache));
+					break;
 			}
 		}
 	}

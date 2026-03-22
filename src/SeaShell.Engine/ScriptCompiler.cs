@@ -62,11 +62,24 @@ public sealed class ScriptCompiler
 		public string? DepsJsonPath { get; init; }
 		public string? ManifestPath { get; init; }
 		public string? Error { get; init; }
+		/// <summary>Path to SeaShell.Script.dll for DOTNET_STARTUP_HOOKS (binaries without SeaShell ref).</summary>
+		public string? StartupHookPath { get; init; }
+		/// <summary>When true, run the AssemblyPath directly instead of via dotnet exec (Tier 2/3 .exe).</summary>
+		public bool DirectExe { get; init; }
 	}
 
 	public CompileResult Compile(string scriptPath, string[] args)
 	{
 		scriptPath = Path.GetFullPath(scriptPath);
+
+		// ── Binary pass-through (.dll / .exe / extensionless ELF) ──────
+		var ext = Path.GetExtension(scriptPath).ToLowerInvariant();
+		if (ext is ".dll" or ".exe")
+			return CompileBinary(scriptPath);
+		// Extensionless files that are not scripts — treat as binary (Linux ELF single-file)
+		if (ext == "" && File.Exists(scriptPath))
+			return CompileBinary(scriptPath);
+
 		var scriptName = Path.GetFileNameWithoutExtension(scriptPath);
 		var language = ScriptLanguageDetector.FromExtension(scriptPath);
 
@@ -417,5 +430,146 @@ public sealed class ScriptCompiler
 
 		_log.Debug("Resolved {Count} direct, {Total} total NuGet packages", nugets.Count, resolvedPackages.Count);
 		return resolvedPackages;
+	}
+
+	// ── Binary pass-through ────────────────────────────────────────────
+
+	private CompileResult CompileBinary(string binaryPath)
+	{
+		var name = Path.GetFileNameWithoutExtension(binaryPath);
+		var binDir = Path.GetDirectoryName(binaryPath)!;
+		var fileExt = Path.GetExtension(binaryPath).ToLowerInvariant();
+		var isExeOrBare = fileExt is ".exe" or ""; // .exe on Windows, extensionless on Linux
+		var directExe = false;
+
+		// .exe or extensionless → check for companion .dll (Tier 1 apphost)
+		if (isExeOrBare)
+		{
+			var dllPath = Path.Combine(binDir, name + ".dll");
+			if (File.Exists(dllPath))
+			{
+				binaryPath = dllPath; // Tier 1: redirect to managed .dll
+			}
+			else
+			{
+				directExe = true; // Tier 2/3: single-file or Linux ELF, run directly
+			}
+		}
+
+		// Inspect PE metadata (skip for Tier 2/3 — metadata is bundled, unreadable)
+		AssemblyInspector.AssemblyInfo? info = null;
+		if (!directExe)
+		{
+			info = AssemblyInspector.Inspect(binaryPath);
+			if (!info.IsManaged)
+				return new CompileResult { Error = $"Not a managed .NET assembly: {binaryPath}" };
+		}
+
+		// Read companion .sea.json for directives
+		var seaJsonPath = Path.Combine(binDir, name + ".sea.json");
+		var (watch, elevate) = ReadCompanionSeaJson(seaJsonPath);
+
+		// Compute cache hash
+		var hash = CompilationCache.ComputeBinaryHash(binaryPath);
+		var outputDir = Path.Combine(_cacheDir, $"{name}_{hash[..8]}");
+		Directory.CreateDirectory(outputDir);
+
+		_log.Debug("Binary staging for {Name} in {OutputDir}", name, outputDir);
+
+		// Copy SeaShell runtime DLLs to staging
+		foreach (var dll in new[] { "SeaShell.Script.dll", "SeaShell.Ipc.dll",
+		                             "MessagePack.dll", "MessagePack.Annotations.dll" })
+		{
+			var src = Path.Combine(AppContext.BaseDirectory, dll);
+			var dest = Path.Combine(outputDir, dll);
+			if (File.Exists(src)) WriteIfMissing(dest, File.ReadAllBytes(src));
+		}
+
+		// Manifest
+		var manifestPath = Path.Combine(outputDir, $"{name}.sea.json");
+		ArtifactWriter.WriteBinaryManifest(manifestPath, binaryPath);
+
+		// Track for watch mode
+		var watchFiles = new List<string> { binaryPath };
+		if (File.Exists(seaJsonPath)) watchFiles.Add(seaJsonPath);
+
+		// StartupHookPath: set when a .dll binary doesn't reference SeaShell.Script.
+		// For directExe (Tier 2/3 single-file), we don't set startup hooks because:
+		// - Tier 3 (self-contained): bundled runtime can't resolve hook deps from staging
+		// - If the binary bundles SeaShell.Script, it already has the module initializer
+		// - If it doesn't, graceful degradation (pipe connect timeout, runs without Sea context)
+		string? startupHookPath = (!directExe && info is { HasSeaShellRef: false })
+			? Path.Combine(outputDir, "SeaShell.Script.dll")
+			: null;
+
+		if (directExe)
+		{
+			// Tier 2/3: run .exe directly
+			_lastSourcesByScript[binaryPath] = watchFiles.ToArray();
+
+			return new CompileResult
+			{
+				Success = true,
+				Watch = watch,
+				Elevate = elevate,
+				AssemblyPath = binaryPath,
+				ManifestPath = manifestPath,
+				StartupHookPath = startupHookPath,
+				DirectExe = true,
+			};
+		}
+
+		// Tier 1 / .dll: stage for dotnet exec
+		var stagedDll = Path.Combine(outputDir, $"{name}.dll");
+		WriteIfMissing(stagedDll, File.ReadAllBytes(binaryPath));
+
+		var stagedRtc = Path.Combine(outputDir, $"{name}.runtimeconfig.json");
+		var companionRtc = Path.Combine(binDir, $"{name}.runtimeconfig.json");
+		if (File.Exists(companionRtc))
+			WriteIfMissing(stagedRtc, File.ReadAllBytes(companionRtc));
+		else
+			ArtifactWriter.WriteRuntimeConfig(stagedRtc, info!.HasAspNetRef);
+
+		var stagedDeps = Path.Combine(outputDir, $"{name}.deps.json");
+		var companionDeps = Path.Combine(binDir, $"{name}.deps.json");
+		if (File.Exists(companionDeps))
+			WriteIfMissing(stagedDeps, File.ReadAllBytes(companionDeps));
+		else
+			DepsJsonWriter.Write(stagedDeps, name, new List<NuGetResolver.ResolvedPackage>());
+
+		if (File.Exists(companionRtc)) watchFiles.Add(companionRtc);
+		if (File.Exists(companionDeps)) watchFiles.Add(companionDeps);
+		_lastSourcesByScript[binaryPath] = watchFiles.ToArray();
+
+		return new CompileResult
+		{
+			Success = true,
+			Watch = watch,
+			Elevate = elevate,
+			AssemblyPath = stagedDll,
+			RuntimeConfigPath = stagedRtc,
+			DepsJsonPath = stagedDeps,
+			ManifestPath = manifestPath,
+			StartupHookPath = startupHookPath,
+		};
+	}
+
+	private static (bool watch, bool elevate) ReadCompanionSeaJson(string path)
+	{
+		if (!File.Exists(path)) return (false, false);
+		try
+		{
+			var json = File.ReadAllText(path);
+			var opts = new System.Text.Json.JsonSerializerOptions { PropertyNameCaseInsensitive = true };
+			var data = System.Text.Json.JsonSerializer.Deserialize<CompanionSeaJson>(json, opts);
+			return (data?.Watch ?? false, data?.Elevate ?? false);
+		}
+		catch { return (false, false); }
+	}
+
+	private sealed class CompanionSeaJson
+	{
+		public bool Watch { get; set; }
+		public bool Elevate { get; set; }
 	}
 }
