@@ -168,7 +168,12 @@ jobs:
             'build/net10.0/SeaShell.Script.dll',
             'build/net10.0/SeaShell.Ipc.dll',
             'build/net10.0/MessagePack.dll',
-            'build/net10.0/MessagePack.Annotations.dll'
+            'build/net10.0/MessagePack.Annotations.dll',
+            'buildTransitive/net10.0/SeaShell.Host.targets',
+            'buildTransitive/net10.0/SeaShell.Script.dll',
+            'buildTransitive/net10.0/SeaShell.Ipc.dll',
+            'buildTransitive/net10.0/MessagePack.dll',
+            'buildTransitive/net10.0/MessagePack.Annotations.dll'
           )
 
           Write-Host "`n=== SeaShell.Engine ==="

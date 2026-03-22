@@ -11,6 +11,9 @@ obj/
 src/SeaShell.Host/build/net10.0/*.dll
 src/SeaShell.Host/build/net10.0/*.pdb
 src/SeaShell.Host/build/net10.0/*.xml
+src/SeaShell.Host/buildTransitive/net10.0/*.dll
+src/SeaShell.Host/buildTransitive/net10.0/*.pdb
+src/SeaShell.Host/buildTransitive/net10.0/*.xml
 test/smoke-publish/
 test/SmokeApp/publish/
 

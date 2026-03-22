@@ -34,9 +34,12 @@
 			             Condition="%(Filename) == 'SeaShell.Script' or %(Filename) == 'SeaShell.Ipc'
 			                     or %(Filename) == 'MessagePack' or %(Filename) == 'MessagePack.Annotations'" />
 		</ItemGroup>
+		<!-- build/ = direct consumers, buildTransitive/ = transitive consumers -->
 		<ItemGroup>
 			<_PackageFiles Include="@(_ScriptDlls)" PackagePath="build/net10.0/" />
 			<_PackageFiles Include="build/net10.0/SeaShell.Host.targets" PackagePath="build/net10.0/" />
+			<_PackageFiles Include="@(_ScriptDlls)" PackagePath="buildTransitive/net10.0/" />
+			<_PackageFiles Include="buildTransitive/net10.0/SeaShell.Host.targets" PackagePath="buildTransitive/net10.0/" />
 		</ItemGroup>
 	</Target>
 </Project>

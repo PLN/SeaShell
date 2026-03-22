@@ -1,0 +1,17 @@
+<Project>
+	<!-- SeaShell runtime DLLs bundled in the Host NuGet package.
+	     Script is added as a compile-time reference (consumers use Sea.* APIs).
+	     All DLLs are copied to consumer output (Engine loads them at runtime). -->
+	<ItemGroup>
+		<Reference Include="SeaShell.Script"
+		           HintPath="$(MSBuildThisFileDirectory)SeaShell.Script.dll"
+		           Private="true" />
+		<Reference Include="SeaShell.Ipc"
+		           HintPath="$(MSBuildThisFileDirectory)SeaShell.Ipc.dll"
+		           Private="true" />
+		<None Include="$(MSBuildThisFileDirectory)MessagePack.dll"
+		      CopyToOutputDirectory="PreserveNewest" Link="MessagePack.dll" />
+		<None Include="$(MSBuildThisFileDirectory)MessagePack.Annotations.dll"
+		      CopyToOutputDirectory="PreserveNewest" Link="MessagePack.Annotations.dll" />
+	</ItemGroup>
+</Project>
