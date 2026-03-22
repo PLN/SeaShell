@@ -98,7 +98,7 @@ jobs:
       - name: Service smoke — verify running + reload cycle
         shell: bash
         run: |
-          sleep 5
+          sleep 3
           echo "=== Verify service is running ==="
           if [[ "$RUNNER_OS" == "Windows" ]]; then
             sc.exe query seashell-smoke | grep -i RUNNING
@@ -114,7 +114,7 @@ jobs:
           fi
           echo "PID before reload: $PID1"
 
-          echo "=== Wait for first RequestReload (5s + margin) ==="
+          echo "=== Wait for RequestReload cycle (fires every 5s) ==="
           sleep 15
 
           echo "=== Verify SmokeApp reloaded (PID changed) ==="

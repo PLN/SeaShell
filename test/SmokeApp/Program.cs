@@ -39,14 +39,10 @@ while (!Sea.ShutdownToken.IsCancellationRequested)
 	iteration++;
 	Console.WriteLine($"[SmokeApp] Heartbeat #{iteration} (reload #{Sea.ReloadCount})");
 
-	// First reload after 5s (1 iteration), then every 30s (6 iterations)
-	var reloadInterval = Sea.ReloadCount == 0 ? 1 : 6;
-	if (iteration % reloadInterval == 0)
-	{
-		Console.WriteLine($"[SmokeApp] Requesting reload...");
-		try { Sea.RequestReload(reason: $"auto-reload at iteration {iteration}"); }
-		catch (Exception ex) { Console.WriteLine($"[SmokeApp] RequestReload failed: {ex.Message}"); }
-	}
+	// Request reload every iteration (every 5s) — keeps CI fast
+	Console.WriteLine($"[SmokeApp] Requesting reload...");
+	try { Sea.RequestReload(reason: $"auto-reload at iteration {iteration}"); }
+	catch (Exception ex) { Console.WriteLine($"[SmokeApp] RequestReload failed: {ex.Message}"); }
 
 	try { await Task.Delay(5000, Sea.ShutdownToken); }
 	catch (OperationCanceledException) { break; }
