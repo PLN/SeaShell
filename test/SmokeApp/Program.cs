@@ -52,14 +52,14 @@ var scriptCode = $$"""
 	Console.WriteLine($"[SmokeScript] PID {Environment.ProcessId} wrote to {logFile}");
 	""";
 
-using var host = new ScriptHost();
+var host = new ScriptHost();
 var scriptResult = await host.RunSnippetAsync(scriptCode);
 if (!scriptResult.Success)
 {
-	Console.Error.WriteLine($"[SmokeApp] Script compilation FAILED:\n{scriptResult.Error}");
+	Console.Error.WriteLine($"[SmokeApp] Script compilation FAILED (exit {scriptResult.ExitCode}):\n{scriptResult.StandardError}");
 	return 1;
 }
-Console.WriteLine($"[SmokeApp] Script ran OK: {scriptResult.Output?.Trim()}");
+Console.WriteLine($"[SmokeApp] Script ran OK: {scriptResult.StandardOutput.Trim()}");
 
 // ── Heartbeat loop ───────────────────────────────────────────────────
 while (!Sea.ShutdownToken.IsCancellationRequested)
@@ -71,7 +71,7 @@ while (!Sea.ShutdownToken.IsCancellationRequested)
 	// Run the script again each iteration
 	var result = await host.RunSnippetAsync(scriptCode);
 	if (!result.Success)
-		Console.Error.WriteLine($"[SmokeApp] Script error: {result.Error}");
+		Console.Error.WriteLine($"[SmokeApp] Script error: {result.StandardError}");
 
 	// Request reload every iteration (every 5s) — keeps CI fast
 	Console.WriteLine($"[SmokeApp] Requesting reload...");

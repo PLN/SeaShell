@@ -1,12 +1,14 @@
 <Project>
-	<!-- Copy SeaShell runtime DLLs to consumer output directories.
-	     These are bundled in the NuGet package (not listed as dependencies)
-	     because the Engine loads them explicitly at AppContext.BaseDirectory. -->
+	<!-- SeaShell runtime DLLs bundled in the Host NuGet package.
+	     Script is added as a compile-time reference (consumers use Sea.* APIs).
+	     All DLLs are copied to consumer output (Engine loads them at runtime). -->
 	<ItemGroup>
-		<None Include="$(MSBuildThisFileDirectory)SeaShell.Script.dll"
-		      CopyToOutputDirectory="PreserveNewest" Link="SeaShell.Script.dll" />
-		<None Include="$(MSBuildThisFileDirectory)SeaShell.Ipc.dll"
-		      CopyToOutputDirectory="PreserveNewest" Link="SeaShell.Ipc.dll" />
+		<Reference Include="SeaShell.Script"
+		           HintPath="$(MSBuildThisFileDirectory)SeaShell.Script.dll"
+		           Private="true" />
+		<Reference Include="SeaShell.Ipc"
+		           HintPath="$(MSBuildThisFileDirectory)SeaShell.Ipc.dll"
+		           Private="true" />
 		<None Include="$(MSBuildThisFileDirectory)MessagePack.dll"
 		      CopyToOutputDirectory="PreserveNewest" Link="MessagePack.dll" />
 		<None Include="$(MSBuildThisFileDirectory)MessagePack.Annotations.dll"
