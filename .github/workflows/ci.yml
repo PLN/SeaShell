@@ -197,7 +197,11 @@ jobs:
           fi
           sleep 1
 
-      - name: Lifecycle — status (daemon running after smoke tests)
+      # Restart daemon via a quick script run, then test lifecycle
+      - name: Lifecycle — restart daemon
+        run: dotnet run --project src/SeaShell.Cli -- test/hello.cs
+
+      - name: Lifecycle — status (daemon running)
         run: dotnet run --project src/SeaShell.Cli -- --status
 
       - name: Lifecycle — stop
