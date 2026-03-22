@@ -3,15 +3,27 @@ name: CI
 on:
   push:
     branches: [main]
-    tags: ['v*']
   pull_request:
     branches: [main]
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: 'Publish packages to nuget.org'
+        type: boolean
+        default: true
+
+# ── Job 1: Build ────────────────────────────────────────────────────────
+# Compile on both platforms, produce platform-specific binaries.
 
 jobs:
   build:
     strategy:
       matrix:
-        os: [windows-latest, ubuntu-latest]
+        include:
+          - os: windows-latest
+            rid: win-x64
+          - os: ubuntu-latest
+            rid: linux-x64
     runs-on: ${{ matrix.os }}
 
     steps:
@@ -26,33 +38,209 @@ jobs:
       - name: Build
         run: dotnet build -c Release
 
+      - name: Publish CLI + Daemon + Elevator
+        run: |
+          dotnet publish src/SeaShell.Cli/SeaShell.Cli.csproj -c Release -r ${{ matrix.rid }} --self-contained false -o ./publish/${{ matrix.rid }}
+          dotnet publish src/SeaShell.Daemon/SeaShell.Daemon.csproj -c Release -r ${{ matrix.rid }} --self-contained false -o ./publish/${{ matrix.rid }}
+          dotnet publish src/SeaShell.Elevator/SeaShell.Elevator.csproj -c Release -r ${{ matrix.rid }} --self-contained false -o ./publish/${{ matrix.rid }}
+
+      - name: Upload binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: binaries-${{ matrix.rid }}
+          path: publish/${{ matrix.rid }}/
+
+  # ── Job 2: Package ───────────────────────────────────────────────────
+  # Assemble .nupkg files with both platforms' apphosts.
+
+  package:
+    needs: build
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup .NET 10
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+          dotnet-quality: 'preview'
+
+      - name: Download Windows binaries
+        uses: actions/download-artifact@v4
+        with:
+          name: binaries-win-x64
+          path: publish/win-x64/
+
+      - name: Download Linux binaries
+        uses: actions/download-artifact@v4
+        with:
+          name: binaries-linux-x64
+          path: publish/linux-x64/
+
       - name: Pack
         run: dotnet pack -c Release -o ./nupkg
 
-      - name: Publish (win-x64)
-        if: runner.os == 'Windows'
-        run: dotnet publish src/SeaShell.Cli/SeaShell.Cli.csproj -c Release -r win-x64 --self-contained false -o ./publish/win-x64
+      - name: Inject Linux apphosts into tool package
+        shell: pwsh
+        run: |
+          $nupkg = (Get-ChildItem nupkg/SeaShell.0.*.nupkg).FullName
+          Write-Host "Injecting Linux apphosts into $nupkg"
 
-      - name: Publish (linux-x64)
-        if: runner.os == 'Linux'
-        run: dotnet publish src/SeaShell.Cli/SeaShell.Cli.csproj -c Release -r linux-x64 --self-contained false -o ./publish/linux-x64
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
 
-      # Smoke tests — exercise the full pipeline: daemon, compiler, pipe, script
+          $zip = [System.IO.Compression.ZipFile]::Open($nupkg, 'Update')
+          try {
+            foreach ($f in @('seashell-daemon', 'seashell-elevator')) {
+              $src = "publish/linux-x64/$f"
+              if (Test-Path $src) {
+                $entryName = "tools/net10.0/any/$f"
+                Write-Host "  Adding $entryName"
+                [System.IO.Compression.ZipFileExtensions]::CreateEntryFromFile(
+                  $zip, $src, $entryName) | Out-Null
+              }
+            }
+
+            # Patch [Content_Types].xml for extensionless files
+            $ctEntry = $zip.GetEntry('[Content_Types].xml')
+            $reader = [System.IO.StreamReader]::new($ctEntry.Open())
+            $ct = $reader.ReadToEnd()
+            $reader.Close()
+
+            foreach ($f in @('seashell-daemon', 'seashell-elevator')) {
+              $override = "<Override PartName=`"/tools/net10.0/any/$f`" ContentType=`"application/octet`" />"
+              if ($ct -notmatch [regex]::Escape($f)) {
+                $ct = $ct -replace '</Types>', "  $override`n</Types>"
+              }
+            }
+
+            $ctEntry.Delete()
+            $newEntry = $zip.CreateEntry('[Content_Types].xml')
+            $writer = [System.IO.StreamWriter]::new($newEntry.Open())
+            $writer.Write($ct)
+            $writer.Close()
+          }
+          finally {
+            $zip.Dispose()
+          }
+
+      - name: Validate package contents
+        shell: pwsh
+        run: |
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $failed = $false
+
+          function Assert-Contains($nupkg, $expected) {
+            $zip = [System.IO.Compression.ZipFile]::OpenRead($nupkg)
+            $entries = $zip.Entries | ForEach-Object { $_.FullName }
+            $zip.Dispose()
+            foreach ($e in $expected) {
+              $match = $entries | Where-Object { $_ -like $e }
+              if ($match) {
+                Write-Host "  OK: $e"
+              } else {
+                Write-Host "  MISSING: $e" -ForegroundColor Red
+                $script:failed = $true
+              }
+            }
+          }
+
+          Write-Host "=== SeaShell (tool) ==="
+          $pkg = (Get-ChildItem nupkg/SeaShell.0.*.nupkg).FullName
+          Assert-Contains $pkg @(
+            'tools/net10.0/any/sea.dll',
+            'tools/net10.0/any/seashell-daemon.dll',
+            'tools/net10.0/any/seashell-daemon.exe',
+            'tools/net10.0/any/seashell-daemon',
+            'tools/net10.0/any/seashell-elevator.exe',
+            'tools/net10.0/any/seashell-elevator',
+            'tools/net10.0/any/SeaShell.Engine.dll',
+            'tools/net10.0/any/SeaShell.Script.dll',
+            'tools/net10.0/any/SeaShell.Ipc.dll',
+            'tools/net10.0/any/MessagePack.dll'
+          )
+
+          Write-Host "`n=== SeaShell.Host ==="
+          $pkg = (Get-ChildItem nupkg/SeaShell.Host.*.nupkg).FullName
+          Assert-Contains $pkg @(
+            'lib/net10.0/SeaShell.Host.dll',
+            'build/net10.0/SeaShell.Host.targets',
+            'build/net10.0/SeaShell.Script.dll',
+            'build/net10.0/SeaShell.Ipc.dll',
+            'build/net10.0/MessagePack.dll',
+            'build/net10.0/MessagePack.Annotations.dll'
+          )
+
+          Write-Host "`n=== SeaShell.Engine ==="
+          $pkg = (Get-ChildItem nupkg/SeaShell.Engine.*.nupkg).FullName
+          Assert-Contains $pkg @('lib/net10.0/SeaShell.Engine.dll')
+
+          Write-Host "`n=== SeaShell.Ipc ==="
+          $pkg = (Get-ChildItem nupkg/SeaShell.Ipc.*.nupkg).FullName
+          Assert-Contains $pkg @('lib/net10.0/SeaShell.Ipc.dll')
+
+          Write-Host "`n=== SeaShell.ServiceHost ==="
+          $pkg = (Get-ChildItem nupkg/SeaShell.ServiceHost.*.nupkg).FullName
+          Assert-Contains $pkg @('lib/net10.0/SeaShell.ServiceHost.dll')
+
+          if ($failed) {
+            Write-Host "`nPackage validation FAILED" -ForegroundColor Red
+            exit 1
+          }
+          Write-Host "`nAll packages validated OK" -ForegroundColor Green
+
+      - name: Upload packages
+        uses: actions/upload-artifact@v4
+        with:
+          name: nupkg
+          path: nupkg/
+
+  # ── Job 3: Test ──────────────────────────────────────────────────────
+  # Test the actual packages, not source. Installs sea from the tool
+  # package and runs smoke tests on both platforms.
+
+  test:
+    needs: package
+    strategy:
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: test/
+
+      - name: Setup .NET 10
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+          dotnet-quality: 'preview'
+
+      - name: Download packages
+        uses: actions/download-artifact@v4
+        with:
+          name: nupkg
+          path: nupkg/
+
+      - name: Install sea tool from package
+        shell: bash
+        run: |
+          dotnet tool install --global SeaShell --add-source ./nupkg --version "*-*" || \
+          dotnet tool install --global SeaShell --add-source ./nupkg
+          echo "Installed: $(sea --version 2>&1 || true)"
+
+      # ── Script smoke tests ──────────────────────────────────────────
       - name: Smoke test — hello.cs
-        run: dotnet run --project src/SeaShell.Cli -- test/hello.cs
+        run: sea test/hello.cs
 
       - name: Smoke test — sea_context_test.cs
-        run: dotnet run --project src/SeaShell.Cli -- test/sea_context_test.cs
+        run: sea test/sea_context_test.cs
 
       - name: Smoke test — interactive_ok.cs
-        run: dotnet run --project src/SeaShell.Cli -- test/interactive_ok.cs
+        run: sea test/interactive_ok.cs
 
-      # Lifecycle tests — daemon start/stop/status
-      # ── Service smoke test ─────────────────────────────────────────────
-      # Exercises all three new features: binary running, RequestReload, ServiceHost.
-      # Publishes SmokeApp as a single-file exe, runs it via ServiceHost as a
-      # platform service, verifies the reload cycle, then stops and uninstalls.
-
+      # ── Service smoke test ──────────────────────────────────────────
       - name: Service smoke — publish SmokeApp (single-file)
         shell: bash
         run: |
@@ -118,7 +306,6 @@ jobs:
           sleep 15
 
           echo "=== Verify SmokeApp reloaded (PID changed) ==="
-          # Retry a few times — SmokeApp may be mid-restart (brief gap between kill and new process)
           PID2=""
           for i in 1 2 3 4 5; do
             if [[ "$RUNNER_OS" == "Windows" ]]; then
@@ -152,7 +339,6 @@ jobs:
             sudo test/smoke-publish/SmokeService/SmokeService stop
           fi
 
-          # Wait for service + child process to fully exit
           for i in 1 2 3 4 5 6; do
             sleep 2
             ORPHAN=""
@@ -185,37 +371,29 @@ jobs:
             sudo test/smoke-publish/SmokeService/SmokeService uninstall
           fi
 
-      # ── Lifecycle tests ────────────────────────────────────────────────
-      # Daemon runs from staged data dir — no DLL locks on bin/.
+      # ── Lifecycle tests ─────────────────────────────────────────────
       - name: Lifecycle — status (daemon running after smoke tests)
-        run: dotnet run --project src/SeaShell.Cli -- --status
+        run: sea --status
 
       - name: Lifecycle — stop
-        run: dotnet run --project src/SeaShell.Cli -- --stop
+        run: sea --stop
 
       - name: Lifecycle — status after stop
-        run: dotnet run --project src/SeaShell.Cli -- --status || true
+        run: sea --status || true
 
       - name: Lifecycle — stop when already stopped (idempotent)
-        run: dotnet run --project src/SeaShell.Cli -- --stop
+        run: sea --stop
 
-      # Upload Linux apphosts for cross-platform NuGet package
-      - name: Upload Linux apphosts
-        if: startsWith(github.ref, 'refs/tags/v') && runner.os == 'Linux'
-        uses: actions/upload-artifact@v4
-        with:
-          name: apphosts-linux
-          path: |
-            src/SeaShell.Cli/bin/Release/net10.0/seashell-daemon
-            src/SeaShell.Cli/bin/Release/net10.0/seashell-elevator
+  # ── Job 4: Publish ──────────────────────────────────────────────────
+  # Manual workflow_dispatch only. Pushes packages to nuget.org,
+  # then bumps the version in Directory.Build.props.
 
-  # Publish to nuget.org on version tags (v*)
-  # Packs on Windows (gets .exe apphosts natively from the build),
-  # then injects Linux ELF apphosts into the nupkg.
   publish:
-    needs: build
-    if: startsWith(github.ref, 'refs/tags/v')
+    needs: test
+    if: github.event_name == 'workflow_dispatch' && inputs.publish
     runs-on: windows-latest
+    permissions:
+      contents: write
 
     steps:
       - uses: actions/checkout@v4
@@ -226,67 +404,11 @@ jobs:
           dotnet-version: '10.0.x'
           dotnet-quality: 'preview'
 
-      - name: Pack
-        run: dotnet pack -c Release -o ./nupkg
-
-      - name: Download Linux apphosts
+      - name: Download packages
         uses: actions/download-artifact@v4
         with:
-          name: apphosts-linux
-          path: linux-apphosts/
-
-      - name: Inject Linux apphosts into nupkg
-        shell: pwsh
-        run: |
-          $nupkg = (Get-ChildItem nupkg/SeaShell.0.*.nupkg).FullName
-          Write-Host "Injecting Linux apphosts into $nupkg"
-
-          Add-Type -AssemblyName System.IO.Compression.FileSystem
-
-          $zip = [System.IO.Compression.ZipFile]::Open($nupkg, 'Update')
-          try {
-            # Add Linux ELF apphosts
-            foreach ($f in Get-ChildItem linux-apphosts/*) {
-              $entryName = "tools/net10.0/any/$($f.Name)"
-              Write-Host "  Adding $entryName"
-              [System.IO.Compression.ZipFileExtensions]::CreateEntryFromFile(
-                $zip, $f.FullName, $entryName) | Out-Null
-            }
-
-            # Patch [Content_Types].xml — add Override entries for extensionless files
-            $ctEntry = $zip.GetEntry('[Content_Types].xml')
-            $reader = [System.IO.StreamReader]::new($ctEntry.Open())
-            $ct = $reader.ReadToEnd()
-            $reader.Close()
-
-            foreach ($f in Get-ChildItem linux-apphosts/*) {
-              $override = "<Override PartName=`"/tools/net10.0/any/$($f.Name)`" ContentType=`"application/octet`" />"
-              if ($ct -notmatch [regex]::Escape($f.Name)) {
-                $ct = $ct -replace '</Types>', "  $override`n</Types>"
-              }
-            }
-
-            # Rewrite [Content_Types].xml
-            $ctEntry.Delete()
-            $newEntry = $zip.CreateEntry('[Content_Types].xml')
-            $writer = [System.IO.StreamWriter]::new($newEntry.Open())
-            $writer.Write($ct)
-            $writer.Close()
-          }
-          finally {
-            $zip.Dispose()
-          }
-
-          # Verify
-          $zip = [System.IO.Compression.ZipFile]::OpenRead($nupkg)
-          $names = $zip.Entries | ForEach-Object { $_.FullName }
-          foreach ($f in @('seashell-daemon', 'seashell-daemon.exe',
-                           'seashell-elevator', 'seashell-elevator.exe')) {
-            $path = "tools/net10.0/any/$f"
-            $status = if ($names -contains $path) { 'OK' } else { 'MISSING' }
-            Write-Host "  ${path}: $status"
-          }
-          $zip.Dispose()
+          name: nupkg
+          path: nupkg/
 
       - name: Push to nuget.org
         shell: pwsh
@@ -297,3 +419,39 @@ jobs:
           }
         env:
           NUGET_API_KEY: ${{ secrets.NUGET_API_KEY }}
+
+      - name: Read current version
+        id: version
+        shell: pwsh
+        run: |
+          $props = Get-Content Directory.Build.props -Raw
+          if ($props -match '<Version>(\d+\.\d+\.\d+)</Version>') {
+            $current = $Matches[1]
+            Write-Host "Current version: $current"
+            echo "current=$current" >> $env:GITHUB_OUTPUT
+            # Bump patch
+            $parts = $current.Split('.')
+            $parts[2] = [int]$parts[2] + 1
+            $next = $parts -join '.'
+            Write-Host "Next version: $next"
+            echo "next=$next" >> $env:GITHUB_OUTPUT
+          }
+
+      - name: Bump version
+        shell: pwsh
+        run: |
+          $file = 'Directory.Build.props'
+          $content = Get-Content $file -Raw
+          $content = $content -replace '<Version>${{ steps.version.outputs.current }}</Version>', '<Version>${{ steps.version.outputs.next }}</Version>'
+          Set-Content $file $content -NoNewline
+
+      - name: Create git tag
+        run: git tag v${{ steps.version.outputs.current }}
+
+      - name: Commit and push version bump
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Directory.Build.props
+          git commit -m "Bump version to ${{ steps.version.outputs.next }} after publishing ${{ steps.version.outputs.current }}"
+          git push origin main --tags
