@@ -293,7 +293,18 @@ jobs:
       - name: Service smoke — verify running + reload cycle + log files
         shell: bash
         run: |
-          sleep 3
+          # First compilation takes 10-20s on CI (Roslyn cold start)
+          sleep 30
+
+          echo "=== Service journal (diagnostics) ==="
+          if [[ "$RUNNER_OS" == "Windows" ]]; then
+            # Windows services log to stdout captured by ServiceHost
+            true
+          else
+            sudo journalctl -u seashell-smoke --no-pager -n 50 || true
+          fi
+
+          echo ""
           echo "=== Verify service is running ==="
           if [[ "$RUNNER_OS" == "Windows" ]]; then
             sc.exe query seashell-smoke | grep -i RUNNING
@@ -339,8 +350,15 @@ jobs:
 
           echo ""
           echo "=== Verify log files (Host-in-Host test) ==="
-          APP_LOG="$SMOKE_LOG_DIR/smokeapp.log"
-          SCRIPT_LOG="$SMOKE_LOG_DIR/smokescript.log"
+          # SMOKE_LOG_DIR doesn't propagate into the service process.
+          # SmokeApp falls back to $TMPDIR/seashell-smoke.
+          if [[ "$RUNNER_OS" == "Windows" ]]; then
+            LOG_DIR="$TEMP/seashell-smoke"
+          else
+            LOG_DIR="/tmp/seashell-smoke"
+          fi
+          APP_LOG="$LOG_DIR/smokeapp.log"
+          SCRIPT_LOG="$LOG_DIR/smokescript.log"
 
           echo "smokeapp.log:"
           if [[ -f "$APP_LOG" ]]; then
