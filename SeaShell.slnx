@@ -8,5 +8,6 @@
     <Project Path="src/SeaShell.Host/SeaShell.Host.csproj" />
     <Project Path="src/SeaShell.Protocol/SeaShell.Protocol.csproj" />
     <Project Path="src/SeaShell.Script/SeaShell.Script.csproj" />
+    <Project Path="src/SeaShell.ServiceHost/SeaShell.ServiceHost.csproj" />
   </Folder>
 </Solution>

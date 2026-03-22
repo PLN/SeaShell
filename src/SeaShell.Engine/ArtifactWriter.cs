@@ -73,6 +73,26 @@ static class ArtifactWriter
 		File.WriteAllText(path, json);
 	}
 
+	/// <summary>Write a minimal manifest for a pre-compiled binary (no sources/packages).</summary>
+	public static void WriteBinaryManifest(string path, string binaryPath)
+	{
+		var manifest = new
+		{
+			scriptPath = binaryPath,
+			sources = Array.Empty<string>(),
+			packages = new Dictionary<string, string>(),
+			assemblies = Array.Empty<string>(),
+		};
+
+		var json = JsonSerializer.Serialize(manifest, new JsonSerializerOptions
+		{
+			WriteIndented = true,
+			PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
+		});
+
+		File.WriteAllText(path, json);
+	}
+
 	public static string? FindDepsJson(string outputDir, string scriptName)
 	{
 		var path = Path.Combine(outputDir, $"{scriptName}.deps.json");

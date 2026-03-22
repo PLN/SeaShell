@@ -19,6 +19,7 @@ public enum MessageType : byte
 	ScriptState   = 5,
 	HostMessage   = 6,
 	ScriptMessage = 7,
+	ScriptReloadRequest = 8,
 
 	// Daemon protocol (CLI ↔ daemon)
 	PingRequest     = 20,
@@ -31,6 +32,7 @@ public enum MessageType : byte
 	ReplStartResp   = 27,
 	ReplEvalReq     = 28,
 	ReplEvalResp    = 29,
+	RecompileRequest = 30,
 
 	// Elevator protocol (daemon ↔ elevator)
 	ElevatorHello   = 40,
@@ -55,6 +57,7 @@ public static class MessageTypeMap
 		[typeof(ScriptState)]     = MessageType.ScriptState,
 		[typeof(HostMessage)]     = MessageType.HostMessage,
 		[typeof(ScriptMessage)]   = MessageType.ScriptMessage,
+		[typeof(ScriptReloadRequest)] = MessageType.ScriptReloadRequest,
 		[typeof(PingRequest)]     = MessageType.PingRequest,
 		[typeof(PingResponse)]    = MessageType.PingResponse,
 		[typeof(StopRequest)]     = MessageType.StopRequest,
@@ -65,6 +68,7 @@ public static class MessageTypeMap
 		[typeof(ReplStartResponse)] = MessageType.ReplStartResp,
 		[typeof(ReplEvalRequest)]   = MessageType.ReplEvalReq,
 		[typeof(ReplEvalResponse)]  = MessageType.ReplEvalResp,
+		[typeof(RecompileRequest)]  = MessageType.RecompileRequest,
 		[typeof(ElevatorHello)]   = MessageType.ElevatorHello,
 		[typeof(ElevatorAck)]     = MessageType.ElevatorAck,
 		[typeof(SpawnRequest)]    = MessageType.SpawnRequest,
@@ -133,6 +137,9 @@ public sealed record HostMessage(byte[] Payload, string? Topic);
 /// <summary>Script → Launcher: application message during execution.</summary>
 public sealed record ScriptMessage(byte[] Payload, string? Topic);
 
+/// <summary>Script → Launcher: script requests to be recompiled and reloaded.</summary>
+public sealed record ScriptReloadRequest(string? Reason, bool ClearCache = false);
+
 // ── CLI → Daemon ────────────────────────────────────────────────────────
 
 public sealed record RunRequest(
@@ -140,7 +147,8 @@ public sealed record RunRequest(
 	string[] Args,
 	string WorkingDirectory,
 	string[] EnvironmentVars,
-	int CliPid
+	int CliPid,
+	bool ClearCache = false
 );
 
 /// <summary>
@@ -158,7 +166,9 @@ public sealed record RunResponse(
 	string? RuntimeConfigPath,
 	string? ManifestPath,
 	int ProcessId,
-	string? Error
+	string? Error,
+	string? StartupHookPath = null,
+	bool DirectExe = false
 );
 
 /// <summary>
@@ -170,7 +180,9 @@ public sealed record HotSwapNotify(
 	string? DepsJsonPath,
 	string? RuntimeConfigPath,
 	string? ManifestPath,
-	string Reason
+	string Reason,
+	string? StartupHookPath = null,
+	bool DirectExe = false
 );
 
 public sealed record PingRequest();
@@ -180,10 +192,15 @@ public sealed record PingResponse(
 	bool IsElevated,
 	bool ElevatorConnected,
 	int UptimeSeconds,
-	int ActiveScripts
+	int ActiveScripts,
+	int Pid = 0,
+	string? DaemonHash = null
 );
 
 public sealed record StopRequest();
+
+/// <summary>CLI → Daemon: request immediate recompilation (triggered by script-initiated reload).</summary>
+public sealed record RecompileRequest(bool ClearCache = false);
 
 // ── REPL protocol ───────────────────────────────────────────────────
 

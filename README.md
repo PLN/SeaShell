@@ -6,6 +6,17 @@ A C# and VB.NET scripting engine with a persistent daemon, NuGet support, hot-sw
 
 ## Install
 
+**Windows** (PowerShell):
+```powershell
+iex (irm https://raw.githubusercontent.com/PLN/SeaShell/main/install.ps1)
+```
+
+**Linux**:
+```bash
+curl -fsSL https://raw.githubusercontent.com/PLN/SeaShell/main/install.sh | sh
+```
+
+**Manual**:
 ```
 dotnet tool install -g SeaShell
 ```
@@ -16,6 +27,8 @@ dotnet tool install -g SeaShell
 sea                             Interactive REPL
 sea script.cs                   Run a C# script
 sea script.vb                   Run a VB.NET script
+sea myapp.dll                   Run a pre-compiled .NET assembly
+sea myapp.exe                   Run a single-file .exe
 sea -i Humanizer.Core           REPL with NuGet packages preloaded
 sea --associate .cs             Associate .cs files with SeaShell
 ```
@@ -33,7 +46,10 @@ SeaShell is inspired by and grateful to [CS-Script](https://github.com/oleg-shil
 - **Hot-swap** — Edit a `//sea_watch` script while it runs. SeaShell recompiles and swaps the process, with state handoff between instances.
 - **REPL** — `sea` with no arguments drops into an interactive session. Variables and state carry across evaluations.
 - **Elevation** — `//sea_elevate` scripts run elevated via a pre-registered Task Scheduler worker. No UAC prompts. Falls back to `gsudo sea script.cs` if the elevator isn't running. Ignored on Linux.
-- **Embeddable** — `SeaShell.Host` lets you compile and run scripts from your own application. No daemon required.
+- **Binary running** — Run pre-compiled `.dll` and `.exe` files with full Sea context. Single-file executables, apphosts, and plain DLLs all supported. Companion `.sea.json` enables directives for binaries.
+- **Script-initiated reload** — `Sea.RequestReload()` triggers recompilation and hot-swap from within a script. Optional `clearCache` for forced fresh builds. Works in both direct and watch mode.
+- **Service hosting** — `SeaShell.ServiceHost` runs scripts as system services. Windows Service, systemd, runit, OpenRC, sysvinit — auto-detected. Zero-locking automatic updates via NuGet.
+- **Embeddable** — `SeaShell.Host` lets you compile and run scripts from your own application. No daemon required. Supports reload and watch mode internally.
 - **VB.NET support** — `.vb` files compile through the same pipeline with VB-native directives (`'sea_nuget`).
 - **CS-Script compatible** — `//css_inc`, `//css_nuget` directives are recognized. Existing `.cscs` scripts work with zero changes.
 - **Cross-platform** — Named pipes on Windows, Unix domain sockets on Linux. Shebangs supported (`#!/usr/bin/env sea`).
@@ -104,10 +120,16 @@ Sea.Assemblies          // All managed DLL paths
 // Hot-swap lifecycle
 Sea.IsReload            // True if this is a hot-swap restart
 Sea.ReloadCount         // Number of reloads so far
+Sea.IsWatchMode         // True when running with //sea_watch
 Sea.IsShuttingDown      // True after Reloading/Stopping fires
 Sea.ShutdownToken       // CancellationToken — cancelled on reload/stop
 Sea.Reloading           // Event: script is about to be replaced
 Sea.Stopping            // Event: clean stop requested (Ctrl+C)
+
+// Script-initiated reload
+Sea.RequestReload()                     // Trigger recompile + hot-swap
+Sea.RequestReload(clearCache: true)     // Force fresh build (clear cache first)
+Sea.RequestReloadAsync(...)             // Async variant
 
 // Reload state handoff (max 8 KB)
 Sea.SetReloadState(bytes)       // Pass state to next instance
@@ -191,6 +213,37 @@ Sea.SendMessage("{\"status\":\"ready\"}", "status");
 
 Messages are binary (`byte[]`) with an optional `string` topic for routing. String convenience overloads encode as UTF-8.
 
+## Service Hosting (SeaShell.ServiceHost)
+
+Run any script or binary as a system service with automatic updates:
+
+```csharp
+using SeaShell.ServiceHost;
+
+return await new ServiceHostBuilder()
+    .ServiceName("myservice")
+    .DisplayName("My Service")
+    .Description("Runs my-script.cs as a system service")
+    .RunScript("my-script.cs")           // or .RunAssembly("myapp.dll")
+    .EnableNuGetUpdates(TimeSpan.FromHours(8))
+    .RunAsync(args);
+```
+
+The binary handles both service mode and management commands:
+
+```
+myservice                   Run as foreground service (invoked by init system)
+myservice install           Auto-detect platform, register service
+myservice uninstall         Remove service registration
+myservice start             Start the registered service
+myservice stop              Stop the registered service
+myservice status            Show service status
+```
+
+Supported init systems (auto-detected): Windows Service, systemd, runit, OpenRC, sysvinit.
+
+**Zero-locking updates**: When `EnableNuGetUpdates` is configured, the service periodically checks for package updates. A new version produces a new compilation cache directory — the old process runs from the old directory, the new one starts from the new directory. No file locks are contested.
+
 ## Task Scheduler (Windows)
 
 Register the daemon and optionally the elevator for automatic startup. Each is a separate, explicit registration:
@@ -201,11 +254,15 @@ sea --install-elevator            Register elevator (requires elevation once)
 sea --uninstall-daemon            Remove daemon task
 sea --uninstall-elevator          Remove elevator task
 sea --start                       Start registered tasks
-sea --stop                        Stop registered tasks
+sea --stop                        Stop daemon and elevator
 sea --status                      Show daemon and elevator status
 ```
 
-The daemon starts automatically on first `sea` invocation even without Task Scheduler. The elevator is optional — without it, elevated scripts fall back to `gsudo sea script.cs`.
+The daemon starts automatically on first `sea` invocation even without Task Scheduler. When a task is registered, `sea` prefers starting it over spawning a separate process — this keeps the daemon under Task Scheduler management.
+
+`--stop` uses IPC first (works for any running daemon, including on Linux), then ends Task Scheduler tasks. It reports actual state — no misleading output when nothing is running.
+
+The elevator is optional — without it, elevated scripts fall back to `gsudo sea script.cs`. When the elevator task is registered but not running, `sea` auto-starts it on demand when an `//sea_elevate` script is run.
 
 ## Project Structure
 
@@ -216,8 +273,9 @@ SeaShell.Elevator  Pre-elevated worker (connects to daemon, no public pipe)
 SeaShell.Engine    Roslyn compiler, NuGet resolver, include system, .deps.json writer
 SeaShell.Script    Sea runtime context (loaded into every script process)
 SeaShell.Ipc       Binary IPC: MessageChannel (MessagePack over System.IO.Pipelines)
-SeaShell.Protocol  Daemon/Elevator protocol messages + transport (named pipes / UDS)
-SeaShell.Host      Embeddable library for other applications
+SeaShell.Protocol     Daemon/Elevator protocol messages + transport (named pipes / UDS)
+SeaShell.Host         Embeddable library for other applications
+SeaShell.ServiceHost  Cross-platform service hosting (Windows Service, systemd, runit, OpenRC, sysvinit)
 ```
 
 See [doc/ARCHITECTURE.md](doc/ARCHITECTURE.md) for the full architecture,
@@ -260,9 +318,24 @@ dotnet tool install -g --add-source ./nupkg SeaShell
 
 ## Notes
 
+### Data Directory
+
+All runtime data lives in a persistent per-user directory (not temp):
+
+| Context | Path |
+|---------|------|
+| Windows user | `%LOCALAPPDATA%\seashell\` |
+| Windows SYSTEM | `%ProgramData%\seashell\` |
+| Linux user | `~/.local/share/seashell/` |
+| Linux root | `/var/lib/seashell/` |
+
+Override with `SEASHELL_DATA` environment variable. Contains: `cache/` (compiled scripts), `daemon/` (staged daemon), `elevator/` (staged elevator), `snippets/` (REPL temp files).
+
+The daemon and elevator binaries are staged to this directory before launching. This eliminates DLL lock conflicts — `dotnet build` always succeeds, even while the daemon is running.
+
 ### Compilation Cache
 
-Compiled scripts are cached in `%TEMP%/seashell/cache/`. The cache key is a SHA256 hash of:
+Compiled scripts are cached in `{DataDir}/cache/`. The cache key is a SHA256 hash of:
 - All source files (main script + includes, by content)
 - All resolved NuGet package versions (name@version)
 - The Engine and Script assembly timestamps
@@ -308,7 +381,8 @@ Edit, save — the new version is serving on the same port in seconds. No downti
 When a script has `//sea_elevate`, the CLI resolves it in order:
 1. Already elevated? (e.g., `gsudo sea script.cs`) — spawn directly
 2. Elevator worker connected to daemon? — delegate to it (no UAC prompt)
-3. Neither — error with a helpful message suggesting `gsudo` or `sea --install-elevator`
+3. Elevator task registered but not running? — auto-start it, wait for it to connect (up to 15s), then delegate
+4. None of the above — error with a helpful message suggesting `gsudo` or `sea --install-elevator`
 
 On Linux, `//sea_elevate` is silently ignored.
 

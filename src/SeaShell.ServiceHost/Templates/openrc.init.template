@@ -1,0 +1,13 @@
+#!/sbin/openrc-run
+
+name="{displayName}"
+description="{description}"
+command="{exePath}"
+command_user="{user}:{group}"
+command_background=true
+pidfile="/run/${RC_SVCNAME}.pid"
+
+depend() {
+	need net
+	after net
+}

@@ -8,6 +8,8 @@ obj/
 # Build artifacts
 /publish/
 /nupkg/
+test/smoke-publish/
+test/SmokeApp/publish/
 
 # SeaShell temp/cache
 /tmp/

@@ -41,10 +41,11 @@ and create a server before the script does.
 
 ### Wire format
 
-All IPC uses JSON envelopes with a type discriminator. There is no authentication
-token or encryption on the pipe — security relies on OS-level access control
-(ACLs and file permissions). This is appropriate for local IPC between processes
-owned by the same user.
+All IPC uses binary MessagePack with length-prefixed framing
+(`[4-byte LE length][1-byte type tag][MessagePack payload]`). There is no
+authentication token or encryption on the pipe — security relies on OS-level
+access control (ACLs and file permissions). This is appropriate for local IPC
+between processes owned by the same user.
 
 ## Elevation
 
