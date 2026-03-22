@@ -5,6 +5,6 @@
 		<Nullable>enable</Nullable>
 	</PropertyGroup>
 	<ItemGroup>
-		<ProjectReference Include="..\..\src\SeaShell.ServiceHost\SeaShell.ServiceHost.csproj" />
+		<PackageReference Include="SeaShell.ServiceHost" Version="0.*" />
 	</ItemGroup>
 </Project>

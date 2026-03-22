@@ -197,7 +197,7 @@ jobs:
 
   # ── Job 3: Test ──────────────────────────────────────────────────────
   # Test the actual packages, not source. Installs sea from the tool
-  # package and runs smoke tests on both platforms.
+  # package, builds test projects against local NuGet source.
 
   test:
     needs: package
@@ -205,6 +205,9 @@ jobs:
       matrix:
         os: [windows-latest, ubuntu-latest]
     runs-on: ${{ matrix.os }}
+
+    env:
+      SMOKE_LOG_DIR: ${{ github.workspace }}/smoke-logs
 
     steps:
       - uses: actions/checkout@v4
@@ -239,29 +242,34 @@ jobs:
         run: sea test/interactive_ok.cs
 
       # ── Service smoke test ──────────────────────────────────────────
-      - name: Service smoke — publish SmokeApp (single-file)
+      # Build test projects against NuGet packages (not source).
+      # SEASHELL_NUPKG_DIR tells test/nuget.config where to find them.
+
+      - name: Service smoke — publish SmokeApp
         shell: bash
+        env:
+          SEASHELL_NUPKG_DIR: ${{ github.workspace }}/nupkg
         run: |
-          if [[ "$RUNNER_OS" == "Windows" ]]; then
-            RID=win-x64
-          else
-            RID=linux-x64
-          fi
-          dotnet publish test/SmokeApp -r $RID -p:PublishSingleFile=true -o test/smoke-publish/SmokeApp
+          if [[ "$RUNNER_OS" == "Windows" ]]; then RID=win-x64; else RID=linux-x64; fi
+          dotnet publish test/SmokeApp --configfile test/nuget.config \
+            -r $RID -p:PublishSingleFile=true -o test/smoke-publish/SmokeApp
 
       - name: Service smoke — publish SmokeService
         shell: bash
+        env:
+          SEASHELL_NUPKG_DIR: ${{ github.workspace }}/nupkg
         run: |
-          if [[ "$RUNNER_OS" == "Windows" ]]; then
-            RID=win-x64
-          else
-            RID=linux-x64
-          fi
-          dotnet publish test/SmokeService -r $RID -o test/smoke-publish/SmokeService
+          if [[ "$RUNNER_OS" == "Windows" ]]; then RID=win-x64; else RID=linux-x64; fi
+          dotnet publish test/SmokeService --configfile test/nuget.config \
+            -r $RID -o test/smoke-publish/SmokeService
 
       - name: Service smoke — create companion .sea.json
         shell: bash
         run: echo '{"watch":true}' > test/smoke-publish/SmokeApp/SmokeApp.sea.json
+
+      - name: Service smoke — create log directory
+        shell: bash
+        run: mkdir -p "$SMOKE_LOG_DIR"
 
       - name: Service smoke — install
         shell: bash
@@ -281,7 +289,7 @@ jobs:
             sudo test/smoke-publish/SmokeService/SmokeService start
           fi
 
-      - name: Service smoke — verify running + reload cycle
+      - name: Service smoke — verify running + reload cycle + log files
         shell: bash
         run: |
           sleep 3
@@ -327,6 +335,41 @@ jobs:
             exit 1
           fi
           echo "PASS: SmokeApp reloaded (PID ${PID1:-?} → $PID2)"
+
+          echo ""
+          echo "=== Verify log files (Host-in-Host test) ==="
+          APP_LOG="$SMOKE_LOG_DIR/smokeapp.log"
+          SCRIPT_LOG="$SMOKE_LOG_DIR/smokescript.log"
+
+          echo "smokeapp.log:"
+          if [[ -f "$APP_LOG" ]]; then
+            APP_LINES=$(wc -l < "$APP_LOG")
+            echo "  $APP_LINES lines"
+            cat "$APP_LOG"
+          else
+            echo "  MISSING"
+            APP_LINES=0
+          fi
+
+          echo "smokescript.log:"
+          if [[ -f "$SCRIPT_LOG" ]]; then
+            SCRIPT_LINES=$(wc -l < "$SCRIPT_LOG")
+            echo "  $SCRIPT_LINES lines"
+            cat "$SCRIPT_LOG"
+          else
+            echo "  MISSING"
+            SCRIPT_LINES=0
+          fi
+
+          if [[ "$APP_LINES" -lt 1 ]]; then
+            echo "FAIL: smokeapp.log has no entries"
+            exit 1
+          fi
+          if [[ "$SCRIPT_LINES" -lt 1 ]]; then
+            echo "FAIL: smokescript.log has no entries — Host-in-Host compilation may have failed (CS1704?)"
+            exit 1
+          fi
+          echo "PASS: Both log files have entries (app=$APP_LINES, script=$SCRIPT_LINES)"
 
       - name: Service smoke — stop and verify clean shutdown
         shell: bash
