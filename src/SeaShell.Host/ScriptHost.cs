@@ -193,6 +193,11 @@ public sealed class ScriptHost
 
 		using var proc = Process.Start(psi)!;
 
+		// Ensure the child process is always killed if we exit unexpectedly
+		// (e.g., cancellation token fires mid-reload before graceful shutdown branch)
+		try
+		{
+
 		// Connect to script's pipe server
 		var pipe = new NamedPipeClientStream(".", pipeName, PipeDirection.InOut, PipeOptions.Asynchronous);
 		try
@@ -202,9 +207,9 @@ public sealed class ScriptHost
 		catch
 		{
 			// Pipe connect failed — run without Sea context
-			await proc.WaitForExitAsync(ct);
-			var o = await proc.StandardOutput.ReadToEndAsync(ct);
-			var e = await proc.StandardError.ReadToEndAsync(ct);
+			await proc.WaitForExitAsync();
+			var o = await proc.StandardOutput.ReadToEndAsync();
+			var e = await proc.StandardError.ReadToEndAsync();
 			return new InstanceResult(proc.ExitCode, o, e, false, false, null);
 		}
 
@@ -277,6 +282,14 @@ public sealed class ScriptHost
 		var se = await stderrTask;
 		if (connection != null) connection.Channel = null;
 		return new InstanceResult(0, so, se, true, clearCache, state);
+
+		}
+		finally
+		{
+			// Kill child process if still running (catches cancellation mid-reload, pipe failures, etc.)
+			if (!proc.HasExited)
+				try { proc.Kill(entireProcessTree: false); } catch { }
+		}
 	}
 
 	private sealed record InstanceResult(
