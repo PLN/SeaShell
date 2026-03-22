@@ -11,6 +11,22 @@
 	</ItemGroup>
 	<ItemGroup>
 		<ProjectReference Include="..\SeaShell.Engine\SeaShell.Engine.csproj" />
-		<ProjectReference Include="..\SeaShell.Script\SeaShell.Script.csproj" />
+		<!-- PrivateAssets=all: Script.dll copies to output for Engine to find,
+		     but does NOT flow as a NuGet dependency to consumers. -->
+		<ProjectReference Include="..\SeaShell.Script\SeaShell.Script.csproj">
+			<PrivateAssets>all</PrivateAssets>
+		</ProjectReference>
 	</ItemGroup>
+
+	<!-- Bundle SeaShell runtime DLLs into the NuGet package.
+	     The .targets file copies them to consumer output directories. -->
+	<ItemGroup>
+		<None Include="build\**" Pack="true" PackagePath="build\" />
+	</ItemGroup>
+
+	<!-- Stage runtime DLLs into build/net10.0/ before packing -->
+	<Target Name="StageScriptBinaries" BeforeTargets="Pack">
+		<Copy SourceFiles="$(OutputPath)SeaShell.Script.dll;$(OutputPath)SeaShell.Ipc.dll;$(OutputPath)MessagePack.dll;$(OutputPath)MessagePack.Annotations.dll"
+		      DestinationFolder="build\net10.0\" SkipUnchangedFiles="true" />
+	</Target>
 </Project>
