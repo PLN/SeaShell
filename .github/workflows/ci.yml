@@ -118,19 +118,30 @@ jobs:
           sleep 15
 
           echo "=== Verify SmokeApp reloaded (PID changed) ==="
-          if [[ "$RUNNER_OS" == "Windows" ]]; then
-            PID2=$(tasklist | grep SmokeApp | awk '{print $2}' || true)
-          else
-            PID2=$(pgrep -f 'SmokeApp' | head -1 || true)
-          fi
-          echo "PID after reload: ${PID2:-(mid-restart)}"
+          # Retry a few times — SmokeApp may be mid-restart (brief gap between kill and new process)
+          PID2=""
+          for i in 1 2 3 4 5; do
+            if [[ "$RUNNER_OS" == "Windows" ]]; then
+              PID2=$(tasklist | grep SmokeApp | awk '{print $2}' || true)
+            else
+              PID2=$(pgrep -f 'SmokeApp' | head -1 || true)
+            fi
+            if [[ -n "$PID2" ]]; then break; fi
+            echo "  attempt $i: not found yet, retrying in 2s..."
+            sleep 2
+          done
 
-          # PID changed OR process is mid-restart (empty) = reload is working
+          echo "PID after reload: ${PID2:-(not found)}"
+
+          if [[ -z "$PID2" ]]; then
+            echo "FAIL: SmokeApp not running after reload"
+            exit 1
+          fi
           if [[ -n "$PID1" && "$PID1" == "$PID2" ]]; then
             echo "FAIL: SmokeApp PID did not change — reload did not happen"
             exit 1
           fi
-          echo "PASS: SmokeApp reloaded (PID ${PID1:-?} → ${PID2:-restarting})"
+          echo "PASS: SmokeApp reloaded (PID ${PID1:-?} → $PID2)"
 
       - name: Service smoke — stop
         shell: bash
