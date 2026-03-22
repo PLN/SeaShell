@@ -186,6 +186,17 @@ jobs:
           fi
 
       # ── Existing lifecycle tests ────────────────────────────────────────
+      # Kill any daemon left from smoke tests (prevents DLL locks during rebuild)
+      - name: Lifecycle — kill stale daemon
+        shell: bash
+        run: |
+          if [[ "$RUNNER_OS" == "Windows" ]]; then
+            taskkill /F /IM seashell-daemon.exe 2>/dev/null || true
+          else
+            pkill -f seashell-daemon 2>/dev/null || true
+          fi
+          sleep 1
+
       - name: Lifecycle — status (daemon running after smoke tests)
         run: dotnet run --project src/SeaShell.Cli -- --status
 
