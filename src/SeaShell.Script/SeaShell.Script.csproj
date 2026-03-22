@@ -1,15 +1,12 @@
 <Project Sdk="Microsoft.NET.Sdk">
-	<!-- Runtime context for scripts. Loaded into every script process. -->
+	<!-- Runtime context for scripts. Loaded into every script process.
+	     Not a standalone NuGet package — bundled as a binary into Engine/Host/Daemon outputs.
+	     The Engine injects this DLL into compiled scripts at compile time. -->
 	<PropertyGroup>
+		<IsPackable>false</IsPackable>
 		<NoWarn>CA2255</NoWarn>
-		<Description>Runtime context library for SeaShell scripts. Provides the Sea static class with script identity, environment info, hot-swap lifecycle, and reload state.</Description>
-		<PackageTags>scripting;seashell;runtime;context</PackageTags>
 		<GenerateDocumentationFile>true</GenerateDocumentationFile>
-		<PackageReadmeFile>README.md</PackageReadmeFile>
 	</PropertyGroup>
-	<ItemGroup>
-		<None Include="README.md" Pack="true" PackagePath="/" />
-	</ItemGroup>
 	<ItemGroup>
 		<ProjectReference Include="..\SeaShell.Ipc\SeaShell.Ipc.csproj" />
 	</ItemGroup>
