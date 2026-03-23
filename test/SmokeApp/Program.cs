@@ -1,14 +1,30 @@
 using System;
+using System.IO;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 using SeaShell;
+using SeaShell.Host;
+
+// ── Host-in-Host smoke test ──────────────────────────────────────────
+// SmokeApp is run by ServiceHost (SmokeService) as a platform service.
+// SmokeApp itself uses ScriptHost to compile and run SmokeScript.cs —
+// a SeaShell script that exercises the Engine+Script pipeline from inside
+// a Host consumer. This is the exact scenario that triggered CS1704
+// (duplicate SeaShell.Script assembly) before the fix.
+
+var logDir = Environment.GetEnvironmentVariable("SMOKE_LOG_DIR")
+	?? Path.Combine(Path.GetTempPath(), "seashell-smoke");
+Directory.CreateDirectory(logDir);
+
+var appLog = Path.Combine(logDir, "smokeapp.log");
+var scriptLog = Path.Combine(logDir, "smokescript.log");
 
 Console.WriteLine($"[SmokeApp] Started (PID {Environment.ProcessId})");
 Console.WriteLine($"[SmokeApp]   ScriptPath:  {Sea.ScriptPath}");
 Console.WriteLine($"[SmokeApp]   IsReload:    {Sea.IsReload}");
 Console.WriteLine($"[SmokeApp]   ReloadCount: {Sea.ReloadCount}");
-Console.WriteLine($"[SmokeApp]   IsWatchMode: {Sea.IsWatchMode}");
+Console.WriteLine($"[SmokeApp]   LogDir:      {logDir}");
 
 var state = Sea.GetReloadStateString();
 if (state != null)
@@ -27,17 +43,35 @@ Sea.Stopping += () =>
 	Console.WriteLine($"[SmokeApp] Stopping event!");
 };
 
-Sea.MessageReceived += (payload, topic) =>
-{
-	var text = Encoding.UTF8.GetString(payload);
-	Console.WriteLine($"[SmokeApp] Message: topic={topic} payload={text}");
-};
+// ── Run SmokeScript via ScriptHost ───────────────────────────────────
+// The script writes its PID to scriptLog. If CS1704 is present, this
+// compilation will fail with "duplicate assembly 'SeaShell.Script'".
+var scriptCode = $$"""
+	var logFile = @"{{scriptLog.Replace("\"", "\"\"")}}";
+	File.AppendAllText(logFile, $"{Environment.ProcessId}\n");
+	Console.WriteLine($"[SmokeScript] PID {Environment.ProcessId} wrote to {logFile}");
+	""";
 
-// Loop: print heartbeat, request reload every 30s
+var host = new ScriptHost();
+var scriptResult = await host.RunSnippetAsync(scriptCode);
+if (!scriptResult.Success)
+{
+	Console.Error.WriteLine($"[SmokeApp] Script compilation FAILED (exit {scriptResult.ExitCode}):\n{scriptResult.StandardError}");
+	return 1;
+}
+Console.WriteLine($"[SmokeApp] Script ran OK: {scriptResult.StandardOutput.Trim()}");
+
+// ── Heartbeat loop ───────────────────────────────────────────────────
 while (!Sea.ShutdownToken.IsCancellationRequested)
 {
 	iteration++;
-	Console.WriteLine($"[SmokeApp] Heartbeat #{iteration} (reload #{Sea.ReloadCount})");
+	File.AppendAllText(appLog, $"{Environment.ProcessId}\n");
+	Console.WriteLine($"[SmokeApp] Heartbeat #{iteration} (PID {Environment.ProcessId})");
+
+	// Run the script again each iteration
+	var result = await host.RunSnippetAsync(scriptCode);
+	if (!result.Success)
+		Console.Error.WriteLine($"[SmokeApp] Script error: {result.StandardError}");
 
 	// Request reload every iteration (every 5s) — keeps CI fast
 	Console.WriteLine($"[SmokeApp] Requesting reload...");
@@ -49,3 +83,4 @@ while (!Sea.ShutdownToken.IsCancellationRequested)
 }
 
 Console.WriteLine($"[SmokeApp] Exiting.");
+return 0;

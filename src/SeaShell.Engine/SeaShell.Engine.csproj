@@ -5,6 +5,8 @@
 		<GenerateDocumentationFile>true</GenerateDocumentationFile>
 		<NoWarn>CS1591</NoWarn>
 		<PackageReadmeFile>README.md</PackageReadmeFile>
+		<!-- Copy NuGet DLLs (MessagePack etc.) to output so they can be bundled in the package -->
+		<CopyLocalLockFileAssemblies>true</CopyLocalLockFileAssemblies>
 	</PropertyGroup>
 	<ItemGroup>
 		<None Include="README.md" Pack="true" PackagePath="/" />
@@ -13,5 +15,29 @@
 		<PackageReference Include="Microsoft.CodeAnalysis.CSharp" Version="5.3.0" />
 		<PackageReference Include="Microsoft.CodeAnalysis.VisualBasic" Version="5.3.0" />
 		<PackageReference Include="Serilog" Version="4.3.1" />
+		<!-- Runtime DLLs bundled alongside Engine.dll in the NuGet package.
+		     PrivateAssets=all: not exposed as NuGet dependencies, just co-located binaries.
+		     The Engine loads them at runtime from its own assembly directory. -->
+		<PackageReference Include="MessagePack" Version="3.1.3" PrivateAssets="all" />
 	</ItemGroup>
+	<ItemGroup>
+		<!-- Script (and its dependency Ipc) bundled as private assets -->
+		<ProjectReference Include="..\SeaShell.Script\SeaShell.Script.csproj">
+			<PrivateAssets>all</PrivateAssets>
+		</ProjectReference>
+	</ItemGroup>
+
+	<!-- Bundle SeaShell runtime DLLs into lib/net10.0/ alongside Engine.dll.
+	     ScriptCompiler finds them via Assembly.Location at runtime. -->
+	<Target Name="BundleRuntimeDlls" BeforeTargets="GenerateNuspec"
+	        DependsOnTargets="ResolveAssemblyReferences">
+		<ItemGroup>
+			<_RuntimeDlls Include="@(ReferenceCopyLocalPaths)"
+			              Condition="%(Filename) == 'SeaShell.Script' or %(Filename) == 'SeaShell.Ipc'
+			                      or %(Filename) == 'MessagePack' or %(Filename) == 'MessagePack.Annotations'" />
+		</ItemGroup>
+		<ItemGroup>
+			<_PackageFiles Include="@(_RuntimeDlls)" PackagePath="lib/net10.0/" />
+		</ItemGroup>
+	</Target>
 </Project>

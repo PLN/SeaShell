@@ -24,20 +24,22 @@
 		<PackageReference Include="MessagePack" Version="3.1.3" PrivateAssets="all" />
 	</ItemGroup>
 
-	<!-- Bundle SeaShell runtime DLLs into the NuGet package.
-	     The .targets file copies them to consumer output directories. -->
-	<ItemGroup>
-		<None Include="build\**" Pack="true" PackagePath="build\" />
-	</ItemGroup>
-
-	<!-- Stage runtime DLLs into build/net10.0/ before packing.
-	     Uses ReferenceCopyLocalPaths (populated by ResolveAssemblyReferences) to find
-	     DLLs regardless of whether they're project outputs or NuGet cache assets. -->
-	<Target Name="StageScriptBinaries" BeforeTargets="Pack" DependsOnTargets="ResolveAssemblyReferences">
+	<!-- Bundle SeaShell runtime DLLs + .targets into the NuGet package dynamically.
+	     Static globs evaluate at project load (before DLLs are resolved), so we add
+	     _PackageFiles inside the target where ReferenceCopyLocalPaths is populated. -->
+	<Target Name="BundleScriptBinaries" BeforeTargets="GenerateNuspec"
+	        DependsOnTargets="ResolveAssemblyReferences">
 		<ItemGroup>
 			<_ScriptDlls Include="@(ReferenceCopyLocalPaths)"
-			             Condition="%(Filename) == 'SeaShell.Script' or %(Filename) == 'SeaShell.Ipc' or %(Filename) == 'MessagePack' or %(Filename) == 'MessagePack.Annotations'" />
+			             Condition="%(Filename) == 'SeaShell.Script' or %(Filename) == 'SeaShell.Ipc'
+			                     or %(Filename) == 'MessagePack' or %(Filename) == 'MessagePack.Annotations'" />
 		</ItemGroup>
-		<Copy SourceFiles="@(_ScriptDlls)" DestinationFolder="build/net10.0/" SkipUnchangedFiles="true" />
+		<!-- build/ = direct consumers, buildTransitive/ = transitive consumers -->
+		<ItemGroup>
+			<_PackageFiles Include="@(_ScriptDlls)" PackagePath="build/net10.0/" />
+			<_PackageFiles Include="build/net10.0/SeaShell.Host.targets" PackagePath="build/net10.0/" />
+			<_PackageFiles Include="@(_ScriptDlls)" PackagePath="buildTransitive/net10.0/" />
+			<_PackageFiles Include="buildTransitive/net10.0/SeaShell.Host.targets" PackagePath="buildTransitive/net10.0/" />
+		</ItemGroup>
 	</Target>
 </Project>
