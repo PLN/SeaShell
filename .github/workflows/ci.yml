@@ -1,16 +1,8 @@
-name: CI
+name: Release
 
 on:
   push:
-    branches: [main]
-  pull_request:
-    branches: [main]
-  workflow_dispatch:
-    inputs:
-      publish:
-        description: 'Publish packages to nuget.org'
-        type: boolean
-        default: true
+    tags: ['v*']
 
 # ── Job 1: Build ────────────────────────────────────────────────────────
 # Compile on both platforms, produce platform-specific binaries.
@@ -33,7 +25,6 @@ jobs:
         uses: actions/setup-dotnet@v4
         with:
           dotnet-version: '10.0.x'
-          dotnet-quality: 'preview'
 
       - name: Build
         run: dotnet build -c Release
@@ -50,12 +41,14 @@ jobs:
           name: binaries-${{ matrix.rid }}
           path: publish/${{ matrix.rid }}/
 
-  # ── Job 2: Package ───────────────────────────────────────────────────
-  # Assemble .nupkg files with both platforms' apphosts.
+  # ── Job 2: Release ───────────────────────────────────────────────────
+  # Pack, validate, publish to nuget.org, create GitHub Release.
 
-  package:
+  release:
     needs: build
     runs-on: windows-latest
+    permissions:
+      contents: write  # for creating releases
 
     steps:
       - uses: actions/checkout@v4
@@ -64,7 +57,6 @@ jobs:
         uses: actions/setup-dotnet@v4
         with:
           dotnet-version: '10.0.x'
-          dotnet-quality: 'preview'
 
       - name: Download Windows binaries
         uses: actions/download-artifact@v4
@@ -160,6 +152,16 @@ jobs:
             'tools/net10.0/any/MessagePack.dll'
           )
 
+          Write-Host "`n=== SeaShell.Engine ==="
+          $pkg = (Get-ChildItem nupkg/SeaShell.Engine.*.nupkg).FullName
+          Assert-Contains $pkg @(
+            'lib/net10.0/SeaShell.Engine.dll',
+            'lib/net10.0/SeaShell.Script.dll',
+            'lib/net10.0/SeaShell.Ipc.dll',
+            'lib/net10.0/MessagePack.dll',
+            'lib/net10.0/MessagePack.Annotations.dll'
+          )
+
           Write-Host "`n=== SeaShell.Host ==="
           $pkg = (Get-ChildItem nupkg/SeaShell.Host.*.nupkg).FullName
           Assert-Contains $pkg @(
@@ -176,10 +178,6 @@ jobs:
             'buildTransitive/net10.0/MessagePack.Annotations.dll'
           )
 
-          Write-Host "`n=== SeaShell.Engine ==="
-          $pkg = (Get-ChildItem nupkg/SeaShell.Engine.*.nupkg).FullName
-          Assert-Contains $pkg @('lib/net10.0/SeaShell.Engine.dll')
-
           Write-Host "`n=== SeaShell.Ipc ==="
           $pkg = (Get-ChildItem nupkg/SeaShell.Ipc.*.nupkg).FullName
           Assert-Contains $pkg @('lib/net10.0/SeaShell.Ipc.dll')
@@ -194,287 +192,6 @@ jobs:
           }
           Write-Host "`nAll packages validated OK" -ForegroundColor Green
 
-      - name: Upload packages
-        uses: actions/upload-artifact@v4
-        with:
-          name: nupkg
-          path: nupkg/
-
-  # ── Job 3: Test ──────────────────────────────────────────────────────
-  # Test the actual packages, not source. Installs sea from the tool
-  # package, builds test projects against local NuGet source.
-
-  test:
-    needs: package
-    strategy:
-      matrix:
-        os: [windows-latest, ubuntu-latest]
-    runs-on: ${{ matrix.os }}
-
-    env:
-      SMOKE_LOG_DIR: ${{ github.workspace }}/smoke-logs
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Setup .NET 10
-        uses: actions/setup-dotnet@v4
-        with:
-          dotnet-version: '10.0.x'
-          dotnet-quality: 'preview'
-
-      - name: Download packages
-        uses: actions/download-artifact@v4
-        with:
-          name: nupkg
-          path: nupkg/
-
-      - name: Install sea tool from package
-        shell: bash
-        run: |
-          dotnet tool install --global SeaShell --add-source ./nupkg --version "*-*" || \
-          dotnet tool install --global SeaShell --add-source ./nupkg
-          echo "Installed: $(sea --version 2>&1 || true)"
-
-      # ── Script smoke tests ──────────────────────────────────────────
-      - name: Smoke test — hello.cs
-        run: sea test/hello.cs
-
-      - name: Smoke test — sea_context_test.cs
-        run: sea test/sea_context_test.cs
-
-      - name: Smoke test — interactive_ok.cs
-        run: sea test/interactive_ok.cs
-
-      # ── Service smoke test ──────────────────────────────────────────
-      # Build test projects against NuGet packages (not source).
-      # SEASHELL_NUPKG_DIR tells test/nuget.config where to find them.
-
-      - name: Service smoke — publish SmokeApp
-        shell: bash
-        env:
-          SEASHELL_NUPKG_DIR: ${{ github.workspace }}/nupkg
-        run: |
-          if [[ "$RUNNER_OS" == "Windows" ]]; then RID=win-x64; else RID=linux-x64; fi
-          # No single-file: SmokeApp uses ScriptHost which needs physical DLLs for compilation
-          dotnet publish test/SmokeApp --configfile test/nuget.config \
-            -r $RID -o test/smoke-publish/SmokeApp
-
-      - name: Service smoke — publish SmokeService
-        shell: bash
-        env:
-          SEASHELL_NUPKG_DIR: ${{ github.workspace }}/nupkg
-        run: |
-          if [[ "$RUNNER_OS" == "Windows" ]]; then RID=win-x64; else RID=linux-x64; fi
-          dotnet publish test/SmokeService --configfile test/nuget.config \
-            -r $RID -o test/smoke-publish/SmokeService
-
-      - name: Service smoke — create companion .sea.json
-        shell: bash
-        run: echo '{"watch":true}' > test/smoke-publish/SmokeApp/SmokeApp.sea.json
-
-      - name: Service smoke — create log directory
-        shell: bash
-        run: mkdir -p "$SMOKE_LOG_DIR"
-
-      - name: Service smoke — install
-        shell: bash
-        run: |
-          if [[ "$RUNNER_OS" == "Windows" ]]; then
-            test/smoke-publish/SmokeService/SmokeService.exe install
-          else
-            sudo test/smoke-publish/SmokeService/SmokeService install
-          fi
-
-      - name: Service smoke — start
-        shell: bash
-        run: |
-          if [[ "$RUNNER_OS" == "Windows" ]]; then
-            test/smoke-publish/SmokeService/SmokeService.exe start
-          else
-            sudo test/smoke-publish/SmokeService/SmokeService start
-          fi
-
-      - name: Service smoke — verify running + reload cycle + log files
-        shell: bash
-        run: |
-          # First compilation takes 10-20s on CI (Roslyn cold start)
-          sleep 30
-
-          echo "=== Service journal (diagnostics) ==="
-          if [[ "$RUNNER_OS" == "Windows" ]]; then
-            # Windows services log to stdout captured by ServiceHost
-            true
-          else
-            sudo journalctl -u seashell-smoke --no-pager -n 50 || true
-          fi
-
-          echo ""
-          echo "=== Verify service is running ==="
-          if [[ "$RUNNER_OS" == "Windows" ]]; then
-            sc.exe query seashell-smoke | grep -i RUNNING
-          else
-            systemctl is-active seashell-smoke
-          fi
-
-          echo "=== Record initial SmokeApp PID ==="
-          if [[ "$RUNNER_OS" == "Windows" ]]; then
-            PID1=$(tasklist | grep SmokeApp | awk '{print $2}' || true)
-          else
-            PID1=$(pgrep -f 'SmokeApp' | head -1 || true)
-          fi
-          echo "PID before reload: ${PID1:-(not yet started)}"
-
-          echo "=== Wait for RequestReload cycle (fires every 5s) ==="
-          sleep 15
-
-          echo "=== Verify SmokeApp reloaded (PID changed) ==="
-          PID2=""
-          for i in 1 2 3 4 5; do
-            if [[ "$RUNNER_OS" == "Windows" ]]; then
-              PID2=$(tasklist | grep SmokeApp | awk '{print $2}' || true)
-            else
-              PID2=$(pgrep -f 'SmokeApp' | head -1 || true)
-            fi
-            if [[ -n "$PID2" ]]; then break; fi
-            echo "  attempt $i: not found yet, retrying in 2s..."
-            sleep 2
-          done
-
-          echo "PID after reload: ${PID2:-(not found)}"
-
-          if [[ -z "$PID2" ]]; then
-            echo "FAIL: SmokeApp not running after reload"
-            exit 1
-          fi
-          if [[ -n "$PID1" && "$PID1" == "$PID2" ]]; then
-            echo "FAIL: SmokeApp PID did not change — reload did not happen"
-            exit 1
-          fi
-          echo "PASS: SmokeApp reloaded (PID ${PID1:-?} → $PID2)"
-
-          echo ""
-          echo "=== Verify log files (Host-in-Host test) ==="
-          # SMOKE_LOG_DIR doesn't propagate into the service process.
-          # SmokeApp falls back to $TMPDIR/seashell-smoke.
-          if [[ "$RUNNER_OS" == "Windows" ]]; then
-            LOG_DIR="$TEMP/seashell-smoke"
-          else
-            LOG_DIR="/tmp/seashell-smoke"
-          fi
-          APP_LOG="$LOG_DIR/smokeapp.log"
-          SCRIPT_LOG="$LOG_DIR/smokescript.log"
-
-          echo "smokeapp.log:"
-          if [[ -f "$APP_LOG" ]]; then
-            APP_LINES=$(wc -l < "$APP_LOG")
-            echo "  $APP_LINES lines"
-            cat "$APP_LOG"
-          else
-            echo "  MISSING"
-            APP_LINES=0
-          fi
-
-          echo "smokescript.log:"
-          if [[ -f "$SCRIPT_LOG" ]]; then
-            SCRIPT_LINES=$(wc -l < "$SCRIPT_LOG")
-            echo "  $SCRIPT_LINES lines"
-            cat "$SCRIPT_LOG"
-          else
-            echo "  MISSING"
-            SCRIPT_LINES=0
-          fi
-
-          if [[ "$APP_LINES" -lt 1 ]]; then
-            echo "FAIL: smokeapp.log has no entries"
-            exit 1
-          fi
-          if [[ "$SCRIPT_LINES" -lt 1 ]]; then
-            echo "FAIL: smokescript.log has no entries — Host-in-Host compilation may have failed (CS1704?)"
-            exit 1
-          fi
-          echo "PASS: Both log files have entries (app=$APP_LINES, script=$SCRIPT_LINES)"
-
-      - name: Service smoke — stop and verify clean shutdown
-        shell: bash
-        run: |
-          if [[ "$RUNNER_OS" == "Windows" ]]; then
-            test/smoke-publish/SmokeService/SmokeService.exe stop
-          else
-            sudo test/smoke-publish/SmokeService/SmokeService stop
-          fi
-
-          for i in 1 2 3 4 5 6; do
-            sleep 2
-            ORPHAN=""
-            if [[ "$RUNNER_OS" == "Windows" ]]; then
-              ORPHAN=$(tasklist | grep SmokeApp | awk '{print $2}' || true)
-            else
-              ORPHAN=$(pgrep -f SmokeApp || true)
-            fi
-            if [[ -z "$ORPHAN" ]]; then
-              echo "PASS: No orphaned processes (attempt $i)"
-              exit 0
-            fi
-            echo "  attempt $i: SmokeApp still running (PID $ORPHAN), waiting..."
-          done
-
-          echo "FAIL: SmokeApp still running after 12s"
-          if [[ "$RUNNER_OS" == "Windows" ]]; then
-            taskkill /F /IM SmokeApp.exe || true
-          else
-            sudo pkill -9 -f SmokeApp || true
-          fi
-          exit 1
-
-      - name: Service smoke — uninstall
-        shell: bash
-        run: |
-          if [[ "$RUNNER_OS" == "Windows" ]]; then
-            test/smoke-publish/SmokeService/SmokeService.exe uninstall
-          else
-            sudo test/smoke-publish/SmokeService/SmokeService uninstall
-          fi
-
-      # ── Lifecycle tests ─────────────────────────────────────────────
-      - name: Lifecycle — status (daemon running after smoke tests)
-        run: sea --status
-
-      - name: Lifecycle — stop
-        run: sea --stop
-
-      - name: Lifecycle — status after stop
-        run: sea --status || true
-
-      - name: Lifecycle — stop when already stopped (idempotent)
-        run: sea --stop
-
-  # ── Job 4: Publish ──────────────────────────────────────────────────
-  # Manual workflow_dispatch only. Pushes packages to nuget.org,
-  # then bumps the version in Directory.Build.props.
-
-  publish:
-    needs: test
-    if: github.event_name == 'workflow_dispatch' && inputs.publish
-    runs-on: windows-latest
-    permissions:
-      contents: write
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Setup .NET 10
-        uses: actions/setup-dotnet@v4
-        with:
-          dotnet-version: '10.0.x'
-          dotnet-quality: 'preview'
-
-      - name: Download packages
-        uses: actions/download-artifact@v4
-        with:
-          name: nupkg
-          path: nupkg/
-
       - name: Push to nuget.org
         shell: pwsh
         run: |
@@ -485,38 +202,14 @@ jobs:
         env:
           NUGET_API_KEY: ${{ secrets.NUGET_API_KEY }}
 
-      - name: Read current version
-        id: version
-        shell: pwsh
+      - name: Create GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          $props = Get-Content Directory.Build.props -Raw
-          if ($props -match '<Version>(\d+\.\d+\.\d+)</Version>') {
-            $current = $Matches[1]
-            Write-Host "Current version: $current"
-            echo "current=$current" >> $env:GITHUB_OUTPUT
-            # Bump patch
-            $parts = $current.Split('.')
-            $parts[2] = [int]$parts[2] + 1
-            $next = $parts -join '.'
-            Write-Host "Next version: $next"
-            echo "next=$next" >> $env:GITHUB_OUTPUT
-          }
-
-      - name: Bump version
-        shell: pwsh
-        run: |
-          $file = 'Directory.Build.props'
-          $content = Get-Content $file -Raw
-          $content = $content -replace '<Version>${{ steps.version.outputs.current }}</Version>', '<Version>${{ steps.version.outputs.next }}</Version>'
-          Set-Content $file $content -NoNewline
-
-      - name: Create git tag
-        run: git tag v${{ steps.version.outputs.current }}
-
-      - name: Commit and push version bump
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add Directory.Build.props
-          git commit -m "Bump version to ${{ steps.version.outputs.next }} after publishing ${{ steps.version.outputs.current }}"
-          git push origin main --tags
+          TAG="${GITHUB_REF_NAME}"
+          echo "Creating release for $TAG"
+          gh release create "$TAG" \
+            --title "$TAG" \
+            --generate-notes \
+            nupkg/*.nupkg
