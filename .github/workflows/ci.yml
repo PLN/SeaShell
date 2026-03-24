@@ -48,7 +48,9 @@ jobs:
     needs: build
     runs-on: windows-latest
     permissions:
-      contents: write  # for creating releases
+      contents: write       # create GitHub releases
+      id-token: write       # OIDC token for Sigstore signing
+      attestations: write   # upload attestation to GitHub API
 
     steps:
       - uses: actions/checkout@v4
@@ -192,7 +194,13 @@ jobs:
           }
           Write-Host "`nAll packages validated OK" -ForegroundColor Green
 
+      - name: Attest NuGet packages
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: 'nupkg/*.nupkg'
+
       - name: Push to nuget.org
+        if: ${{ !contains(github.ref_name, '-') }}
         shell: pwsh
         run: |
           foreach ($pkg in Get-ChildItem nupkg/*.nupkg) {
