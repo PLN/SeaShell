@@ -262,7 +262,7 @@ public sealed class ScriptCompiler
 
 		var depsPath = Path.Combine(outputDir, $"{scriptName}.deps.json");
 		if (!File.Exists(depsPath))
-			DepsJsonWriter.Write(depsPath, assemblyName, resolvedPackages);
+			DepsJsonWriter.Write(depsPath, assemblyName, resolvedPackages, _engineDir);
 
 		// Copy SeaShell runtime DLLs to output dir (for runtime loading).
 		// Skip DLLs already provided by NuGet — they're mapped in .deps.json
@@ -550,7 +550,7 @@ public sealed class ScriptCompiler
 		if (File.Exists(companionDeps))
 			WriteIfMissing(stagedDeps, File.ReadAllBytes(companionDeps));
 		else
-			DepsJsonWriter.Write(stagedDeps, name, new List<NuGetResolver.ResolvedPackage>());
+			DepsJsonWriter.Write(stagedDeps, name, new List<NuGetResolver.ResolvedPackage>(), _engineDir);
 
 		if (File.Exists(companionRtc)) watchFiles.Add(companionRtc);
 		if (File.Exists(companionDeps)) watchFiles.Add(companionDeps);
