@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Reflection;
 using System.Text.Json;
 
 namespace SeaShell.Engine;
@@ -19,16 +20,22 @@ public static class DepsJsonWriter
 	public static void Write(
 		string outputPath,
 		string assemblyName,
-		List<NuGetResolver.ResolvedPackage> packages)
+		List<NuGetResolver.ResolvedPackage> packages,
+		string engineDir)
 	{
 		var tfmName = $".NETCoreApp,Version=v{Environment.Version.Major}.{Environment.Version.Minor}";
+
+		// Read actual versions from bundled DLLs (avoids hardcoding)
+		var msgpackVer = GetBundledVersion(engineDir, "MessagePack.dll");
+		var ipcVer = GetBundledVersion(engineDir, "SeaShell.Ipc.dll");
+		var scriptVer = GetBundledVersion(engineDir, "SeaShell.Script.dll");
 
 		// Build targets entries
 		var targets = new Dictionary<string, object>();
 
 		// SeaShell runtime libraries — listed as project deps so dotnet exec
 		// finds them in the app directory (next to the compiled script DLL)
-		targets["MessagePack/1.0.0"] = new
+		targets[$"MessagePack/{msgpackVer}"] = new
 		{
 			runtime = new Dictionary<string, object>
 			{
@@ -36,22 +43,22 @@ public static class DepsJsonWriter
 				["MessagePack.Annotations.dll"] = new { }
 			}
 		};
-		targets["SeaShell.Ipc/1.0.0"] = new
+		targets[$"SeaShell.Ipc/{ipcVer}"] = new
 		{
 			dependencies = new Dictionary<string, string>
 			{
-				["MessagePack"] = "1.0.0"
+				["MessagePack"] = msgpackVer
 			},
 			runtime = new Dictionary<string, object>
 			{
 				["SeaShell.Ipc.dll"] = new { }
 			}
 		};
-		targets["SeaShell.Script/1.0.0"] = new
+		targets[$"SeaShell.Script/{scriptVer}"] = new
 		{
 			dependencies = new Dictionary<string, string>
 			{
-				["SeaShell.Ipc"] = "1.0.0"
+				["SeaShell.Ipc"] = ipcVer
 			},
 			runtime = new Dictionary<string, object>
 			{
@@ -86,21 +93,21 @@ public static class DepsJsonWriter
 		// Build libraries entries
 		var libraries = new Dictionary<string, object>();
 
-		libraries["MessagePack/1.0.0"] = new
+		libraries[$"MessagePack/{msgpackVer}"] = new
 		{
 			type = "project",
 			serviceable = false,
 			sha512 = ""
 		};
 
-		libraries["SeaShell.Ipc/1.0.0"] = new
+		libraries[$"SeaShell.Ipc/{ipcVer}"] = new
 		{
 			type = "project",
 			serviceable = false,
 			sha512 = ""
 		};
 
-		libraries["SeaShell.Script/1.0.0"] = new
+		libraries[$"SeaShell.Script/{scriptVer}"] = new
 		{
 			type = "project",
 			serviceable = false,
@@ -136,5 +143,12 @@ public static class DepsJsonWriter
 		});
 
 		File.WriteAllText(outputPath, json);
+	}
+
+	static string GetBundledVersion(string engineDir, string dllName)
+	{
+		var path = Path.Combine(engineDir, dllName);
+		if (!File.Exists(path)) return "0.0.0";
+		return AssemblyName.GetAssemblyName(path).Version?.ToString(3) ?? "0.0.0";
 	}
 }

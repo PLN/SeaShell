@@ -10,4 +10,7 @@
     <Project Path="src/SeaShell.Script/SeaShell.Script.csproj" />
     <Project Path="src/SeaShell.ServiceHost/SeaShell.ServiceHost.csproj" />
   </Folder>
+  <Folder Name="/test/">
+    <Project Path="test/EngineTest/EngineTest.csproj" />
+  </Folder>
 </Solution>
