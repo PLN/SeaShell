@@ -14,17 +14,23 @@ var artifacts = Environment.GetEnvironmentVariable("PIPELINE_ARTIFACTS")!;
 var logs = Environment.GetEnvironmentVariable("PIPELINE_LOGS")!;
 var rid = Environment.GetEnvironmentVariable("PIPELINE_RID")!;
 var commonDir = Environment.GetEnvironmentVariable("PIPELINE_COMMON")!;
+var runCounter = Environment.GetEnvironmentVariable("PIPELINE_RUN") ?? "0";
+
+// Pass BuildNumber so NuGet packages get unique versions per pipeline run (e.g., 0.1.12.4).
+// Avoids stale NuGet cache collisions when the same semver is rebuilt with different code.
+var versionArg = $"-p:BuildNumber={runCounter}";
 
 Console.WriteLine($"[build] Source:    {src}");
 Console.WriteLine($"[build] Artifacts: {artifacts}");
 Console.WriteLine($"[build] RID:       {rid}");
+Console.WriteLine($"[build] Run:       {runCounter}");
 
 Directory.CreateDirectory(artifacts);
 Directory.CreateDirectory(logs);
 
 // ── Build ────────────────────────────────────────────────────────────
 
-var buildCode = DiagnosticsExt.RunProcess("dotnet", "build -c Release", src,
+var buildCode = DiagnosticsExt.RunProcess("dotnet", $"build -c Release {versionArg}", src,
 	logFile: Path.Combine(logs, "build.log"), prefix: "build");
 if (buildCode != 0)
 {
@@ -40,7 +46,7 @@ foreach (var project in new[] { "SeaShell.Cli", "SeaShell.Daemon", "SeaShell.Ele
 {
 	var csproj = Path.Combine(src, "src", project, $"{project}.csproj");
 	var code = DiagnosticsExt.RunProcess("dotnet",
-		$"publish \"{csproj}\" -c Release -r {rid} --self-contained false -o \"{publishDir}\"",
+		$"publish \"{csproj}\" -c Release -r {rid} --self-contained false -o \"{publishDir}\" {versionArg}",
 		src, logFile: Path.Combine(logs, $"publish-{project}.log"), prefix: "build");
 	if (code != 0)
 	{

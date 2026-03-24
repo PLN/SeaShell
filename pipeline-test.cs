@@ -111,6 +111,93 @@ RunTest("host-in-host (ScriptHost compilation)", () =>
 RunTest("host-resolution (bundled DLL probing)", () =>
 	DiagnosticsExt.RunProcess("sea", Path.Combine(testDir, "host-resolution", "host-resolution.cs"), src, prefix: "test"));
 
+// ── Service CWD test ─────────────────────────────────────────────────
+// Full end-to-end: publish ServiceCwdTest, register as service, start via
+// SCM/systemd, verify script runs despite CWD being system32 or /.
+
+Console.WriteLine("\n[test] === Service CWD test ===");
+
+RunTest("service-cwd (SCM/systemd script resolution)", () =>
+{
+	var testProjectDir = Path.Combine(src, "test", "ServiceCwdTest");
+	var publishDir = Path.Combine(artifacts, "service-cwd-test");
+	// Use a markers directory inside the publish dir — the service process can
+	// write there regardless of which account it runs as (the installer sets
+	// WorkingDirectory to the exe's directory).
+	var markerDir = Path.Combine(publishDir, "markers");
+	var markerFile = Path.Combine(markerDir, "seashell-cwd-test.marker");
+	var serviceName = "seashell-cwd-test";
+
+	Directory.CreateDirectory(markerDir);
+	if (File.Exists(markerFile)) File.Delete(markerFile);
+
+	// Clear NuGet http-cache to avoid stale packages with same version number
+	DiagnosticsExt.RunProcess("dotnet", "nuget locals http-cache --clear", src, quiet: true);
+
+	// Publish with local nupkg source
+	Environment.SetEnvironmentVariable("SEASHELL_NUPKG_DIR", nupkgDir);
+	var pubCode = DiagnosticsExt.RunProcess("dotnet",
+		$"publish \"{testProjectDir}\" -c Release -r {rid} --self-contained false -o \"{publishDir}\" --force",
+		src, prefix: "test", logFile: Path.Combine(logs, "service-cwd-publish.log"));
+	if (pubCode != 0) { Console.Error.WriteLine("[test] ServiceCwdTest publish failed"); return pubCode; }
+
+	// cwd-test-script.cs is copied by dotnet publish (CopyToOutputDirectory in .csproj)
+
+	var exeName = isWindows ? "ServiceCwdTest.exe" : "ServiceCwdTest";
+	var exePath = Path.Combine(publishDir, exeName);
+
+	// Elevation wrapper
+	var elevate = isWindows ? "gsudo" : "sudo";
+
+	// Install service
+	Console.WriteLine($"[test]   Installing service '{serviceName}'...");
+	var installCode = DiagnosticsExt.RunProcess(elevate, $"\"{exePath}\" install", publishDir, prefix: "test");
+	if (installCode != 0) { Console.Error.WriteLine("[test] Service install failed"); return installCode; }
+
+	try
+	{
+		// Start service via the binary's own 'start' command (delegates to sc.exe/systemctl)
+		Console.WriteLine($"[test]   Starting service...");
+		var startCode = DiagnosticsExt.RunProcess(elevate, $"\"{exePath}\" start", publishDir, prefix: "test");
+		if (startCode != 0) { Console.Error.WriteLine("[test] Service start failed"); return startCode; }
+
+		// Wait for script to execute and write marker
+		Console.WriteLine($"[test]   Waiting for marker file...");
+		for (var i = 0; i < 30; i++)
+		{
+			if (File.Exists(markerFile)) break;
+			Thread.Sleep(1000);
+		}
+
+		if (!File.Exists(markerFile))
+		{
+			Console.Error.WriteLine("[test] Marker file not found after 30s");
+			return 1;
+		}
+
+		var markerContent = File.ReadAllText(markerFile);
+		Console.WriteLine($"[test]   Marker content:\n{markerContent.TrimEnd()}");
+
+		// Verify Mother.cs resolved (Script= line present, set via Mother.ScriptName)
+		if (!markerContent.Contains("Script="))
+		{
+			Console.Error.WriteLine("[test] Marker missing Script= (Mother.cs include failed)");
+			return 1;
+		}
+
+		Console.WriteLine("[test]   Script executed successfully from service context");
+		return 0;
+	}
+	finally
+	{
+		// Stop and uninstall (cleanup) — use the binary's own management commands
+		Console.WriteLine($"[test]   Stopping and uninstalling service...");
+		DiagnosticsExt.RunProcess(elevate, $"\"{exePath}\" stop", publishDir, quiet: true);
+		Thread.Sleep(3000);
+		DiagnosticsExt.RunProcess(elevate, $"\"{exePath}\" uninstall", publishDir, quiet: true);
+	}
+});
+
 // ── Lifecycle tests ──────────────────────────────────────────────────
 
 Console.WriteLine("\n[test] === Lifecycle tests ===");

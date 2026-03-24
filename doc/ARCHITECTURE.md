@@ -50,6 +50,7 @@ SeaShell has five components that communicate over platform-native IPC:
 | **SeaShell.Ipc** | Shared message types and `MessageChannel` (System.IO.Pipelines). Used by both Script (in the script process) and Cli/Host (in the launcher). |
 | **SeaShell.Protocol** | Daemon/Elevator protocol messages and `TransportStream` (platform IPC abstraction). |
 | **SeaShell.Host** | Embeddable API. Wraps Engine + Script for applications that want to run scripts without the daemon. |
+| **SeaShell.ServiceHost** | Cross-platform service hosting. Auto-detects init system (Windows Service, systemd, runit, OpenRC). Management commands, crash recovery, zero-locking NuGet updates. |
 
 ## IPC Layers
 
@@ -104,16 +105,23 @@ Script source
   │
   └─ ArtifactWriter:
       ├─ {name}.dll            compiled assembly
-      ├─ {name}.runtimeconfig.json   runtime configuration
+      ├─ {name}.runtimeconfig.json   runtime config + probing paths
       ├─ {name}.deps.json      assembly probing manifest
       ├─ {name}.sea.json       SeaShell metadata (sources, packages, assemblies)
-      ├─ SeaShell.Script.dll   copied from daemon
-      └─ SeaShell.Ipc.dll      copied from daemon
+      ├─ SeaShell.Script.dll   copied from engine dir
+      ├─ SeaShell.Ipc.dll      copied from engine dir
+      ├─ MessagePack.dll       copied from engine dir
+      └─ MessagePack.Annotations.dll
 ```
 
 The compiled script runs via `dotnet exec --runtimeconfig ... --depsfile ... assembly.dll`.
 The `.deps.json` is critical — it tells the dotnet host where to find runtime-specific
 and native DLLs, which is the key improvement over CS-Script's assembly loading.
+
+The `.runtimeconfig.json` includes two `additionalProbingPaths`: (1) the engine binary
+directory (where bundled DLLs live) and (2) the NuGet global cache (`~/.nuget/packages/`).
+This ensures script subprocesses can find bundled DLLs even when running inside a host
+application (e.g., csasvc) where the DLL copy might be skipped.
 
 ## NuGet Resolution
 

@@ -48,12 +48,17 @@ public sealed class IncludeResolver
 			if (Directory.Exists(localShare))
 				_searchPaths.Add(localShare);
 
+			// /usr/local/share/ — admin-installed software
 			if (Directory.Exists("/usr/local/share/seashell/inc"))
 				_searchPaths.Add("/usr/local/share/seashell/inc");
-
-			// CS-Script compatibility fallback
 			if (Directory.Exists("/usr/local/share/cs-script/inc"))
 				_searchPaths.Add("/usr/local/share/cs-script/inc");
+
+			// /usr/share/ — system/distro-managed (FHS standard)
+			if (Directory.Exists("/usr/share/seashell/inc"))
+				_searchPaths.Add("/usr/share/seashell/inc");
+			if (Directory.Exists("/usr/share/cs-script/inc"))
+				_searchPaths.Add("/usr/share/cs-script/inc");
 		}
 
 		if (extraSearchPaths != null)
