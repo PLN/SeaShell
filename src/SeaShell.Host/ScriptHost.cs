@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.IO.Pipes;
+using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using System.Threading;
@@ -70,7 +71,8 @@ public sealed class ScriptHost
 	}
 
 	/// <summary>
-	/// Compile and run a code snippet. Wraps it in a minimal script file.
+	/// Compile and run a code snippet. Uses content-based hashing so identical
+	/// snippets hit the compilation cache without any disk I/O.
 	/// </summary>
 	public async Task<ScriptResult> RunSnippetAsync(
 		string code,
@@ -80,19 +82,39 @@ public sealed class ScriptHost
 		ScriptConnection? connection = null,
 		CancellationToken ct = default)
 	{
-		var tempDir = SeaShellPaths.SnippetsDir;
-		Directory.CreateDirectory(tempDir);
-		var tempFile = Path.Combine(tempDir, $"snippet_{Guid.NewGuid():N}.cs");
+		// Deterministic path from content — identical code always maps to the same
+		// snippet name, so the compilation cache hash is stable across calls.
+		var codeHash = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(code)))[..16];
+		var scriptName = $"snippet_{codeHash}";
+		var snippetPath = Path.Combine(SeaShellPaths.SnippetsDir, $"{scriptName}.cs");
 
-		try
+		// Check compilation cache — skip file creation entirely on hit
+		var sources = new List<(string Path, string Source)> { (snippetPath, code) };
+		var hash = CompilationCache.ComputeHash(sources);
+		var outputDir = Path.Combine(SeaShellPaths.CacheDir, $"{scriptName}_{hash[..8]}");
+		var dllPath = Path.Combine(outputDir, $"{scriptName}.dll");
+		var rtcPath = Path.Combine(outputDir, $"{scriptName}.runtimeconfig.json");
+
+		if (File.Exists(dllPath) && File.Exists(rtcPath))
 		{
-			File.WriteAllText(tempFile, code);
-			return await RunAsync(tempFile, args, workingDirectory, environmentVars, connection, ct);
+			// Cache hit — zero disk I/O, run directly from cached output
+			var depsPath = Path.Combine(outputDir, $"{scriptName}.deps.json");
+			var manifestPath = Path.Combine(outputDir, $"{scriptName}.sea.json");
+			var cached = new ScriptCompiler.CompileResult
+			{
+				Success = true,
+				AssemblyPath = dllPath,
+				RuntimeConfigPath = rtcPath,
+				DepsJsonPath = File.Exists(depsPath) ? depsPath : null,
+				ManifestPath = File.Exists(manifestPath) ? manifestPath : null,
+			};
+			return await ExecuteAsync(cached, args, workingDirectory, environmentVars, connection, ct);
 		}
-		finally
-		{
-			try { File.Delete(tempFile); } catch { }
-		}
+
+		// Cache miss — write snippet file, compile, run
+		Directory.CreateDirectory(SeaShellPaths.SnippetsDir);
+		File.WriteAllText(snippetPath, code);
+		return await RunAsync(snippetPath, args, workingDirectory, environmentVars, connection, ct);
 	}
 
 	/// <summary>

@@ -4,6 +4,7 @@ using System.IO;
 using System.Linq;
 using System.Runtime.InteropServices;
 using System.Text.Json;
+using System.Text.Json.Nodes;
 
 namespace SeaShell.Engine;
 
@@ -13,7 +14,7 @@ namespace SeaShell.Engine;
 /// </summary>
 static class ArtifactWriter
 {
-	public static void WriteRuntimeConfig(string path, bool webApp, string engineDir)
+	public static void WriteRuntimeConfig(string path, bool webApp)
 	{
 		var tfm = GetCurrentTfm();
 		var version = Environment.Version.ToString(3); // e.g., "10.0.0"
@@ -25,20 +26,14 @@ static class ArtifactWriter
 		if (webApp)
 			frameworks.Add(new { name = "Microsoft.AspNetCore.App", version });
 
-		// Probing paths for runtime assembly resolution:
-		// 1. Engine dir — bundled DLLs (SeaShell.Script, Ipc, MessagePack) live here
-		// 2. NuGet cache — user's NuGet packages resolved from //sea_nuget directives
-		var nugetCache = Path.Combine(
-			Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
-			".nuget", "packages");
-
+		// No additionalProbingPaths — the output dir is self-contained.
+		// All DLLs (bundled + NuGet) are copied there by ScriptCompiler.
 		var config = new
 		{
 			runtimeOptions = new
 			{
 				tfm,
 				frameworks,
-				additionalProbingPaths = new[] { engineDir, nugetCache },
 				configProperties = new Dictionary<string, object>
 				{
 					["System.Runtime.Serialization.EnableUnsafeBinaryFormatterSerialization"] = false,
@@ -48,6 +43,51 @@ static class ArtifactWriter
 
 		var json = JsonSerializer.Serialize(config, new JsonSerializerOptions { WriteIndented = true });
 		File.WriteAllText(path, json);
+	}
+
+	/// <summary>
+	/// Merge SeaShell's probing paths into an existing (companion) runtimeconfig.json.
+	/// Used by CompileBinary when running a pre-compiled binary that has its own
+	/// runtimeconfig — the companion settings are preserved, and SeaShell's engineDir
+	/// and NuGet cache are added to additionalProbingPaths.
+	/// </summary>
+	public static void MergeRuntimeConfig(string companionPath, string outputPath, string engineDir)
+	{
+		var node = JsonNode.Parse(File.ReadAllText(companionPath))!;
+		var rtOpts = node["runtimeOptions"]?.AsObject();
+		if (rtOpts == null)
+		{
+			// No runtimeOptions — just copy as-is
+			File.Copy(companionPath, outputPath, overwrite: true);
+			return;
+		}
+
+		var nugetCache = Path.Combine(
+			Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+			".nuget", "packages");
+
+		// Get or create additionalProbingPaths array
+		var probing = rtOpts["additionalProbingPaths"]?.AsArray();
+		if (probing == null)
+		{
+			probing = new JsonArray();
+			rtOpts["additionalProbingPaths"] = probing;
+		}
+
+		// Collect existing paths for dedup
+		var existing = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+		foreach (var item in probing)
+			if (item?.GetValue<string>() is { } s)
+				existing.Add(s);
+
+		// Add SeaShell paths if not already present
+		if (!existing.Contains(engineDir))
+			probing.Add(engineDir);
+		if (!existing.Contains(nugetCache))
+			probing.Add(nugetCache);
+
+		var json = node.ToJsonString(new JsonSerializerOptions { WriteIndented = true });
+		File.WriteAllText(outputPath, json);
 	}
 
 	public static void WriteManifest(

@@ -102,13 +102,11 @@ public sealed class ScriptCompiler
 			return new CompileResult { Error = ex.Message };
 		}
 
-		// ── Resolve NuGet packages (before cache check so versions are in the hash) ──
-		var resolvedPackages = ResolveNuGetPackages(resolved.Directives.NuGets);
-		if (resolvedPackages == null)
-			return _lastNuGetError!; // error already logged
-
-		// ── Check cache (includes source hashes + NuGet versions + engine fingerprint) ──
-		var hash = CompilationCache.ComputeHash(resolved.Sources, resolvedPackages);
+		// ── Check cache (source content + engine fingerprint only) ──────
+		// NuGet resolution is expensive — skip it entirely on cache hits.
+		// The output dir is self-contained (all DLLs copied there at compile time),
+		// so NuGet packages with the same id+version always produce the same output.
+		var hash = CompilationCache.ComputeHash(resolved.Sources);
 		var outputDir = Path.Combine(_cacheDir, $"{scriptName}_{hash[..8]}");
 		var dllPath = Path.Combine(outputDir, $"{scriptName}.dll");
 		var runtimeConfigPath = Path.Combine(outputDir, $"{scriptName}.runtimeconfig.json");
@@ -127,6 +125,11 @@ public sealed class ScriptCompiler
 				ManifestPath = ArtifactWriter.FindManifest(outputDir, scriptName),
 			};
 		}
+
+		// ── Resolve NuGet packages (cache miss only) ────────────────────
+		var resolvedPackages = ResolveNuGetPackages(resolved.Directives.NuGets);
+		if (resolvedPackages == null)
+			return _lastNuGetError!; // error already logged
 
 		// ── Parse syntax trees ──────────────────────────────────────────
 		var trees = new List<SyntaxTree>();
@@ -258,27 +261,42 @@ public sealed class ScriptCompiler
 		WriteIfMissing(dllPath, ms.ToArray());
 
 		if (!File.Exists(runtimeConfigPath))
-			ArtifactWriter.WriteRuntimeConfig(runtimeConfigPath, resolved.Directives.WebApp, _engineDir);
+			ArtifactWriter.WriteRuntimeConfig(runtimeConfigPath, resolved.Directives.WebApp);
 
 		var depsPath = Path.Combine(outputDir, $"{scriptName}.deps.json");
 		if (!File.Exists(depsPath))
 			DepsJsonWriter.Write(depsPath, assemblyName, resolvedPackages, _engineDir);
 
-		// Copy SeaShell runtime DLLs to output dir (for runtime loading).
-		// Skip DLLs already provided by NuGet — they're mapped in .deps.json
-		// and resolved from the NuGet cache at runtime.
-		var nugetRuntimeNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-		foreach (var pkg in resolvedPackages)
-			foreach (var asset in pkg.RuntimeAssets)
-				nugetRuntimeNames.Add(Path.GetFileName(asset.FullPath));
-
+		// Copy SeaShell runtime DLLs to output dir (startup hook + transitive deps)
 		foreach (var dllName in new[] { "SeaShell.Script.dll", "SeaShell.Ipc.dll", "MessagePack.dll", "MessagePack.Annotations.dll" })
 		{
-			if (nugetRuntimeNames.Contains(dllName)) continue;
 			var src = Path.Combine(_engineDir, dllName);
 			var dest = Path.Combine(outputDir, dllName);
 			if (File.Exists(src) && !File.Exists(dest))
 				File.Copy(src, dest);
+		}
+
+		// Copy NuGet package DLLs to output dir — makes the output self-contained.
+		// No runtime dependency on the NuGet cache (which may be cleared, or belong
+		// to a different user account). Like dotnet publish, everything is local.
+		foreach (var pkg in resolvedPackages)
+		{
+			// Managed DLLs — copy flat (bare filename)
+			foreach (var asset in pkg.RuntimeAssets)
+			{
+				var dest = Path.Combine(outputDir, Path.GetFileName(asset.FullPath));
+				if (File.Exists(asset.FullPath) && !File.Exists(dest))
+					File.Copy(asset.FullPath, dest);
+			}
+			// Native DLLs — preserve runtimes/{rid}/native/ structure
+			foreach (var asset in pkg.NativeAssets)
+			{
+				var dest = Path.Combine(outputDir, asset.RelativePath.Replace('/', Path.DirectorySeparatorChar));
+				var destDir = Path.GetDirectoryName(dest)!;
+				Directory.CreateDirectory(destDir);
+				if (File.Exists(asset.FullPath) && !File.Exists(dest))
+					File.Copy(asset.FullPath, dest);
+			}
 		}
 
 		// Write manifest — all the metadata the Sea class needs at runtime
@@ -541,14 +559,14 @@ public sealed class ScriptCompiler
 		var stagedRtc = Path.Combine(outputDir, $"{name}.runtimeconfig.json");
 		var companionRtc = Path.Combine(binDir, $"{name}.runtimeconfig.json");
 		if (File.Exists(companionRtc))
-			WriteIfMissing(stagedRtc, File.ReadAllBytes(companionRtc));
+			ArtifactWriter.MergeRuntimeConfig(companionRtc, stagedRtc, _engineDir);
 		else
-			ArtifactWriter.WriteRuntimeConfig(stagedRtc, info!.HasAspNetRef, _engineDir);
+			ArtifactWriter.WriteRuntimeConfig(stagedRtc, info!.HasAspNetRef);
 
 		var stagedDeps = Path.Combine(outputDir, $"{name}.deps.json");
 		var companionDeps = Path.Combine(binDir, $"{name}.deps.json");
 		if (File.Exists(companionDeps))
-			WriteIfMissing(stagedDeps, File.ReadAllBytes(companionDeps));
+			DepsJsonWriter.Merge(companionDeps, stagedDeps, _engineDir);
 		else
 			DepsJsonWriter.Write(stagedDeps, name, new List<NuGetResolver.ResolvedPackage>(), _engineDir);
 

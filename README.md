@@ -1,6 +1,6 @@
 # {~} SeaShell
 
-[![CI](https://github.com/PLN/SeaShell/actions/workflows/ci.yml/badge.svg)](https://github.com/PLN/SeaShell/actions/workflows/ci.yml)
+[![Release](https://github.com/PLN/SeaShell/actions/workflows/ci.yml/badge.svg?event=push)](https://github.com/PLN/SeaShell/actions/workflows/ci.yml)
 
 A C# and VB.NET scripting engine with a persistent daemon, NuGet support, hot-swap, REPL, and an embeddable host library. Built on Roslyn.
 

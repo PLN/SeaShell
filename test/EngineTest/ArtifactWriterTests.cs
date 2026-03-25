@@ -10,12 +10,10 @@ namespace SeaShell.Engine.Tests;
 public class ArtifactWriterTests : IDisposable
 {
 	private readonly string _tempFile;
-	private readonly string _engineDir;
 
 	public ArtifactWriterTests()
 	{
 		_tempFile = Path.Combine(Path.GetTempPath(), $"seashell-test-{Guid.NewGuid():N}.runtimeconfig.json");
-		_engineDir = Path.Combine(Path.GetTempPath(), "seashell-test-engine");
 	}
 
 	public void Dispose()
@@ -23,34 +21,19 @@ public class ArtifactWriterTests : IDisposable
 		if (File.Exists(_tempFile)) File.Delete(_tempFile);
 	}
 
-	// ── Probing paths ──────────────────────────────────────────────
+	// ── Self-contained output (no probing paths) ──────────────────
 
 	[Fact]
-	public void WriteRuntimeConfig_IncludesEngineDir()
+	public void WriteRuntimeConfig_NoAdditionalProbingPaths()
 	{
-		ArtifactWriter.WriteRuntimeConfig(_tempFile, webApp: false, _engineDir);
+		ArtifactWriter.WriteRuntimeConfig(_tempFile, webApp: false);
 
 		var doc = JsonDocument.Parse(File.ReadAllText(_tempFile));
-		var paths = doc.RootElement
-			.GetProperty("runtimeOptions")
-			.GetProperty("additionalProbingPaths");
+		var rtOpts = doc.RootElement.GetProperty("runtimeOptions");
 
-		var pathList = paths.EnumerateArray().Select(e => e.GetString()).ToList();
-		Assert.Contains(_engineDir, pathList);
-	}
-
-	[Fact]
-	public void WriteRuntimeConfig_IncludesNuGetCache()
-	{
-		ArtifactWriter.WriteRuntimeConfig(_tempFile, webApp: false, _engineDir);
-
-		var doc = JsonDocument.Parse(File.ReadAllText(_tempFile));
-		var paths = doc.RootElement
-			.GetProperty("runtimeOptions")
-			.GetProperty("additionalProbingPaths");
-
-		var pathList = paths.EnumerateArray().Select(e => e.GetString()).ToList();
-		Assert.Contains(pathList, p => p != null && p.Contains(".nuget"));
+		// Output is self-contained — all DLLs are in the app base dir.
+		// No additionalProbingPaths should be present.
+		Assert.False(rtOpts.TryGetProperty("additionalProbingPaths", out _));
 	}
 
 	// ── Framework references ───────────────────────────────────────
@@ -58,7 +41,7 @@ public class ArtifactWriterTests : IDisposable
 	[Fact]
 	public void WriteRuntimeConfig_Default_OnlyNetCoreFramework()
 	{
-		ArtifactWriter.WriteRuntimeConfig(_tempFile, webApp: false, _engineDir);
+		ArtifactWriter.WriteRuntimeConfig(_tempFile, webApp: false);
 
 		var doc = JsonDocument.Parse(File.ReadAllText(_tempFile));
 		var frameworks = doc.RootElement
@@ -72,7 +55,7 @@ public class ArtifactWriterTests : IDisposable
 	[Fact]
 	public void WriteRuntimeConfig_WebApp_IncludesAspNetFramework()
 	{
-		ArtifactWriter.WriteRuntimeConfig(_tempFile, webApp: true, _engineDir);
+		ArtifactWriter.WriteRuntimeConfig(_tempFile, webApp: true);
 
 		var doc = JsonDocument.Parse(File.ReadAllText(_tempFile));
 		var frameworks = doc.RootElement

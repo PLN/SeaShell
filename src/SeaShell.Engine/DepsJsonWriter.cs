@@ -4,6 +4,7 @@ using System.IO;
 using System.Linq;
 using System.Reflection;
 using System.Text.Json;
+using System.Text.Json.Nodes;
 
 namespace SeaShell.Engine;
 
@@ -33,12 +34,14 @@ public static class DepsJsonWriter
 		// Build targets entries
 		var targets = new Dictionary<string, object>();
 
-		// SeaShell runtime libraries — listed as project deps so the .NET host
+		// SeaShell runtime libraries — always listed as project deps so the .NET host
 		// includes them in the TPA (Trusted Platform Assemblies) list. Without
 		// these entries, the startup hook (SeaShell.Script) can't load and the
 		// script pipe connection fails.
-		// The DLLs are physically copied to the output dir by ScriptCompiler;
-		// the engine dir is also in additionalProbingPaths as a fallback.
+		// The DLLs are always physically copied to the output dir by ScriptCompiler.
+		// Even when NuGet transitively provides the same packages, we keep the
+		// type:"project" entries because they resolve from the app base dir (guaranteed)
+		// rather than the NuGet cache (which may not be accessible under service accounts).
 		targets[$"MessagePack/{msgpackVer}"] = new
 		{
 			runtime = new Dictionary<string, object>
@@ -70,20 +73,22 @@ public static class DepsJsonWriter
 			}
 		};
 
-		// Each NuGet package
+		// Each NuGet package — listed as type:"project" because all DLLs are copied
+		// to the output dir by ScriptCompiler. No NuGet cache probing at runtime.
 		foreach (var pkg in packages)
 		{
 			var entry = new Dictionary<string, object>();
 
-			// Runtime managed assets
+			// Runtime managed assets — bare filenames (copied flat to output dir)
 			if (pkg.RuntimeAssets.Count > 0)
 			{
 				entry["runtime"] = pkg.RuntimeAssets.ToDictionary(
-					a => a.RelativePath,
+					a => Path.GetFileName(a.FullPath),
 					a => (object)new { });
 			}
 
-			// Native assets
+			// Native assets — keep relative path (runtimes/{rid}/native/ structure
+			// is preserved in the output dir by ScriptCompiler)
 			if (pkg.NativeAssets.Count > 0)
 			{
 				entry["native"] = pkg.NativeAssets.ToDictionary(
@@ -122,11 +127,9 @@ public static class DepsJsonWriter
 		{
 			libraries[$"{pkg.Name}/{pkg.Version}"] = new
 			{
-				type = "package",
-				serviceable = true,
-				sha512 = "",
-				path = pkg.PackagePath,
-				hashPath = ""
+				type = "project",
+				serviceable = false,
+				sha512 = ""
 			};
 		}
 
@@ -147,6 +150,99 @@ public static class DepsJsonWriter
 		});
 
 		File.WriteAllText(outputPath, json);
+	}
+
+	/// <summary>
+	/// Merge SeaShell's bundled library entries into an existing (companion) deps.json.
+	/// Used by CompileBinary when running a pre-compiled binary that has its own deps.json —
+	/// the companion entries are preserved, and SeaShell's bundled DLLs are added so the
+	/// startup hook (SeaShell.Script) and its transitive deps can load.
+	/// </summary>
+	public static void Merge(string companionPath, string outputPath, string engineDir)
+	{
+		var node = JsonNode.Parse(File.ReadAllText(companionPath))!;
+
+		var msgpackVer = GetBundledVersion(engineDir, "MessagePack.dll");
+		var ipcVer = GetBundledVersion(engineDir, "SeaShell.Ipc.dll");
+		var scriptVer = GetBundledVersion(engineDir, "SeaShell.Script.dll");
+
+		// Find the first (and usually only) TFM target
+		var targetsNode = node["targets"]?.AsObject();
+		JsonNode? tfmTargets = null;
+		if (targetsNode != null)
+		{
+			foreach (var kv in targetsNode)
+			{
+				tfmTargets = kv.Value;
+				break;
+			}
+		}
+
+		if (tfmTargets is JsonObject tfmObj)
+		{
+			// Add bundled entries only if they don't already exist
+			if (!HasEntry(tfmObj, "MessagePack"))
+			{
+				tfmObj[$"MessagePack/{msgpackVer}"] = new JsonObject
+				{
+					["runtime"] = new JsonObject
+					{
+						["MessagePack.dll"] = new JsonObject(),
+						["MessagePack.Annotations.dll"] = new JsonObject()
+					}
+				};
+			}
+			if (!HasEntry(tfmObj, "SeaShell.Ipc"))
+			{
+				tfmObj[$"SeaShell.Ipc/{ipcVer}"] = new JsonObject
+				{
+					["dependencies"] = new JsonObject { ["MessagePack"] = msgpackVer },
+					["runtime"] = new JsonObject { ["SeaShell.Ipc.dll"] = new JsonObject() }
+				};
+			}
+			if (!HasEntry(tfmObj, "SeaShell.Script"))
+			{
+				tfmObj[$"SeaShell.Script/{scriptVer}"] = new JsonObject
+				{
+					["dependencies"] = new JsonObject { ["SeaShell.Ipc"] = ipcVer },
+					["runtime"] = new JsonObject { ["SeaShell.Script.dll"] = new JsonObject() }
+				};
+			}
+		}
+
+		// Add to libraries
+		var libs = node["libraries"]?.AsObject();
+		if (libs != null)
+		{
+			if (!HasEntry(libs, "MessagePack"))
+				libs[$"MessagePack/{msgpackVer}"] = new JsonObject
+				{
+					["type"] = "project", ["serviceable"] = false, ["sha512"] = ""
+				};
+			if (!HasEntry(libs, "SeaShell.Ipc"))
+				libs[$"SeaShell.Ipc/{ipcVer}"] = new JsonObject
+				{
+					["type"] = "project", ["serviceable"] = false, ["sha512"] = ""
+				};
+			if (!HasEntry(libs, "SeaShell.Script"))
+				libs[$"SeaShell.Script/{scriptVer}"] = new JsonObject
+				{
+					["type"] = "project", ["serviceable"] = false, ["sha512"] = ""
+				};
+		}
+
+		var json = node.ToJsonString(new JsonSerializerOptions { WriteIndented = true });
+		File.WriteAllText(outputPath, json);
+	}
+
+	/// <summary>Check if a JsonObject has any key starting with "name/".</summary>
+	static bool HasEntry(JsonObject obj, string name)
+	{
+		var prefix = name + "/";
+		foreach (var kv in obj)
+			if (kv.Key.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
+				return true;
+		return false;
 	}
 
 	static string GetBundledVersion(string engineDir, string dllName)

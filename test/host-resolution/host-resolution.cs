@@ -3,7 +3,7 @@
 // Verifies that bundled DLLs (MessagePack, SeaShell.Ipc, SeaShell.Script)
 // resolve correctly when a ScriptHost consumer compiles and runs a script.
 //
-// This catches the CSA bug: deps.json listed bundled assemblies as
+// This catches a host-embedding bug: deps.json listed bundled assemblies as
 // type "project" entries, causing the .NET host to try NuGet cache
 // resolution for DLLs that only exist bundled inside the host package.
 //
