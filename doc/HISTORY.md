@@ -1,5 +1,30 @@
 # History
 
+## v0.2.15 (2026-03-27)
+
+**Daemon staging fix, .NET 10 dependency cleanup, cache hash includes direct NuGet versions.**
+
+- **Recursive daemon staging** — `StageBinary()` now copies subdirectories (including
+  `runtimes/`) when staging daemon and elevator binaries. Previously only top-level files
+  were copied, causing `System.Diagnostics.EventLog.Messages.dll` (in `runtimes/win/lib/`)
+  to be missing at runtime. Fixes daemon startup failure on machines where the NuGet cache
+  doesn't have the package (e.g., installed as a dotnet tool, not built from source).
+  `ComputeDirHash()` updated to include DLLs from subdirectories.
+- **System.Diagnostics.EventLog upgraded to 10.0.5** — Overrides the transitive 8.0.0
+  (from Serilog.Sinks.EventLog 4.0.0) via Directory.Build.props. The 8.0.0 package only
+  ships `lib/net8.0/` and `runtimes/win/lib/net8.0/` assets; 10.0.5 has proper `net10.0`
+  assets. Also upgrades ServiceHost from the preview version to stable.
+- **System.IO.Pipes.AccessControl removed** — The 5.0.0 NuGet package (only `lib/net5.0/`
+  assets) is unnecessary on .NET 10 where `PipeSecurity`, `PipeAccessRule`, and
+  `NamedPipeServerStreamAcl` are inbox in the shared framework. Removed from Protocol.csproj
+  along with the `NU1510` warning suppression.
+- **Cache hash includes direct NuGet versions** — `CompilationCache.ComputeHash()` now
+  includes resolved versions of direct `//sea_nuget` package references. For explicit
+  versions this is zero-cost (already in source text). For versionless directives, a single
+  `Directory.GetDirectories()` call resolves the latest version from the NuGet cache (~1-2ms).
+  Transitive dependencies are not included (immutable by convention). This ensures versionless
+  `//sea_nuget Foo` directives pick up new package versions without requiring a source change.
+
 ## v0.2.14 (2026-03-25)
 
 **Self-contained compilation output. The output directory is now standalone like `dotnet publish`
