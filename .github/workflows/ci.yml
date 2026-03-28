@@ -16,12 +16,17 @@ jobs:
             rid: win-x64
           - os: ubuntu-latest
             rid: linux-x64
+          - os: ubuntu-latest
+            rid: linux-musl-x64
+            container: mcr.microsoft.com/dotnet/sdk:10.0-alpine
     runs-on: ${{ matrix.os }}
+    container: ${{ matrix.container || '' }}
 
     steps:
       - uses: actions/checkout@v4
 
       - name: Setup .NET 10
+        if: ${{ !matrix.container }}
         uses: actions/setup-dotnet@v4
         with:
           dotnet-version: '10.0.x'
@@ -72,6 +77,12 @@ jobs:
           name: binaries-linux-x64
           path: publish/linux-x64/
 
+      - name: Download Alpine binaries
+        uses: actions/download-artifact@v4
+        with:
+          name: binaries-linux-musl-x64
+          path: publish/linux-musl-x64/
+
       - name: Pack
         run: dotnet pack -c Release -o ./nupkg
 
@@ -85,10 +96,22 @@ jobs:
 
           $zip = [System.IO.Compression.ZipFile]::Open($nupkg, 'Update')
           try {
+            # Inject glibc apphosts
             foreach ($f in @('seashell-daemon', 'seashell-elevator')) {
               $src = "publish/linux-x64/$f"
               if (Test-Path $src) {
                 $entryName = "tools/net10.0/any/$f"
+                Write-Host "  Adding $entryName"
+                [System.IO.Compression.ZipFileExtensions]::CreateEntryFromFile(
+                  $zip, $src, $entryName) | Out-Null
+              }
+            }
+
+            # Inject musl apphosts
+            foreach ($f in @('seashell-daemon', 'seashell-elevator')) {
+              $src = "publish/linux-musl-x64/$f"
+              if (Test-Path $src) {
+                $entryName = "runtimes/linux-musl-x64/$f"
                 Write-Host "  Adding $entryName"
                 [System.IO.Compression.ZipFileExtensions]::CreateEntryFromFile(
                   $zip, $src, $entryName) | Out-Null
@@ -102,9 +125,13 @@ jobs:
             $reader.Close()
 
             foreach ($f in @('seashell-daemon', 'seashell-elevator')) {
-              $override = "<Override PartName=`"/tools/net10.0/any/$f`" ContentType=`"application/octet`" />"
-              if ($ct -notmatch [regex]::Escape($f)) {
-                $ct = $ct -replace '</Types>', "  $override`n</Types>"
+              $glibcOverride = "<Override PartName=`"/tools/net10.0/any/$f`" ContentType=`"application/octet`" />"
+              if ($ct -notmatch [regex]::Escape("/tools/net10.0/any/$f")) {
+                $ct = $ct -replace '</Types>', "  $glibcOverride`n</Types>"
+              }
+              $muslOverride = "<Override PartName=`"/runtimes/linux-musl-x64/$f`" ContentType=`"application/octet`" />"
+              if ($ct -notmatch [regex]::Escape("/runtimes/linux-musl-x64/$f")) {
+                $ct = $ct -replace '</Types>', "  $muslOverride`n</Types>"
               }
             }
 
@@ -151,7 +178,9 @@ jobs:
             'tools/net10.0/any/SeaShell.Engine.dll',
             'tools/net10.0/any/SeaShell.Script.dll',
             'tools/net10.0/any/SeaShell.Ipc.dll',
-            'tools/net10.0/any/MessagePack.dll'
+            'tools/net10.0/any/MessagePack.dll',
+            'runtimes/linux-musl-x64/seashell-daemon',
+            'runtimes/linux-musl-x64/seashell-elevator'
           )
 
           Write-Host "`n=== SeaShell.Engine ==="

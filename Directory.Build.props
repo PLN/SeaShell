@@ -4,10 +4,10 @@
 		<LangVersion>latest</LangVersion>
 		<Nullable>enable</Nullable>
 		<ImplicitUsings>disable</ImplicitUsings>
-		<Version>0.2.15</Version>
+		<Version>0.2.16</Version>
 		<!-- Local pipeline passes -p:BuildNumber={runCounter} for unique versions per build.
 		     GitHub CI omits it, keeping the clean 3-component version for NuGet.org. -->
-		<Version Condition="'$(BuildNumber)' != ''">0.2.15.$(BuildNumber)</Version>
+		<Version Condition="'$(BuildNumber)' != ''">0.2.16.$(BuildNumber)</Version>
 
 		<!-- Shared NuGet metadata -->
 		<Authors>PLN;Claude (Anthropic)</Authors>

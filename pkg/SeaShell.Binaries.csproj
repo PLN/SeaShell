@@ -1,7 +1,7 @@
 <Project Sdk="Microsoft.NET.Sdk">
 	<!--
 	SeaShell.Binaries — published binaries for deployment automation.
-	Contains sea, seashell-daemon, and seashell-elevator for win-x64 and linux-x64.
+	Contains sea, seashell-daemon, and seashell-elevator for win-x64, linux-x64, and linux-musl-x64.
 
 	Build: dotnet pack pkg/SeaShell.Binaries.csproj -c Release -o ./nupkg
 	This first publishes all three projects for both RIDs, then packs them.
@@ -12,7 +12,7 @@
 	-->
 	<PropertyGroup>
 		<TargetFramework>net10.0</TargetFramework>
-		<Description>SeaShell pre-built binaries for deployment. Contains sea CLI, daemon, and elevator for win-x64 and linux-x64.</Description>
+		<Description>SeaShell pre-built binaries for deployment. Contains sea CLI, daemon, and elevator for win-x64, linux-x64, and linux-musl-x64.</Description>
 		<PackageTags>scripting;seashell;binaries;deployment</PackageTags>
 		<!-- This project doesn't produce its own assembly -->
 		<IncludeBuildOutput>false</IncludeBuildOutput>
@@ -28,5 +28,6 @@
 	<ItemGroup>
 		<Content Include="$(PublishDir)win-x64\**\*" PackagePath="content/seashell/win-x64/" />
 		<Content Include="$(PublishDir)linux-x64\**\*" PackagePath="content/seashell/linux-x64/" />
+		<Content Include="$(PublishDir)linux-musl-x64\**\*" PackagePath="content/seashell/linux-musl-x64/" />
 	</ItemGroup>
 </Project>
