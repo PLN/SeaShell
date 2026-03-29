@@ -18,7 +18,7 @@ public sealed class RunitInstaller : IServiceInstaller
 
 		var runPath = Path.Combine(svDir, "run");
 		File.WriteAllText(runPath, runScript);
-		RunCommand("chmod", $"+x {runPath}");
+		RunCommand("chmod", "+x", runPath);
 
 		// Symlink to activate
 		var servicePath = Directory.Exists("/var/service")
@@ -26,7 +26,7 @@ public sealed class RunitInstaller : IServiceInstaller
 			: $"/etc/service/{config.Name}";
 
 		if (!Path.Exists(servicePath))
-			RunCommand("ln", $"-s {svDir} {servicePath}");
+			RunCommand("ln", "-s", svDir, servicePath);
 
 		Console.WriteLine($"runit service installed: {svDir}");
 		Console.WriteLine($"Activated via symlink: {servicePath}");
@@ -51,13 +51,15 @@ public sealed class RunitInstaller : IServiceInstaller
 		return 0;
 	}
 
-	public int Start(ServiceConfig config) => RunCommand("sv", $"start {config.Name}");
-	public int Stop(ServiceConfig config) => RunCommand("sv", $"stop {config.Name}");
-	public int Status(ServiceConfig config) => RunCommand("sv", $"status {config.Name}");
+	public int Start(ServiceConfig config) => RunCommand("sv", "start", config.Name);
+	public int Stop(ServiceConfig config) => RunCommand("sv", "stop", config.Name);
+	public int Status(ServiceConfig config) => RunCommand("sv", "status", config.Name);
 
-	private static int RunCommand(string command, string arguments)
+	private static int RunCommand(string command, params string[] arguments)
 	{
-		var psi = new ProcessStartInfo(command, arguments) { UseShellExecute = false };
+		var psi = new ProcessStartInfo(command) { UseShellExecute = false };
+		foreach (var arg in arguments)
+			psi.ArgumentList.Add(arg);
 		using var proc = Process.Start(psi)!;
 		proc.WaitForExit();
 		return proc.ExitCode;

@@ -5,6 +5,6 @@
 		<Nullable>enable</Nullable>
 	</PropertyGroup>
 	<ItemGroup>
-		<PackageReference Include="SeaShell.ServiceHost" Version="0.*" />
+		<PackageReference Include="SeaShell.Host" Version="0.*" />
 	</ItemGroup>
 </Project>

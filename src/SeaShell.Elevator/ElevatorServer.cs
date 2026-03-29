@@ -32,7 +32,7 @@ public sealed class ElevatorWorker
 		if (!_isElevated)
 			_log.Warning("Running without elevation — scripts will NOT be elevated");
 
-		var daemonAddress = TransportEndpoint.GetDaemonAddress(TransportEndpoint.CurrentUserIdentity);
+		var daemonAddress = TransportEndpoint.GetDaemonAddress(TransportEndpoint.CurrentUserIdentity, TransportEndpoint.CurrentVersion);
 
 		while (!ct.IsCancellationRequested)
 		{

@@ -1,14 +1,14 @@
 <Solution>
   <Folder Name="/src/">
-    <Project Path="src/SeaShell.Ipc/SeaShell.Ipc.csproj" />
+    <Project Path="src/SeaShell.Common/SeaShell.Common.csproj" />
     <Project Path="src/SeaShell.Cli/SeaShell.Cli.csproj" />
     <Project Path="src/SeaShell.Daemon/SeaShell.Daemon.csproj" />
     <Project Path="src/SeaShell.Elevator/SeaShell.Elevator.csproj" />
     <Project Path="src/SeaShell.Engine/SeaShell.Engine.csproj" />
     <Project Path="src/SeaShell.Host/SeaShell.Host.csproj" />
+    <Project Path="src/SeaShell.Invoker/SeaShell.Invoker.csproj" />
     <Project Path="src/SeaShell.Protocol/SeaShell.Protocol.csproj" />
     <Project Path="src/SeaShell.Script/SeaShell.Script.csproj" />
-    <Project Path="src/SeaShell.ServiceHost/SeaShell.ServiceHost.csproj" />
   </Folder>
   <Folder Name="/test/">
     <Project Path="test/EngineTest/EngineTest.csproj" />

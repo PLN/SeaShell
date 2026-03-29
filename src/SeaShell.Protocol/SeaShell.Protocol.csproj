@@ -1,9 +1,8 @@
 <Project Sdk="Microsoft.NET.Sdk">
-	<!-- Cross-platform transport (named pipes, Unix sockets). Depends on Ipc for message types. -->
 	<PropertyGroup>
 		<IsPackable>false</IsPackable>
 	</PropertyGroup>
 	<ItemGroup>
-		<ProjectReference Include="..\SeaShell.Ipc\SeaShell.Ipc.csproj" />
+		<ProjectReference Include="..\SeaShell.Common\SeaShell.Common.csproj" />
 	</ItemGroup>
 </Project>

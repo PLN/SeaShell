@@ -31,28 +31,76 @@ public sealed class DaemonServer : IAsyncDisposable
 	private static readonly TimeSpan UpdateInterval = TimeSpan.FromHours(8);
 	private static readonly string Version = typeof(DaemonServer).Assembly.GetName().Version?.ToString(3) ?? "0.1.0";
 
+	// Idle timeout — 0 means stay active (default).
+	private long _lastActivityTicks;
+	private int _activeConnections;
+
+	/// <summary>
+	/// How long the daemon stays alive with no active connections or requests.
+	/// Zero (default) means stay active indefinitely.
+	/// </summary>
+	public TimeSpan IdleTimeout { get; set; }
+
 	public DaemonServer(string address)
 	{
 		_server = new TransportServer(address);
 		_updater = new NuGetUpdater(_compiler.NuGetResolver);
 		_updater.Log += msg => _log.Information("{Message}", msg);
+		_lastActivityTicks = DateTime.UtcNow.Ticks;
 	}
 
 	public async Task RunAsync(CancellationToken ct)
 	{
 		_server.Start();
-		var addr = TransportEndpoint.GetDaemonAddress(TransportEndpoint.CurrentUserIdentity);
+		var addr = TransportEndpoint.GetDaemonAddress(TransportEndpoint.CurrentUserIdentity, TransportEndpoint.CurrentVersion);
 		_log.Information("Listening on {Address}", addr);
+
+		if (IdleTimeout > TimeSpan.Zero)
+			_log.Information("Idle timeout: {IdleTimeout}", IdleTimeout);
 
 		// Background NuGet update check — every 8 hours
 		_ = RunUpdateLoopAsync(ct);
+
+		Interlocked.Exchange(ref _lastActivityTicks, DateTime.UtcNow.Ticks);
 
 		while (!ct.IsCancellationRequested)
 		{
 			try
 			{
-				var conn = await _server.AcceptAsync(ct);
-				_ = HandleConnectionAsync(conn, ct);
+				if (IdleTimeout > TimeSpan.Zero)
+				{
+					var lastActivity = new DateTime(Interlocked.Read(ref _lastActivityTicks), DateTimeKind.Utc);
+					var idle = DateTime.UtcNow - lastActivity;
+
+					if (idle >= IdleTimeout && Volatile.Read(ref _activeConnections) == 0)
+					{
+						_log.Information("Idle timeout reached ({IdleTimeout}), shutting down", IdleTimeout);
+						return;
+					}
+
+					// Wait for connection, but wake periodically to recheck idle state
+					var wait = IdleTimeout - idle;
+					if (wait <= TimeSpan.Zero) wait = TimeSpan.FromSeconds(1);
+
+					using var idleCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+					idleCts.CancelAfter(wait);
+
+					try
+					{
+						var conn = await _server.AcceptAsync(idleCts.Token);
+						TouchActivity();
+						_ = HandleConnectionAsync(conn, ct);
+					}
+					catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+					{
+						continue; // idle timer expired, loop to recheck
+					}
+				}
+				else
+				{
+					var conn = await _server.AcceptAsync(ct);
+					_ = HandleConnectionAsync(conn, ct);
+				}
 			}
 			catch (OperationCanceledException) when (ct.IsCancellationRequested)
 			{
@@ -65,8 +113,12 @@ public sealed class DaemonServer : IAsyncDisposable
 		}
 	}
 
+	private void TouchActivity() =>
+		Interlocked.Exchange(ref _lastActivityTicks, DateTime.UtcNow.Ticks);
+
 	private async Task HandleConnectionAsync(TransportStream conn, CancellationToken ct)
 	{
+		Interlocked.Increment(ref _activeConnections);
 		try
 		{
 			var result = await conn.Channel.ReceiveAsync(ct);
@@ -74,7 +126,9 @@ public sealed class DaemonServer : IAsyncDisposable
 
 			var (type, message) = result.Value;
 
-			// Elevator registration — hold this connection, don't dispose it
+			// Elevator registration — hold this connection, don't dispose it.
+			// HandleElevatorHello stores the connection and returns quickly,
+			// so the active connection count drops back naturally via finally.
 			if (type == MessageType.ElevatorHello)
 			{
 				await HandleElevatorHello(conn, (ElevatorHello)message, ct);
@@ -138,6 +192,11 @@ public sealed class DaemonServer : IAsyncDisposable
 		catch (Exception ex)
 		{
 			_log.Error(ex, "Connection error");
+		}
+		finally
+		{
+			Interlocked.Decrement(ref _activeConnections);
+			TouchActivity();
 		}
 	}
 

@@ -333,10 +333,16 @@ public static class Sea
 				PipeTransmissionMode.Byte, PipeOptions.Asynchronous, 0, 0, security);
 		}
 
-		var pipe = new NamedPipeServerStream(pipeName, PipeDirection.InOut, 1,
-			PipeTransmissionMode.Byte, PipeOptions.Asynchronous);
+		// Set restrictive umask BEFORE pipe creation to close the TOCTOU gap —
+		// the underlying Unix socket is created with owner-only permissions from the start.
+		NamedPipeServerStream pipe;
+		using (PosixUmask.RestrictiveUmask())
+		{
+			pipe = new NamedPipeServerStream(pipeName, PipeDirection.InOut, 1,
+				PipeTransmissionMode.Byte, PipeOptions.Asynchronous);
+		}
 
-		// Restrict socket to owner only (matches daemon security model)
+		// Defense-in-depth: explicitly set permissions in case umask was bypassed
 		if (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
 		{
 			try

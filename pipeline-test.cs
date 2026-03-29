@@ -5,6 +5,7 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.Linq;
+using System.IO.Compression;
 using System.Runtime.InteropServices;
 using System.Threading;
 using Serilog;
@@ -83,8 +84,8 @@ if (isWindows)
 	DiagnosticsExt.RunProcess("taskkill", "/F /IM seashell-elevator.exe", src, quiet: true);
 	// Unregister Task Scheduler tasks — they point to the old staged binary
 	// which we're about to delete. The fresh install will re-stage on first use.
-	DiagnosticsExt.RunProcess("schtasks.exe", $"/Delete /TN \"\\SeaShell\\SeaShell Daemon ({Environment.UserName})\" /F", src, quiet: true);
-	DiagnosticsExt.RunProcess("schtasks.exe", $"/Delete /TN \"\\SeaShell\\SeaShell Elevator ({Environment.UserName})\" /F", src, quiet: true);
+	// Delete all SeaShell tasks (both old unversioned and new versioned names).
+	DiagnosticsExt.RunProcess("powershell", "-c \"Get-ScheduledTask -TaskPath '\\SeaShell\\' -ErrorAction SilentlyContinue | Unregister-ScheduledTask -Confirm:$false -ErrorAction SilentlyContinue\"", src, quiet: true);
 }
 else
 {
@@ -115,11 +116,53 @@ var rootInstallCode = DiagnosticsExt.RunProcess(elevate,
 if (rootInstallCode != 0)
 	Console.Error.WriteLine("[test] WARNING: Failed to install sea for root/SYSTEM (non-fatal)");
 
+// ── Install SeaShell.Service into NuGet caches ─────────────────────
+// dotnet tool install stores dependencies in .store/, NOT in ~/.nuget/packages/.
+// The daemon staging (ServiceManifest) looks in ~/.nuget/packages/ for
+// SeaShell.Service. Clear old versions (may have R2R DLLs from earlier
+// pipeline runs) and extract the fresh package for all accounts.
+
+var userNugetCache = Path.Combine(
+	Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".nuget", "packages");
+var servicePkg = Directory.GetFiles(nupkgDir, "SeaShell.Service.*.nupkg").FirstOrDefault();
+
+if (servicePkg != null)
+{
+	var serviceVersion = Path.GetFileNameWithoutExtension(servicePkg)
+		.Substring("SeaShell.Service.".Length);
+
+	// Current user — clear old versions, install fresh
+	var userServiceDir = Path.Combine(userNugetCache, "seashell.service");
+	if (Directory.Exists(userServiceDir))
+	{
+		Console.WriteLine($"[test]   Clearing old seashell.service from {userNugetCache}");
+		try { Directory.Delete(userServiceDir, true); } catch { }
+	}
+	InstallServicePackageToCache(servicePkg, serviceVersion, userNugetCache);
+
+	if (isWindows)
+	{
+		// SYSTEM account — different NuGet cache, different user profile
+		var systemNugetCache = @"C:\Windows\system32\config\systemprofile\.nuget\packages";
+		DiagnosticsExt.RunProcess("gsudo",
+			@"cmd /c rmdir /s /q ""C:\Windows\system32\config\systemprofile\.nuget\packages\seashell.service"" 2>nul",
+			src, quiet: true);
+		InstallServicePackageToCache(servicePkg, serviceVersion, systemNugetCache, elevate: true);
+	}
+	else
+	{
+		// root
+		var rootNugetCache = "/root/.nuget/packages";
+		DiagnosticsExt.RunProcess("sudo", "rm -rf /root/.nuget/packages/seashell.service", src, quiet: true);
+		InstallServicePackageToCache(servicePkg, serviceVersion, rootNugetCache, elevate: true);
+	}
+}
+
 // ── Clear all SeaShell caches (both accounts) ───────────────────────
 
 Console.WriteLine("[test] Clearing SeaShell caches...");
 
-// Current user: cache + daemon staging + elevator staging
+// Current user: cache + daemon staging + elevator staging + manifest
 var seashellDataDir = isWindows
 	? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "seashell")
 	: Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".local", "share", "seashell");
@@ -132,6 +175,12 @@ foreach (var sub in new[] { "cache", "daemon", "elevator" })
 		try { Directory.Delete(dir, true); } catch { }
 	}
 }
+var manifestFile = Path.Combine(seashellDataDir, "seashell.json");
+if (File.Exists(manifestFile))
+{
+	Console.WriteLine($"[test]   Clearing manifest: {manifestFile}");
+	try { File.Delete(manifestFile); } catch { }
+}
 
 // Root/SYSTEM caches
 if (isWindows)
@@ -139,10 +188,11 @@ if (isWindows)
 	DiagnosticsExt.RunProcess("gsudo", @"cmd /c rmdir /s /q ""C:\ProgramData\seashell\cache"" 2>nul", src, quiet: true);
 	DiagnosticsExt.RunProcess("gsudo", @"cmd /c rmdir /s /q ""C:\ProgramData\seashell\daemon"" 2>nul", src, quiet: true);
 	DiagnosticsExt.RunProcess("gsudo", @"cmd /c rmdir /s /q ""C:\ProgramData\seashell\elevator"" 2>nul", src, quiet: true);
+	DiagnosticsExt.RunProcess("gsudo", @"cmd /c del /q ""C:\ProgramData\seashell\seashell.json"" 2>nul", src, quiet: true);
 }
 else
 {
-	DiagnosticsExt.RunProcess("sudo", "rm -rf /var/lib/seashell/cache /var/lib/seashell/daemon /var/lib/seashell/elevator", src, quiet: true);
+	DiagnosticsExt.RunProcess("sudo", "rm -rf /var/lib/seashell/cache /var/lib/seashell/daemon /var/lib/seashell/elevator /var/lib/seashell/seashell.json", src, quiet: true);
 }
 
 // ── Verify installation ─────────────────────────────────────────────
@@ -428,6 +478,44 @@ RunTest("daemon status (no crash)", () =>
 	return 0; // always pass if it didn't crash
 });
 
+// ── Socket permission test (Linux only) ────────────────────────────
+// Verifies the daemon socket is created with owner-only permissions (0600).
+// The umask fix in Transport.cs closes the TOCTOU gap between Bind() and
+// SetUnixFileMode() — the socket is never world-accessible, even briefly.
+
+RunTest("daemon socket permissions", () =>
+{
+	if (isWindows) { Console.Write("(skipped on Windows) "); return 0; }
+
+	// The daemon is running from the smoke tests above — find its socket
+	var xdgRuntime = Environment.GetEnvironmentVariable("XDG_RUNTIME_DIR");
+	if (string.IsNullOrEmpty(xdgRuntime) || !Directory.Exists(xdgRuntime))
+		xdgRuntime = Path.GetTempPath();
+
+	var identity = Environment.UserName.ToLowerInvariant();
+	var sockets = Directory.GetFiles(xdgRuntime, $"seashell-*-{identity}.sock");
+
+	if (sockets.Length == 0)
+	{
+		Console.Error.WriteLine($"\n[test]   No daemon socket found in {xdgRuntime}");
+		return 1;
+	}
+
+	var socketPath = sockets[0];
+	var mode = File.GetUnixFileMode(socketPath);
+	var forbidden = UnixFileMode.GroupRead | UnixFileMode.GroupWrite | UnixFileMode.GroupExecute
+	              | UnixFileMode.OtherRead | UnixFileMode.OtherWrite | UnixFileMode.OtherExecute;
+
+	if ((mode & forbidden) != 0)
+	{
+		Console.Error.WriteLine($"\n[test]   Socket {socketPath} has insecure permissions: {mode}");
+		return 1;
+	}
+
+	Console.Write($"({mode}) ");
+	return 0;
+});
+
 RunTest("daemon stop", () =>
 	DiagnosticsExt.RunProcess("sea", "--stop", src, prefix: "test"));
 
@@ -480,5 +568,40 @@ void RunTest(string name, Func<int> action)
 		Console.WriteLine($"FAILED ({ex.Message})");
 		results.Add((name, false, ex.Message));
 		failed++;
+	}
+}
+
+void InstallServicePackageToCache(string nupkgPath, string version, string nugetCache, bool elevate = false)
+{
+	var targetDir = Path.Combine(nugetCache, "seashell.service", version);
+	Console.WriteLine($"[test]   SeaShell.Service {version} → {targetDir}");
+
+	if (elevate)
+	{
+		// Extract to a temp dir, then copy with elevation
+		var tempDir = Path.Combine(Path.GetTempPath(), $"seashell-service-{version}");
+		if (Directory.Exists(tempDir)) Directory.Delete(tempDir, true);
+		System.IO.Compression.ZipFile.ExtractToDirectory(nupkgPath, tempDir, true);
+
+		if (isWindows)
+		{
+			DiagnosticsExt.RunProcess("gsudo",
+				$"cmd /c xcopy /E /I /Y \"{tempDir}\" \"{targetDir}\"",
+				src, quiet: true);
+		}
+		else
+		{
+			DiagnosticsExt.RunProcess("sudo", $"mkdir -p \"{targetDir}\"", src, quiet: true);
+			DiagnosticsExt.RunProcess("sudo", $"cp -r \"{tempDir}/.\" \"{targetDir}/\"", src, quiet: true);
+		}
+
+		try { Directory.Delete(tempDir, true); } catch { }
+	}
+	else
+	{
+		// Direct extraction — no elevation needed
+		if (Directory.Exists(targetDir)) Directory.Delete(targetDir, true);
+		Directory.CreateDirectory(targetDir);
+		System.IO.Compression.ZipFile.ExtractToDirectory(nupkgPath, targetDir, true);
 	}
 }

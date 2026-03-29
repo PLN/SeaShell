@@ -1,5 +1,52 @@
 # History
 
+## v0.3.17 (2026-03-29)
+
+**Invoker refactoring: shared execution engine, package consolidation, security hardening.**
+
+The v0.3 line extracts the execution logic into a shared Invoker library. CLI, Host,
+and ServiceHost are now thin wrappers around the same core — same code paths for
+compilation, execution, elevation, watch mode, and reload.
+
+- **SeaShell.Invoker** — New library containing the shared client-side execution engine:
+  `ScriptInvoker` (compile, execute, watch, reload, elevate), `DaemonLauncher` (ensure
+  daemon running), `DaemonManager` (status, stop, binary staging, version-check),
+  `ScheduledTasks` (Windows Task Scheduler management), `ServiceManifest` (installation
+  state tracking).
+- **CLI gutted** — `ScriptRunner` reduced from 560 to 35 lines. All execution logic
+  delegated to `ScriptInvoker`. `DaemonManager` and `ScheduledTasks` moved to Invoker.
+- **Host rewritten** — `ScriptHost` is now a thin wrapper around `ScriptInvoker` with
+  `OutputMode.Capture`. Dropped direct Engine/Roslyn dependency — compilation happens
+  in the daemon, not in the host process.
+- **ServiceHost merged into Host** — `ServiceHostBuilder`, `ServiceHostWorker`, init system
+  detection, and all service installers moved into SeaShell.Host. Same NuGet package, same
+  namespace. Consumers reference one package instead of two.
+- **Package consolidation** — 7 public NuGet packages → 3: SeaShell (CLI tool),
+  SeaShell.Host (library + service hosting), SeaShell.Service (daemon/elevator binaries).
+  Internal projects (Common, Engine, Protocol, Invoker, Script) are bundled, not published.
+- **Service manifest** — `seashell.json` in the data directory tracks installations per
+  version: staged binary paths, hashes, pipe addresses, and registered scheduled tasks.
+  File-locked for concurrent access. `ServiceManifest.GetOrStageDaemon()` finds daemon
+  binaries from the CLI tool directory or the SeaShell.Service NuGet package, stages them,
+  and records the result.
+- **Side-by-side versioning** — Daemon pipe/socket addresses include the 3-part assembly
+  version (`seashell-{version}-{identity}`). Multiple SeaShell versions can run concurrently
+  without conflicts. Each version gets its own daemon, cache, and staged binaries.
+- **Daemon idle timeout** — Configurable via `SEASHELL_IDLE_TIMEOUT` environment variable
+  or `--idle-timeout` flag. Supports `ms`, `s`, `m`, `h` suffixes. Zero (default) means
+  stay active indefinitely. Useful for CI and ephemeral environments.
+- **Security: service installer argument injection** — All five service installers
+  (Windows Service, systemd, sysvinit, OpenRC, runit) switched from string-based
+  `ProcessStartInfo` arguments to `ArgumentList`. Prevents argument injection if service
+  names or paths contain special characters.
+- **Security: Unix socket TOCTOU** — Socket and pipe creation on Linux now sets
+  `umask(0077)` before `Bind()`/`new NamedPipeServerStream()` and restores after.
+  Closes the brief window where the socket was world-accessible between creation and
+  `SetUnixFileMode()`. New `PosixUmask` helper in SeaShell.Common. Existing
+  `SetUnixFileMode` calls retained as defense-in-depth.
+- **Pipeline test** — `daemon socket permissions` test verifies the daemon socket is
+  created with owner-only permissions (0600) on Linux. Passes on Debian and Alpine.
+
 ## v0.2.16 (2026-03-28)
 
 **Alpine Linux (linux-musl-x64) support, pipeline test rework.**
@@ -129,8 +176,8 @@ NuGet resolution entirely.**
 - **NuGet transitive dedup** — Engine deduplicates compile-time references when a script's
   NuGet dependencies transitively include assemblies already bundled by the Engine.
 - **Local CI/CD pipeline** — Build, package, and test on both Windows and Linux build hosts
-  via SSH. MooseFS shared storage with unison sync. Convention-based directory layout with
-  timestamp correlation IDs.
+  via SSH. Shared storage for cross-platform artifact exchange. Convention-based directory
+  layout with timestamp correlation IDs.
 
 ## v0.1.7 (2026-03-22)
 

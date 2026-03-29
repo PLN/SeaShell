@@ -21,7 +21,7 @@ public sealed class SystemdInstaller : IServiceInstaller
 		File.WriteAllText(unitPath, content);
 
 		RunCommand("systemctl", "daemon-reload");
-		RunCommand("systemctl", $"enable {config.Name}");
+		RunCommand("systemctl", "enable", config.Name);
 
 		Console.WriteLine($"systemd unit installed: {unitPath}");
 		Console.WriteLine($"Run: systemctl start {config.Name}");
@@ -30,8 +30,8 @@ public sealed class SystemdInstaller : IServiceInstaller
 
 	public int Uninstall(ServiceConfig config)
 	{
-		RunCommand("systemctl", $"stop {config.Name}");
-		RunCommand("systemctl", $"disable {config.Name}");
+		RunCommand("systemctl", "stop", config.Name);
+		RunCommand("systemctl", "disable", config.Name);
 
 		var unitPath = $"/etc/systemd/system/{config.Name}.service";
 		if (File.Exists(unitPath))
@@ -42,23 +42,25 @@ public sealed class SystemdInstaller : IServiceInstaller
 		return 0;
 	}
 
-	public int Start(ServiceConfig config) => RunCommand("systemctl", $"start {config.Name}");
-	public int Stop(ServiceConfig config) => RunCommand("systemctl", $"stop {config.Name}");
-	public int Status(ServiceConfig config) => RunCommand("systemctl", $"status {config.Name}");
+	public int Start(ServiceConfig config) => RunCommand("systemctl", "start", config.Name);
+	public int Stop(ServiceConfig config) => RunCommand("systemctl", "stop", config.Name);
+	public int Status(ServiceConfig config) => RunCommand("systemctl", "status", config.Name);
 
 	private static string LoadTemplate(string name)
 	{
 		var asm = Assembly.GetExecutingAssembly();
-		var resourceName = $"SeaShell.ServiceHost.Templates.{name}";
+		var resourceName = $"SeaShell.Host.Templates.{name}";
 		using var stream = asm.GetManifestResourceStream(resourceName);
 		if (stream == null) throw new FileNotFoundException($"Embedded resource not found: {resourceName}");
 		using var reader = new StreamReader(stream);
 		return reader.ReadToEnd();
 	}
 
-	private static int RunCommand(string command, string arguments)
+	private static int RunCommand(string command, params string[] arguments)
 	{
-		var psi = new ProcessStartInfo(command, arguments) { UseShellExecute = false };
+		var psi = new ProcessStartInfo(command) { UseShellExecute = false };
+		foreach (var arg in arguments)
+			psi.ArgumentList.Add(arg);
 		using var proc = Process.Start(psi)!;
 		proc.WaitForExit();
 		return proc.ExitCode;

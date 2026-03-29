@@ -19,7 +19,7 @@ var markerDir = Path.Combine(scriptDir, "markers");
 var marker = Path.Combine(markerDir, "seashell-cwd-test.marker");
 
 // Exercise SeaShell.Host to prove the NuGet assembly (and its transitive deps:
-// SeaShell.Engine, SeaShell.Script, SeaShell.Ipc, MessagePack) loaded at runtime.
+// SeaShell.Engine, SeaShell.Script, SeaShell.Common, MessagePack) loaded at runtime.
 // This is the exact scenario that fails when deps.json has orphaned type:"project"
 // entries for bundled DLLs that weren't copied to the output dir.
 var nugetOk = "FAIL";

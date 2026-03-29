@@ -27,7 +27,6 @@ public sealed class ServiceHostBuilder
 	private string? _scriptPath;
 	private string? _assemblyPath;
 	private string[]? _scriptArgs;
-	private TimeSpan? _updateInterval;
 	private string? _workingDirectory;
 	private Dictionary<string, string>? _environmentVars;
 
@@ -55,13 +54,6 @@ public sealed class ServiceHostBuilder
 		_assemblyPath = assemblyPath;
 		_scriptPath = null;
 		_scriptArgs = args;
-		return this;
-	}
-
-	/// <summary>Enable background NuGet update checks on the given interval.</summary>
-	public ServiceHostBuilder EnableNuGetUpdates(TimeSpan interval)
-	{
-		_updateInterval = interval;
 		return this;
 	}
 
@@ -127,7 +119,7 @@ public sealed class ServiceHostBuilder
 
 		// Register our worker
 		builder.Services.AddSingleton(new ServiceHostOptions(
-			targetPath, _scriptArgs ?? Array.Empty<string>(), _updateInterval,
+			targetPath, _scriptArgs ?? Array.Empty<string>(),
 			workingDirectory, _environmentVars));
 		builder.Services.AddHostedService<ServiceHostWorker>();
 
@@ -178,6 +170,5 @@ public sealed class ServiceHostBuilder
 internal sealed record ServiceHostOptions(
 	string TargetPath,
 	string[] Args,
-	TimeSpan? UpdateInterval,
 	string WorkingDirectory,
 	Dictionary<string, string>? EnvironmentVars);

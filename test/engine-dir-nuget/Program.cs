@@ -1,32 +1,27 @@
 // ── Engine Dir NuGet Test ────────────────────────────────────────────
 //
 // Tests that ScriptHost works when consumed via NuGet in a `dotnet run`
-// scenario (no publish). In this layout, SeaShell.Engine.dll lives in
-// the NuGet cache (~/.nuget/packages/seashell.engine/x.y.z/lib/net10.0/)
-// and bundled DLLs (MessagePack, SeaShell.Ipc, SeaShell.Script) are each
-// in their OWN package directories — not adjacent to the Engine.
+// scenario (no publish). In this layout, bundled DLLs (Invoker, Ipc,
+// Protocol, Script, MessagePack) are in the NuGet cache — not adjacent.
 //
-// This exercises the _engineDir probing path: if the Engine assumes
-// bundled DLLs are next to SeaShell.Engine.dll, they won't be found.
+// v0.3: Host no longer references Engine. This test verifies that the
+// Invoker-based Host works correctly from a NuGet cache layout.
 //
 // Exit 0 = pass, non-zero = fail.
 
 using System;
 using System.Diagnostics;
-using System.Linq;
-using System.Runtime.InteropServices;
 using SeaShell.Host;
 
 var testName = "engine-dir-nuget";
 Console.WriteLine($"[{testName}] Running test...");
 
-// Verify we're NOT in a publish layout — the Engine DLL should be in the NuGet cache
-var engineLocation = typeof(SeaShell.Engine.ScriptCompiler).Assembly.Location;
-Console.WriteLine($"[{testName}]   Engine location: {engineLocation}");
+// Verify Host is loaded from NuGet cache (not a flat publish dir)
+var hostLocation = typeof(ScriptHost).Assembly.Location;
+Console.WriteLine($"[{testName}]   Host location: {hostLocation}");
 
 var host = new ScriptHost();
 
-// The inner snippet checks that bundled DLLs resolve at runtime
 var snippet = """
 	using System;
 	using SeaShell;

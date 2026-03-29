@@ -273,7 +273,7 @@ public sealed class ScriptCompiler
 			DepsJsonWriter.Write(depsPath, assemblyName, resolvedPackages, _engineDir);
 
 		// Copy SeaShell runtime DLLs to output dir (startup hook + transitive deps)
-		foreach (var dllName in new[] { "SeaShell.Script.dll", "SeaShell.Ipc.dll", "MessagePack.dll", "MessagePack.Annotations.dll" })
+		foreach (var dllName in new[] { "SeaShell.Script.dll", "SeaShell.Common.dll", "MessagePack.dll", "MessagePack.Annotations.dll" })
 		{
 			var src = Path.Combine(_engineDir, dllName);
 			var dest = Path.Combine(outputDir, dllName);
@@ -396,7 +396,7 @@ public sealed class ScriptCompiler
 		var engineDir = Path.GetDirectoryName(scriptAssemblyPath) ?? AppContext.BaseDirectory;
 		foreach (var name in new[] {
 			scriptAssemblyPath,
-			Path.Combine(engineDir, "SeaShell.Ipc.dll"),
+			Path.Combine(engineDir, "SeaShell.Common.dll"),
 			Path.Combine(engineDir, "MessagePack.dll"),
 			Path.Combine(engineDir, "MessagePack.Annotations.dll"),
 		})
@@ -515,7 +515,7 @@ public sealed class ScriptCompiler
 		_log.Debug("Binary staging for {Name} in {OutputDir}", name, outputDir);
 
 		// Copy SeaShell runtime DLLs to staging
-		foreach (var dll in new[] { "SeaShell.Script.dll", "SeaShell.Ipc.dll",
+		foreach (var dll in new[] { "SeaShell.Script.dll", "SeaShell.Common.dll",
 		                             "MessagePack.dll", "MessagePack.Annotations.dll" })
 		{
 			var src = Path.Combine(_engineDir, dll);

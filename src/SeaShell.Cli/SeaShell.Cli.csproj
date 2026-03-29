@@ -15,9 +15,6 @@
 	</ItemGroup>
 	<ItemGroup>
 		<ProjectReference Include="..\SeaShell.Protocol\SeaShell.Protocol.csproj" />
-		<!-- Daemon and Elevator are bundled so the tool package is self-contained.
-		     The CLI finds them next to itself via AppContext.BaseDirectory. -->
-		<ProjectReference Include="..\SeaShell.Daemon\SeaShell.Daemon.csproj" />
-		<ProjectReference Include="..\SeaShell.Elevator\SeaShell.Elevator.csproj" />
+		<ProjectReference Include="..\SeaShell.Invoker\SeaShell.Invoker.csproj" />
 	</ItemGroup>
 </Project>

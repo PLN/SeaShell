@@ -8,6 +8,6 @@
 		<GenerateDocumentationFile>true</GenerateDocumentationFile>
 	</PropertyGroup>
 	<ItemGroup>
-		<ProjectReference Include="..\SeaShell.Ipc\SeaShell.Ipc.csproj" />
+		<ProjectReference Include="..\SeaShell.Common\SeaShell.Common.csproj" />
 	</ItemGroup>
 </Project>

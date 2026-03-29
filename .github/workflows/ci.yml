@@ -83,66 +83,70 @@ jobs:
           name: binaries-linux-musl-x64
           path: publish/linux-musl-x64/
 
-      - name: Pack
+      # Build Daemon separately — nothing in the packable projects references it,
+      # but we need its bin/Release output for the Service package's shared DLLs.
+      - name: Build Daemon (for shared DLLs)
+        run: dotnet build src/SeaShell.Daemon/SeaShell.Daemon.csproj -c Release
+
+      - name: Pack CLI + Host
         run: dotnet pack -c Release -o ./nupkg
 
-      - name: Inject Linux apphosts into tool package
+      # Service package: platform binaries from build jobs + shared DLLs from Daemon build.
+      # PublishDir and BuildDir default to paths relative to pkg/SeaShell.Binaries.csproj
+      # that match our download layout (publish/{rid}/) and build output.
+      - name: Pack Service
+        run: dotnet pack pkg/SeaShell.Binaries.csproj -c Release -o ./nupkg
+
+      # Inject SeaShell.Service dependency into CLI and Host nuspecs post-pack.
+      # Can't be a .csproj dependency (chicken-and-egg: Service is built from same repo).
+      - name: Inject Service dependency
         shell: pwsh
         run: |
-          $nupkg = (Get-ChildItem nupkg/SeaShell.0.*.nupkg).FullName
-          Write-Host "Injecting Linux apphosts into $nupkg"
-
           Add-Type -AssemblyName System.IO.Compression.FileSystem
 
-          $zip = [System.IO.Compression.ZipFile]::Open($nupkg, 'Update')
-          try {
-            # Inject glibc apphosts
-            foreach ($f in @('seashell-daemon', 'seashell-elevator')) {
-              $src = "publish/linux-x64/$f"
-              if (Test-Path $src) {
-                $entryName = "tools/net10.0/any/$f"
-                Write-Host "  Adding $entryName"
-                [System.IO.Compression.ZipFileExtensions]::CreateEntryFromFile(
-                  $zip, $src, $entryName) | Out-Null
+          $serviceVersion = (Get-ChildItem nupkg/SeaShell.Service.*.nupkg).BaseName -replace '^SeaShell\.Service\.',''
+          Write-Host "Service version: $serviceVersion"
+
+          foreach ($pattern in @('SeaShell.0.*.nupkg', 'SeaShell.Host.*.nupkg')) {
+            $pkg = (Get-ChildItem "nupkg/$pattern" -ErrorAction SilentlyContinue).FullName
+            if (-not $pkg) { continue }
+            Write-Host "Injecting into $(Split-Path $pkg -Leaf)"
+
+            $zip = [System.IO.Compression.ZipFile]::Open($pkg, 'Update')
+            try {
+              $nuspec = $zip.Entries | Where-Object { $_.FullName -like '*.nuspec' } | Select-Object -First 1
+              $reader = [System.IO.StreamReader]::new($nuspec.Open())
+              $xml = [xml]$reader.ReadToEnd()
+              $reader.Close()
+
+              $ns = $xml.DocumentElement.NamespaceURI
+              $deps = $xml.SelectSingleNode('//*[local-name()="dependencies"]')
+              if (-not $deps) {
+                $deps = $xml.CreateElement('dependencies', $ns)
+                $xml.SelectSingleNode('//*[local-name()="metadata"]').AppendChild($deps) | Out-Null
               }
+
+              $group = $deps.SelectSingleNode('*[local-name()="group" and contains(@targetFramework,"net10.0")]')
+              if (-not $group) {
+                $group = $xml.CreateElement('group', $ns)
+                $group.SetAttribute('targetFramework', 'net10.0')
+                $deps.AppendChild($group) | Out-Null
+              }
+
+              $dep = $xml.CreateElement('dependency', $ns)
+              $dep.SetAttribute('id', 'SeaShell.Service')
+              $dep.SetAttribute('version', "[$serviceVersion]")
+              $dep.SetAttribute('exclude', 'Build,Analyzers')
+              $group.AppendChild($dep) | Out-Null
+
+              $nuspec.Delete()
+              $newEntry = $zip.CreateEntry($nuspec.FullName)
+              $writer = [System.IO.StreamWriter]::new($newEntry.Open())
+              $xml.Save($writer)
+              $writer.Close()
+              Write-Host "  OK: SeaShell.Service [$serviceVersion]"
             }
-
-            # Inject musl apphosts
-            foreach ($f in @('seashell-daemon', 'seashell-elevator')) {
-              $src = "publish/linux-musl-x64/$f"
-              if (Test-Path $src) {
-                $entryName = "runtimes/linux-musl-x64/$f"
-                Write-Host "  Adding $entryName"
-                [System.IO.Compression.ZipFileExtensions]::CreateEntryFromFile(
-                  $zip, $src, $entryName) | Out-Null
-              }
-            }
-
-            # Patch [Content_Types].xml for extensionless files
-            $ctEntry = $zip.GetEntry('[Content_Types].xml')
-            $reader = [System.IO.StreamReader]::new($ctEntry.Open())
-            $ct = $reader.ReadToEnd()
-            $reader.Close()
-
-            foreach ($f in @('seashell-daemon', 'seashell-elevator')) {
-              $glibcOverride = "<Override PartName=`"/tools/net10.0/any/$f`" ContentType=`"application/octet`" />"
-              if ($ct -notmatch [regex]::Escape("/tools/net10.0/any/$f")) {
-                $ct = $ct -replace '</Types>', "  $glibcOverride`n</Types>"
-              }
-              $muslOverride = "<Override PartName=`"/runtimes/linux-musl-x64/$f`" ContentType=`"application/octet`" />"
-              if ($ct -notmatch [regex]::Escape("/runtimes/linux-musl-x64/$f")) {
-                $ct = $ct -replace '</Types>', "  $muslOverride`n</Types>"
-              }
-            }
-
-            $ctEntry.Delete()
-            $newEntry = $zip.CreateEntry('[Content_Types].xml')
-            $writer = [System.IO.StreamWriter]::new($newEntry.Open())
-            $writer.Write($ct)
-            $writer.Close()
-          }
-          finally {
-            $zip.Dispose()
+            finally { $zip.Dispose() }
           }
 
       - name: Validate package contents
@@ -156,8 +160,7 @@ jobs:
             $entries = $zip.Entries | ForEach-Object { $_.FullName }
             $zip.Dispose()
             foreach ($e in $expected) {
-              $match = $entries | Where-Object { $_ -like $e }
-              if ($match) {
+              if ($entries -contains $e) {
                 Write-Host "  OK: $e"
               } else {
                 Write-Host "  MISSING: $e" -ForegroundColor Red
@@ -166,32 +169,27 @@ jobs:
             }
           }
 
+          function Assert-NuspecHas($nupkg, $text) {
+            $zip = [System.IO.Compression.ZipFile]::OpenRead($nupkg)
+            $nuspec = $zip.Entries | Where-Object { $_.FullName -like '*.nuspec' } | Select-Object -First 1
+            $reader = [System.IO.StreamReader]::new($nuspec.Open())
+            $content = $reader.ReadToEnd()
+            $reader.Close()
+            $zip.Dispose()
+            if ($content -match $text) { Write-Host "  OK: $text dependency" }
+            else { Write-Host "  MISSING: $text dependency" -ForegroundColor Red; $script:failed = $true }
+          }
+
           Write-Host "=== SeaShell (tool) ==="
           $pkg = (Get-ChildItem nupkg/SeaShell.0.*.nupkg).FullName
           Assert-Contains $pkg @(
             'tools/net10.0/any/sea.dll',
-            'tools/net10.0/any/seashell-daemon.dll',
-            'tools/net10.0/any/seashell-daemon.exe',
-            'tools/net10.0/any/seashell-daemon',
-            'tools/net10.0/any/seashell-elevator.exe',
-            'tools/net10.0/any/seashell-elevator',
-            'tools/net10.0/any/SeaShell.Engine.dll',
-            'tools/net10.0/any/SeaShell.Script.dll',
-            'tools/net10.0/any/SeaShell.Ipc.dll',
-            'tools/net10.0/any/MessagePack.dll',
-            'runtimes/linux-musl-x64/seashell-daemon',
-            'runtimes/linux-musl-x64/seashell-elevator'
+            'tools/net10.0/any/SeaShell.Invoker.dll',
+            'tools/net10.0/any/SeaShell.Protocol.dll',
+            'tools/net10.0/any/SeaShell.Common.dll',
+            'tools/net10.0/any/MessagePack.dll'
           )
-
-          Write-Host "`n=== SeaShell.Engine ==="
-          $pkg = (Get-ChildItem nupkg/SeaShell.Engine.*.nupkg).FullName
-          Assert-Contains $pkg @(
-            'lib/net10.0/SeaShell.Engine.dll',
-            'lib/net10.0/SeaShell.Script.dll',
-            'lib/net10.0/SeaShell.Ipc.dll',
-            'lib/net10.0/MessagePack.dll',
-            'lib/net10.0/MessagePack.Annotations.dll'
-          )
+          Assert-NuspecHas $pkg 'SeaShell.Service'
 
           Write-Host "`n=== SeaShell.Host ==="
           $pkg = (Get-ChildItem nupkg/SeaShell.Host.*.nupkg).FullName
@@ -199,29 +197,38 @@ jobs:
             'lib/net10.0/SeaShell.Host.dll',
             'build/net10.0/SeaShell.Host.targets',
             'build/net10.0/SeaShell.Script.dll',
-            'build/net10.0/SeaShell.Ipc.dll',
+            'build/net10.0/SeaShell.Common.dll',
             'build/net10.0/MessagePack.dll',
-            'build/net10.0/MessagePack.Annotations.dll',
-            'buildTransitive/net10.0/SeaShell.Host.targets',
-            'buildTransitive/net10.0/SeaShell.Script.dll',
-            'buildTransitive/net10.0/SeaShell.Ipc.dll',
-            'buildTransitive/net10.0/MessagePack.dll',
-            'buildTransitive/net10.0/MessagePack.Annotations.dll'
+            'buildTransitive/net10.0/SeaShell.Host.targets'
+          )
+          Assert-NuspecHas $pkg 'SeaShell.Service'
+
+          Write-Host "`n=== SeaShell.Service ==="
+          $pkg = (Get-ChildItem nupkg/SeaShell.Service.*.nupkg).FullName
+          Assert-Contains $pkg @(
+            'runtimes/win-x64/seashell-daemon.exe',
+            'runtimes/win-x64/seashell-elevator.exe',
+            'runtimes/linux-x64/seashell-daemon',
+            'runtimes/linux-x64/seashell-elevator',
+            'runtimes/linux-musl-x64/seashell-daemon',
+            'runtimes/linux-musl-x64/seashell-elevator',
+            'runtimes/any/SeaShell.Engine.dll',
+            'runtimes/any/SeaShell.Common.dll'
           )
 
-          Write-Host "`n=== SeaShell.Ipc ==="
-          $pkg = (Get-ChildItem nupkg/SeaShell.Ipc.*.nupkg).FullName
-          Assert-Contains $pkg @('lib/net10.0/SeaShell.Ipc.dll')
-
-          Write-Host "`n=== SeaShell.ServiceHost ==="
-          $pkg = (Get-ChildItem nupkg/SeaShell.ServiceHost.*.nupkg).FullName
-          Assert-Contains $pkg @('lib/net10.0/SeaShell.ServiceHost.dll')
+          # Verify exactly 3 packages (no stale Engine/Common/ServiceHost/Ipc packages)
+          $count = (Get-ChildItem nupkg/*.nupkg).Count
+          if ($count -ne 3) {
+            Write-Host "Expected 3 packages, found $count" -ForegroundColor Red
+            Get-ChildItem nupkg/*.nupkg | ForEach-Object { Write-Host "  $_" }
+            $failed = $true
+          }
 
           if ($failed) {
             Write-Host "`nPackage validation FAILED" -ForegroundColor Red
             exit 1
           }
-          Write-Host "`nAll packages validated OK" -ForegroundColor Green
+          Write-Host "`nAll packages validated OK ($count packages)" -ForegroundColor Green
 
       - name: Attest NuGet packages
         uses: actions/attest-build-provenance@v2

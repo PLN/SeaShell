@@ -3,7 +3,7 @@ using System.IO;
 using System.Runtime.InteropServices;
 using System.Security.Principal;
 
-namespace SeaShell.Engine;
+namespace SeaShell;
 
 /// <summary>
 /// Canonical paths for SeaShell runtime data: compilation cache, staged binaries, snippets.
@@ -57,6 +57,7 @@ public static class SeaShellPaths
 		return Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".local", "share", "seashell");
 	}
 
+	[System.Runtime.Versioning.SupportedOSPlatform("windows")]
 	private static bool IsWindowsSystemAccount()
 	{
 		if (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
