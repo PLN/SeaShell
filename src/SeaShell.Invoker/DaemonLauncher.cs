@@ -18,15 +18,38 @@ public static class DaemonLauncher
 	public static async Task<bool> EnsureRunningAsync(
 		string? daemonAddress = null,
 		Action<string>? log = null,
+		Action<string>? verboseLog = null,
 		CancellationToken ct = default)
 	{
 		daemonAddress ??= TransportEndpoint.GetDaemonAddress(TransportEndpoint.CurrentUserIdentity, TransportEndpoint.CurrentVersion);
 
 		if (await TransportClient.ProbeAsync(daemonAddress, ct))
+		{
+			// Daemon is running — check if it matches our staged version.
+			var stagedDir = ServiceManifest.GetOrStageDaemon(DaemonManager.Version, verboseLog);
+			if (stagedDir != null)
+			{
+				var expectedHash = DaemonManager.ComputeDirHash(stagedDir);
+				if (await DaemonManager.EnsureDaemonMatchesAsync(daemonAddress, expectedHash, verboseLog))
+				{
+					// Daemon was stopped due to mismatch — start the new one
+					if (StartDaemon(log, verboseLog) != 0)
+						return false;
+
+					for (int i = 0; i < 20; i++)
+					{
+						await Task.Delay(250, ct);
+						if (await TransportClient.ProbeAsync(daemonAddress, ct))
+							return true;
+					}
+					return false;
+				}
+			}
 			return true;
+		}
 
 		// Start daemon via DaemonManager
-		if (StartDaemon(log) != 0)
+		if (StartDaemon(log, verboseLog) != 0)
 			return false;
 
 		// Wait for daemon to become available
@@ -52,6 +75,6 @@ public static class DaemonLauncher
 	/// <summary>
 	/// Start the daemon. Delegates to DaemonManager.StartDaemon.
 	/// </summary>
-	private static int StartDaemon(Action<string>? log) =>
-		DaemonManager.StartDaemon(log);
+	private static int StartDaemon(Action<string>? log, Action<string>? verboseLog = null) =>
+		DaemonManager.StartDaemon(log, verboseLog);
 }

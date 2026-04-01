@@ -9,5 +9,7 @@
 	</ItemGroup>
 	<ItemGroup>
 		<ProjectReference Include="../../src/SeaShell.Engine/SeaShell.Engine.csproj" />
+		<ProjectReference Include="../../src/SeaShell.Common/SeaShell.Common.csproj" />
+		<ProjectReference Include="../../src/SeaShell.Invoker/SeaShell.Invoker.csproj" />
 	</ItemGroup>
 </Project>

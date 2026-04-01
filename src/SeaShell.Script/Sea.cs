@@ -96,8 +96,45 @@ public static class Sea
 	/// </summary>
 	public static event Action<byte[], string?>? MessageReceived;
 
+	/// <summary>
+	/// Fires when a blocked invocation attaches to this instance via //sea_mutex_attach.
+	/// The handler receives an <see cref="AttachContext"/> for bidirectional communication
+	/// with the caller. Each client gets its own event invocation on a thread pool thread.
+	/// </summary>
+	public static event Action<AttachContext>? Attached;
+
 	/// <summary>True when running in watch mode (//sea_watch). Enables file-change hot-swap.</summary>
 	public static bool IsWatchMode { get; private set; }
+
+	/// <summary>The mutex scope active for this script (0=None, 1=Session, 2=User, 3=System).</summary>
+	public static byte MutexScope { get; private set; }
+
+	/// <summary>
+	/// True when running under seaw.exe (Windows subsystem) without a console.
+	/// False when running under sea.exe or when seaw.exe allocated a console
+	/// due to //sea_console.
+	/// </summary>
+	public static bool IsWindowMode { get; private set; }
+
+	/// <summary>
+	/// True when running under //sea_restart. The Invoker will restart the script
+	/// process on exit unless <see cref="Restart"/> is set to false.
+	/// </summary>
+	public static bool IsRestartMode { get; private set; }
+
+	/// <summary>
+	/// Controls whether the Invoker restarts this script on exit.
+	/// Default: true when //sea_restart is active. Set to false to exit cleanly
+	/// without restart. Only meaningful when <see cref="IsRestartMode"/> is true.
+	/// </summary>
+	public static bool Restart { get; set; }
+
+	/// <summary>
+	/// How many times this script has been restarted (0 on first run).
+	/// Distinct from <see cref="ReloadCount"/> — reload is recompile+swap,
+	/// restart is process-level.
+	/// </summary>
+	public static int RestartCount { get; private set; }
 
 	/// <summary>True if this instance was started as a hot-swap replacement (not the first run).</summary>
 	public static bool IsReload { get; private set; }
@@ -257,7 +294,7 @@ public static class Sea
 				// Send ScriptExit when process exits
 				AppDomain.CurrentDomain.ProcessExit += (_, _) =>
 				{
-					try { _channel.SendAsync(new ScriptExit(Environment.ExitCode, ExitDelay)).AsTask().GetAwaiter().GetResult(); }
+					try { _channel.SendAsync(new ScriptExit(Environment.ExitCode, ExitDelay, Restart)).AsTask().GetAwaiter().GetResult(); }
 					catch { }
 				};
 
@@ -292,12 +329,14 @@ public static class Sea
 					case MessageType.ScriptReload:
 						IsShuttingDown = true;
 						_shutdownCts.Cancel();
+						AttachServer.Stop();
 						try { Reloading?.Invoke(); } catch { }
 						break;
 
 					case MessageType.ScriptStop:
 						IsShuttingDown = true;
 						_shutdownCts.Cancel();
+						AttachServer.Stop();
 						try { Stopping?.Invoke(); } catch { }
 						break;
 
@@ -376,6 +415,18 @@ public static class Sea
 
 		IsConsoleEphemeral = init.IsConsoleEphemeral;
 		IsWatchMode = init.Watch;
+		IsRestartMode = init.Restart;
+		Restart = init.Restart; // default to true when //sea_restart is active
+		RestartCount = init.RestartCount;
+		MutexScope = init.MutexScope;
+		IsWindowMode = init.WindowMode;
+
+		// Start attach server if //sea_mutex_attach is active
+		if (init.MutexAttach && !string.IsNullOrEmpty(init.ScriptPath))
+		{
+			var identity = ComputeIdentity(init.ScriptPath);
+			AttachServer.Start($"seashell-attach-{identity}");
+		}
 
 		if (init.ReloadCount > 0)
 		{
@@ -388,6 +439,23 @@ public static class Sea
 			try { _reloadState = Convert.FromBase64String(init.State); }
 			catch { }
 		}
+	}
+
+	/// <summary>FNV-1a hash of the normalized script path — same identity as DirectiveScanner.</summary>
+	private static string ComputeIdentity(string scriptPath)
+	{
+		var normalized = Path.GetFullPath(scriptPath).ToLowerInvariant();
+		const ulong fnvOffsetBasis = 14695981039346656037;
+		const ulong fnvPrime = 1099511628211;
+		var hash = fnvOffsetBasis;
+		foreach (var c in normalized) { hash ^= c; hash *= fnvPrime; }
+		return hash.ToString("x16");
+	}
+
+	/// <summary>Raise the Attached event. Called by AttachServer.</summary>
+	internal static void RaiseAttached(AttachContext ctx)
+	{
+		try { Attached?.Invoke(ctx); } catch { }
 	}
 
 	private static bool CheckElevation()

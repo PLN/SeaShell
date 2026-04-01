@@ -59,6 +59,9 @@ public sealed class ScriptCompiler
 		public bool Success { get; init; }
 		public bool Elevate { get; init; }
 		public bool Watch { get; init; }
+		public bool Restart { get; init; }
+		public byte MutexScope { get; init; }
+		public bool MutexAttach { get; init; }
 		public string? AssemblyPath { get; init; }
 		public string? RuntimeConfigPath { get; init; }
 		public string? DepsJsonPath { get; init; }
@@ -124,6 +127,9 @@ public sealed class ScriptCompiler
 				Success = true,
 				Elevate = resolved.Directives.Elevate,
 				Watch = resolved.Directives.Watch,
+				Restart = resolved.Directives.Restart,
+			MutexScope = resolved.Directives.MutexScope,
+			MutexAttach = resolved.Directives.MutexAttach,
 				AssemblyPath = dllPath,
 				RuntimeConfigPath = runtimeConfigPath,
 				DepsJsonPath = ArtifactWriter.FindDepsJson(outputDir, scriptName),
@@ -313,6 +319,9 @@ public sealed class ScriptCompiler
 			Success = true,
 			Elevate = resolved.Directives.Elevate,
 			Watch = resolved.Directives.Watch,
+			Restart = resolved.Directives.Restart,
+			MutexScope = resolved.Directives.MutexScope,
+			MutexAttach = resolved.Directives.MutexAttach,
 			AssemblyPath = dllPath,
 			RuntimeConfigPath = runtimeConfigPath,
 			DepsJsonPath = depsPath,
@@ -505,7 +514,7 @@ public sealed class ScriptCompiler
 
 		// Read companion .sea.json for directives
 		var seaJsonPath = Path.Combine(binDir, name + ".sea.json");
-		var (watch, elevate) = ReadCompanionSeaJson(seaJsonPath);
+		var (watch, elevate, restart, mutexScope, mutexAttach) = ReadCompanionSeaJson(seaJsonPath);
 
 		// Compute cache hash
 		var hash = CompilationCache.ComputeBinaryHash(binaryPath);
@@ -550,6 +559,9 @@ public sealed class ScriptCompiler
 				Success = true,
 				Watch = watch,
 				Elevate = elevate,
+				Restart = restart,
+			MutexScope = mutexScope,
+			MutexAttach = mutexAttach,
 				AssemblyPath = binaryPath,
 				ManifestPath = manifestPath,
 				StartupHookPath = startupHookPath,
@@ -584,6 +596,9 @@ public sealed class ScriptCompiler
 			Success = true,
 			Watch = watch,
 			Elevate = elevate,
+			Restart = restart,
+			MutexScope = mutexScope,
+			MutexAttach = mutexAttach,
 			AssemblyPath = stagedDll,
 			RuntimeConfigPath = stagedRtc,
 			DepsJsonPath = stagedDeps,
@@ -592,22 +607,26 @@ public sealed class ScriptCompiler
 		};
 	}
 
-	private static (bool watch, bool elevate) ReadCompanionSeaJson(string path)
+	private static (bool watch, bool elevate, bool restart, byte mutexScope, bool mutexAttach) ReadCompanionSeaJson(string path)
 	{
-		if (!File.Exists(path)) return (false, false);
+		if (!File.Exists(path)) return (false, false, false, 0, false);
 		try
 		{
 			var json = File.ReadAllText(path);
 			var opts = new System.Text.Json.JsonSerializerOptions { PropertyNameCaseInsensitive = true };
 			var data = System.Text.Json.JsonSerializer.Deserialize<CompanionSeaJson>(json, opts);
-			return (data?.Watch ?? false, data?.Elevate ?? false);
+			return (data?.Watch ?? false, data?.Elevate ?? false, data?.Restart ?? false,
+				data?.MutexScope ?? 0, data?.MutexAttach ?? false);
 		}
-		catch { return (false, false); }
+		catch { return (false, false, false, 0, false); }
 	}
 
 	private sealed class CompanionSeaJson
 	{
 		public bool Watch { get; set; }
 		public bool Elevate { get; set; }
+		public bool Restart { get; set; }
+		public byte MutexScope { get; set; }
+		public bool MutexAttach { get; set; }
 	}
 }

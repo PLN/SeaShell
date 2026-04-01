@@ -1,5 +1,137 @@
 # History
 
+## v0.4.0.110 (2026-03-31)
+
+**Archive-based distribution, seaw.exe, mutex/attach/restart directives.**
+
+The v0.4 line overhauls distribution (archive-based bootstrapper replaces NuGet tool +
+lazy staging), adds a windowless CLI binary (seaw.exe), and introduces three new
+directive families: script mutex, attach protocol, and auto-restart.
+
+### Distribution
+
+- **Archive-based install** — Per-RID zip archives replace the NuGet tool + Service
+  package + lazy staging model. Archives contain all binaries (sea, seaw, daemon,
+  elevator) pre-built for each platform.
+- **SeaShell.Bootstrapper** — New dotnet tool (`seashell` command). Embeds per-RID
+  archives and extracts them on install. Subcommands: `install`, `uninstall`, `start`,
+  `stop`, `status`. `update` is an alias for `install`.
+- **`seashell` dashboard** — Running `seashell` with no arguments shows version,
+  platform, daemon/elevator state, and idle time.
+- **SeaShell.Service NuGet package dropped** — Archives replace it. `SeaShell.Binaries`
+  marked `IsPackable=false`.
+- **install.ps1 / install.sh rewritten** — Download archives from GitHub releases,
+  extract to platform install dir, manage PATH. `SEASHELL_ARCHIVE` env var for
+  offline installs.
+
+### seaw.exe
+
+- **WinExe subsystem binary** — Built from SeaShell.Cli with `OutputType=WinExe`,
+  `AssemblyName=seaw`. No console window by default.
+- **`//sea_console` directive** — Allocates a console for seaw.exe scripts that need
+  stdout. Without it, seaw runs windowless.
+- **`//sea_window` directive** — Flags scripts as window-mode (used by file association).
+- **`.csw` extension** — Window-mode script convention. Associated with seaw.exe.
+- **Event Log errors** — When seaw.exe has no console, unhandled errors are written to
+  the Windows Event Log (SeaShell source) instead of lost to stderr.
+- **ExitDelayIfNeeded** — Applied to all non-script code paths in seaw.exe to prevent
+  console flash on errors.
+
+### Script mutex
+
+- **`//sea_mutex` directive** — Enforces single-instance execution per script. Three
+  scopes: `system` (default), `user`, `session`.
+- **Windows**: Named kernel mutex (`Global\SeaShell_{id}` for system,
+  `SeaShell_{id}_u{user}` for user, `Local\SeaShell_{id}_s{session}` for session).
+- **Linux**: File locks (flock) in scope-appropriate directories.
+- **DirectiveScanner** — New lightweight pre-compilation scanner in SeaShell.Invoker.
+  Reads only the first ~20 lines of a script to detect mutex/attach/window/console
+  directives. Resolves mutex blocking instantly without daemon contact.
+- **Pre-compilation check** — `ScriptInvoker.RunAsync()` acquires the mutex before
+  contacting the daemon. If blocked and no attach, exits with code 200.
+
+### Attach protocol
+
+- **`//sea_mutex_attach` directive** — When a second instance is blocked by a mutex,
+  it connects to the running instance instead of exiting.
+- **AttachServer** — Named pipe listener (`seashell-attach-{identity}`) started by
+  `Sea.Initialize()` when `//sea_mutex_attach` is active.
+- **AttachContext** — API provided to scripts via `Sea.Attached` event: `Args`,
+  `WorkingDirectory`, `Send(byte[])`, `Receive()`, `Close(exitCode)`.
+- **Wire protocol** — `AttachHello` (args + CWD), `AttachMessage` (bidirectional
+  binary payload), `AttachClose` (exit code). Message types 50-52.
+
+### Restart
+
+- **`//sea_restart` directive** — Script automatically restarts on exit. Distinct
+  from watch-mode reload (no recompilation).
+- **Crash backoff** — If a restart cycle completes in under 5 seconds, exponential
+  delay kicks in: 2s, 4s, 8s, 8s... Resets after a successful long run.
+- **Opt-out** — `Sea.Restart = false` within a script prevents restart for that run.
+- **`Sea.RestartCount`** — Incremented on each restart cycle.
+
+### Version scheme
+
+- **4-part version everywhere** — `0.4.0.110` format: `major.minor.patch.build`.
+  `ToString(4)` used in all version display, pipe addressing, and task names.
+- **Single source of truth** — `<Version>` in Directory.Build.props. Pipeline
+  orchestrator auto-increments the build number before each build.
+- **Side-by-side** — 4-part version in pipe addresses means each build gets its own
+  daemon instance. No conflicts during development.
+
+### Bug fixes
+
+- **Daemon hash mismatch** — `DaemonServer` and `DaemonManager` now both use SHA256
+  of assembly FullNames. Previously used different algorithms, causing unnecessary
+  daemon restarts.
+- **ScriptHost parameter mismatch** — `windowMode` parameter added to all
+  `ScriptInvoker` call sites. Previously missing from Host path.
+- **seaw.exe console flash** — `ExitDelayIfNeeded` applied to all non-script exit
+  paths. Previously, error messages vanished instantly.
+- **False ephemeral detection** — Parent process detection via
+  `NtQueryInformationProcess` replaces fragile `GetConsoleProcessList` counting.
+  The old method miscounted across .NET hosting models.
+- **IncludeResolver merge** — v0.3 directive fields (`Restart`, `MutexScope`,
+  `MutexAttach`, `Window`, `Console`) now propagate through `//sea_inc` includes.
+- **Old task cleanup** — `InstallDaemon`/`InstallElevator` remove stale versioned
+  Task Scheduler tasks before registering new ones.
+
+### Daemon improvements
+
+- **Idle time tracking** — `PingResponse` gains `IdleSeconds` and
+  `IdleTimeoutSeconds` fields. CLI `--status` shows idle time and timeout.
+- **Elevator version tracking** — `ElevatorHello` carries version string. Daemon
+  stores it, `PingResponse` reports it, `--status` displays it.
+- **Handle inheritance guard** — `StdHandleInheritGuard` temporarily clears
+  `HANDLE_FLAG_INHERIT` on stdin/stdout/stderr before spawning daemon. Prevents
+  daemon from inheriting handles that block SSH sessions and pipe readers.
+- **Stdin redirect+close** — Daemon process gets all three standard streams
+  redirected and immediately closed, in addition to the handle guard.
+- **Quiet by default** — Daemon lifecycle messages suppressed unless `-V` /
+  `--verbose` / `SEA_VERBOSE` is set.
+- **Rich `--status`** — Shows version, uptime, idle time, timeout, active script
+  count, and elevator version.
+
+### CI workflow
+
+- **Rewritten** for archive-based distribution. Produces per-RID zip archives +
+  bootstrapper NuGet package. No Service package.
+- **seaw.exe** — Published on Windows via separate temp dir to avoid csproj output
+  conflicts with sea.exe.
+- **Archive embedding** — Per-RID zips embedded in bootstrapper nupkg. Versioned
+  copies attached to GitHub release.
+- **Package validation** — Checks bootstrapper contains embedded archives and Host
+  contains targets files. Rejects unexpected packages.
+- **Attestation + NuGet push** preserved from v0.3.
+
+### Tests
+
+- **87 unit tests** (10 new): `IncludeResolverTests` (directive field merge),
+  `DaemonHashTests` (algorithm alignment), `MessageRoundtripTests`.
+- **New directive tests**: Restart, Mutex (all scopes), MutexAttach, Window, Console.
+- **Pipeline integration tests**: mutex user/session scopes, seaw window/console mode,
+  elevated install (elevator + Event Log source), seaw Event Log error.
+
 ## v0.3.17 (2026-03-29)
 
 **Invoker refactoring: shared execution engine, package consolidation, security hardening.**

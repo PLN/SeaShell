@@ -259,6 +259,78 @@ public class DirectiveParserTests
 		Assert.Empty(result.Includes);
 	}
 
+	// ── Restart ────────────────────────────────────────────────────
+
+	[Fact]
+	public void Parse_Restart()
+	{
+		var result = DirectiveParser.Parse("//sea_restart");
+		Assert.True(result.Restart);
+	}
+
+	// ── Mutex ──────────────────────────────────────────────────────
+
+	[Fact]
+	public void Parse_Mutex_DefaultSystem()
+	{
+		var result = DirectiveParser.Parse("//sea_mutex");
+		Assert.Equal(3, result.MutexScope); // 3 = System
+	}
+
+	[Theory]
+	[InlineData("//sea_mutex session", 1)]
+	[InlineData("//sea_mutex user", 2)]
+	[InlineData("//sea_mutex system", 3)]
+	public void Parse_Mutex_Scope(string source, byte expectedScope)
+	{
+		var result = DirectiveParser.Parse(source);
+		Assert.Equal(expectedScope, result.MutexScope);
+	}
+
+	[Fact]
+	public void Parse_MutexAttach_ImpliesMutex()
+	{
+		var result = DirectiveParser.Parse("//sea_mutex_attach");
+		Assert.True(result.MutexAttach);
+		Assert.Equal(3, result.MutexScope); // default System
+	}
+
+	[Fact]
+	public void Parse_MutexAttach_WithScope()
+	{
+		var result = DirectiveParser.Parse("//sea_mutex_attach user");
+		Assert.True(result.MutexAttach);
+		Assert.Equal(2, result.MutexScope); // User
+	}
+
+	// ── Window / Console ──────────────────────────────────────────
+
+	[Fact]
+	public void Parse_Window()
+	{
+		var result = DirectiveParser.Parse("//sea_window");
+		Assert.True(result.Window);
+	}
+
+	[Fact]
+	public void Parse_Console()
+	{
+		var result = DirectiveParser.Parse("//sea_console");
+		Assert.True(result.Console);
+	}
+
+	// ── Multiple new directives combined ──────────────────────────
+
+	[Fact]
+	public void Parse_AllNewDirectives()
+	{
+		var source = "//sea_restart\n//sea_mutex user\n//sea_window";
+		var result = DirectiveParser.Parse(source);
+		Assert.True(result.Restart);
+		Assert.Equal(2, result.MutexScope); // User
+		Assert.True(result.Window);
+	}
+
 	// ── VB Support ─────────────────────────────────────────────────
 
 	[Fact]

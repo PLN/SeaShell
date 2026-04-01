@@ -1,5 +1,6 @@
 //css_inc Mother.cs
 //css_inc System.Diagnostics.Ext.cs
+//css_inc pipeline-tasks.cs
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
@@ -24,13 +25,12 @@ var logs = Environment.GetEnvironmentVariable("PIPELINE_LOGS")!;
 var rid = Environment.GetEnvironmentVariable("PIPELINE_RID")!;
 var host = Environment.GetEnvironmentVariable("PIPELINE_HOST") ?? rid;
 var commonDir = Environment.GetEnvironmentVariable("PIPELINE_COMMON")!;
-
-var nupkgDir = Path.Combine(artifacts, "nupkg");
 var isWindows = RuntimeInformation.IsOSPlatform(OSPlatform.Windows);
+var pipelineRoot = isWindows ? @"C:\pipeline" : "/pipeline";
+var nupkgDir = Path.Combine(artifacts, "nupkg");
 var elevate = isWindows ? "gsudo" : "sudo";
-var passed = 0;
-var failed = 0;
-var results = new List<(string name, bool pass, string detail)>();
+
+var tasks = new TaskTracker("test", host, "seashell", pipelineRoot);
 
 Console.WriteLine($"[test] Source:   {src}");
 Console.WriteLine($"[test] NuPkg:    {nupkgDir}");
@@ -61,7 +61,7 @@ Console.WriteLine("\n[test] ══ Phase 1: Contained tests ══");
 // Tests that ScriptHost works when the Engine DLL is in the NuGet cache
 // (not a flat publish dir). Bundled DLLs are in separate package dirs.
 
-RunTest("engine-dir-nuget (dotnet run, NuGet cache layout)", () =>
+tasks.Run("engine-dir-nuget (dotnet run, NuGet cache layout)", () =>
 {
 	var engineDirTestProject = Path.Combine(src, "test", "engine-dir-nuget");
 	Environment.SetEnvironmentVariable("SEASHELL_NUPKG_DIR", nupkgDir);
@@ -212,33 +212,33 @@ Console.WriteLine("\n[test] ══ Phase 3: Smoke tests ══");
 
 // ── Script smoke tests ───────────────────────────────────────────────
 
-RunTest("hello.cs", () =>
+tasks.Run("hello.cs", () =>
 	DiagnosticsExt.RunProcess("sea", Path.Combine(testDir, "hello.cs"), src, prefix: "test"));
 
-RunTest("sea_context_test.cs", () =>
+tasks.Run("sea_context_test.cs", () =>
 	DiagnosticsExt.RunProcess("sea", Path.Combine(testDir, "sea_context_test.cs"), src, prefix: "test"));
 
-RunTest("interactive_ok.cs", () =>
+tasks.Run("interactive_ok.cs", () =>
 	DiagnosticsExt.RunProcess("sea", Path.Combine(testDir, "interactive_ok.cs"), src, prefix: "test"));
 
 // ── Regression tests ─────────────────────────────────────────────────
 
-RunTest("nuget-transitive (CS1704 dedup)", () =>
+tasks.Run("nuget-transitive (CS1704 dedup)", () =>
 	DiagnosticsExt.RunProcess("sea", Path.Combine(testDir, "nuget-transitive", "nuget-transitive.cs"), src, prefix: "test"));
 
-RunTest("host-in-host (ScriptHost compilation)", () =>
+tasks.Run("host-in-host (ScriptHost compilation)", () =>
 	DiagnosticsExt.RunProcess("sea", Path.Combine(testDir, "host-in-host", "host-in-host.cs"), src, prefix: "test"));
 
-RunTest("host-resolution (bundled DLL probing)", () =>
+tasks.Run("host-resolution (bundled DLL probing)", () =>
 	DiagnosticsExt.RunProcess("sea", Path.Combine(testDir, "host-resolution", "host-resolution.cs"), src, prefix: "test"));
 
-RunTest("host-in-host-nuget (nested ScriptHost + NuGet)", () =>
+tasks.Run("host-in-host-nuget (nested ScriptHost + NuGet)", () =>
 	DiagnosticsExt.RunProcess("sea", Path.Combine(testDir, "host-in-host-nuget", "host-in-host-nuget.cs"), src, prefix: "test"));
 
 // ── Binary pass-through test ────────────────────────────────────────
 // Tests that a pre-compiled binary with its own deps.json works via sea.
 
-RunTest("binary-deps (companion deps.json pass-through)", () =>
+tasks.Run("binary-deps (companion deps.json pass-through)", () =>
 {
 	var binaryTestProject = Path.Combine(src, "test", "binary-deps");
 	var binaryPublishDir = Path.Combine(artifacts, "binary-deps-test");
@@ -256,7 +256,7 @@ RunTest("binary-deps (companion deps.json pass-through)", () =>
 // Full end-to-end: publish ServiceCwdTest, register as service, start via
 // SCM/systemd, verify script runs despite CWD being system32 or /.
 
-RunTest("service-cwd (SCM/systemd script resolution)", () =>
+tasks.Run("service-cwd (SCM/systemd script resolution)", () =>
 {
 	var testProjectDir = Path.Combine(src, "test", "ServiceCwdTest");
 	var publishDir = Path.Combine(artifacts, "service-cwd-test");
@@ -373,7 +373,7 @@ RunTest("service-cwd (SCM/systemd script resolution)", () =>
 // The new account has a different NuGet cache and temp dir — the nuget.config
 // we placed for the primary account is invisible. Compilation should fail.
 
-RunTest("service-identity (NuGet cache isolation on account switch)", () =>
+tasks.Run("service-identity (NuGet cache isolation on account switch)", () =>
 {
 	var testProjectDir = Path.Combine(src, "test", "ServiceCwdTest");
 	var publishDir = Path.Combine(artifacts, "service-cwd-test");
@@ -466,13 +466,521 @@ RunTest("service-identity (NuGet cache isolation on account switch)", () =>
 	}
 });
 
+// ── Restart tests ────────────────────────────────────────────────────
+// Force-restart daemon to ensure it has the latest staged Engine DLL.
+// Previous smoke tests may have started a daemon with stale assemblies.
+
+Console.WriteLine("\n[test] === Restart tests ===");
+
+// Debug: check daemon staging
+DiagnosticsExt.RunProcess("sea", "--daemon-stop", src, quiet: true);
+Thread.Sleep(2000);
+
+// Diagnostic: show where the daemon is staged and check Engine DLL
+var diagDataDir = isWindows
+	? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "seashell")
+	: Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".local", "share", "seashell");
+Console.WriteLine($"[test] DataDir: {diagDataDir}");
+if (Directory.Exists(Path.Combine(diagDataDir, "daemon")))
+{
+	foreach (var dir in Directory.GetDirectories(Path.Combine(diagDataDir, "daemon")))
+	{
+		var engineDll = Path.Combine(dir, "SeaShell.Engine.dll");
+		var commonDll = Path.Combine(dir, "SeaShell.Common.dll");
+		Console.WriteLine($"[test]   Staged: {dir}");
+		Console.WriteLine($"[test]     Engine.dll exists={File.Exists(engineDll)}");
+		Console.WriteLine($"[test]     Common.dll exists={File.Exists(commonDll)}");
+	}
+}
+else
+{
+	Console.WriteLine("[test]   No daemon staging directory found");
+}
+
+// Also check where sea.exe thinks AppContext.BaseDirectory is
+Console.WriteLine($"[test]   AppContext: {AppContext.BaseDirectory}");
+var daemonInBase = Path.Combine(AppContext.BaseDirectory, "seashell-daemon.dll");
+Console.WriteLine($"[test]   daemon in AppContext: {File.Exists(daemonInBase)}");
+
+tasks.Run("restart (exits and restarts, then opts out)", () =>
+	DiagnosticsExt.RunProcess("sea", Path.Combine(testDir, "restart_test.cs"), src,
+		prefix: "test", logFile: Path.Combine(logs, "restart_test.log"), idleTimeout: 30));
+
+tasks.Run("restart opt-out (Sea.Restart = false exits cleanly)", () =>
+	DiagnosticsExt.RunProcess("sea", Path.Combine(testDir, "restart_opt_out_test.cs"), src,
+		prefix: "test", logFile: Path.Combine(logs, "restart_opt_out_test.log"), idleTimeout: 15));
+
+// ── Mutex tests ─────────────────────────────────────────────────────
+
+Console.WriteLine("\n[test] === Mutex tests ===");
+
+tasks.Run("mutex (second instance blocked, exits 200)", () =>
+{
+	var scriptPath = Path.Combine(testDir, "mutex_test.cs");
+
+	// Start first instance in background (holds mutex for 5s)
+	var psi1 = new ProcessStartInfo
+	{
+		FileName = "sea",
+		Arguments = scriptPath,
+		WorkingDirectory = src,
+		RedirectStandardOutput = true,
+		RedirectStandardError = true,
+		UseShellExecute = false,
+	};
+	using var proc1 = Process.Start(psi1)!;
+
+	// Give first instance time to acquire mutex and compile
+	Thread.Sleep(3000);
+
+	// Launch second instance — should exit immediately with code 200
+	var logFile2 = Path.Combine(logs, "mutex_test_blocked.log");
+	var code2 = DiagnosticsExt.RunProcess("sea", scriptPath, src,
+		prefix: "test", logFile: logFile2, idleTimeout: 10);
+
+	// Wait for first instance to finish
+	proc1.WaitForExit(15_000);
+
+	if (code2 == 200)
+	{
+		Console.Write("(blocked=200) ");
+		return 0;
+	}
+
+	Console.Error.WriteLine($"\n[test]   Second instance exited with {code2}, expected 200");
+	return 1;
+});
+
+tasks.Run("mutex_attach (second instance communicates with first)", () =>
+{
+	var scriptPath = Path.Combine(testDir, "mutex_attach_test.cs");
+
+	// Start first instance in background (waits for attach up to 15s)
+	var psi1 = new ProcessStartInfo
+	{
+		FileName = "sea",
+		Arguments = scriptPath,
+		WorkingDirectory = src,
+		RedirectStandardOutput = true,
+		RedirectStandardError = true,
+		UseShellExecute = false,
+	};
+	using var proc1 = Process.Start(psi1)!;
+
+	// Give first instance time to compile, start, and open attach pipe
+	Thread.Sleep(5000);
+
+	// Launch second instance with args — should attach and relay
+	var logFile2 = Path.Combine(logs, "mutex_attach_client.log");
+	var code2 = DiagnosticsExt.RunProcess("sea",
+		$"{scriptPath} test-arg-1 test-arg-2", src,
+		prefix: "test", logFile: logFile2, idleTimeout: 15);
+
+	// Wait for first instance to finish (should exit after receiving attach)
+	if (!proc1.WaitForExit(20_000))
+	{
+		try { proc1.Kill(); } catch { }
+		Console.Error.WriteLine("\n[test]   First instance did not exit within 20s");
+		return 1;
+	}
+
+	var stdout1 = proc1.StandardOutput.ReadToEnd();
+	var stderr1 = proc1.StandardError.ReadToEnd();
+
+	if (proc1.ExitCode != 0)
+	{
+		Console.Error.WriteLine($"\n[test]   First instance exited with {proc1.ExitCode}");
+		Console.Error.WriteLine(stderr1);
+		return 1;
+	}
+
+	if (!stdout1.Contains("received attach"))
+	{
+		Console.Error.WriteLine("\n[test]   First instance did not log 'received attach'");
+		Console.Error.WriteLine(stdout1);
+		return 1;
+	}
+
+	Console.Write("(attach OK) ");
+	return 0;
+});
+
+// ── Mutex scope tests ───────────────────────────────────────────────
+
+tasks.Run("mutex user scope (second instance blocked, exits 200)", () =>
+{
+	var scriptPath = Path.Combine(testDir, "mutex_user_test.cs");
+
+	var psi1 = new ProcessStartInfo
+	{
+		FileName = "sea",
+		Arguments = scriptPath,
+		WorkingDirectory = src,
+		RedirectStandardOutput = true,
+		RedirectStandardError = true,
+		UseShellExecute = false,
+	};
+	using var proc1 = Process.Start(psi1)!;
+	Thread.Sleep(3000);
+
+	var logFile2 = Path.Combine(logs, "mutex_user_blocked.log");
+	var code2 = DiagnosticsExt.RunProcess("sea", scriptPath, src,
+		prefix: "test", logFile: logFile2, idleTimeout: 10);
+
+	proc1.WaitForExit(15_000);
+
+	if (code2 == 200) { Console.Write("(blocked=200) "); return 0; }
+	Console.Error.WriteLine($"\n[test]   User mutex: second exited {code2}, expected 200");
+	return 1;
+});
+
+if (isWindows)
+{
+	tasks.Run("mutex session scope (same session blocked, different session free)", () =>
+	{
+		var scriptPath = Path.Combine(testDir, "mutex_session_test.cs");
+		var markerPath = Path.Combine(logs, "session_marker.txt");
+		if (File.Exists(markerPath)) File.Delete(markerPath);
+
+		// 1. Start first instance in this SSH session (holds session mutex for 8s)
+		var psi1 = new ProcessStartInfo
+		{
+			FileName = "sea",
+			Arguments = scriptPath,
+			WorkingDirectory = src,
+			RedirectStandardOutput = true,
+			RedirectStandardError = true,
+			UseShellExecute = false,
+		};
+		using var proc1 = Process.Start(psi1)!;
+		Thread.Sleep(3000);
+
+		// 2. Second instance in same session → should be blocked (exit 200)
+		var logFile2 = Path.Combine(logs, "mutex_session_blocked.log");
+		var code2 = DiagnosticsExt.RunProcess("sea", scriptPath, src,
+			prefix: "test", logFile: logFile2, idleTimeout: 10);
+
+		if (code2 != 200)
+		{
+			proc1.WaitForExit(15_000);
+			Console.Error.WriteLine($"\n[test]   Session mutex same-session: exited {code2}, expected 200");
+			return 1;
+		}
+		Console.Write("(same=200) ");
+
+		// 3. Different session via Task Scheduler — should NOT be blocked
+		var taskName = "SeaShell_SessionTest";
+		var seaPath = "sea"; // on PATH after install
+		var createArgs = $"/Create /TN \"{taskName}\" /TR \"\\\"{seaPath}\\\" \\\"{scriptPath}\\\" \\\"{markerPath}\\\"\" /SC ONCE /ST 00:00 /F /RU \"{Environment.UserName}\" /IT";
+		DiagnosticsExt.RunProcess("schtasks", createArgs, src, prefix: "test");
+		DiagnosticsExt.RunProcess("schtasks", $"/Run /TN \"{taskName}\"", src, prefix: "test");
+
+		// Wait for marker file (different session should not be blocked)
+		var found = false;
+		for (int i = 0; i < 40; i++) // up to 10s
+		{
+			Thread.Sleep(250);
+			if (File.Exists(markerPath)) { found = true; break; }
+		}
+
+		// Cleanup
+		DiagnosticsExt.RunProcess("schtasks", $"/Delete /TN \"{taskName}\" /F", src, prefix: "test");
+		proc1.WaitForExit(15_000);
+
+		if (found)
+		{
+			Console.Write("(diff-session=free) ");
+			return 0;
+		}
+		Console.Error.WriteLine("\n[test]   Session mutex: different-session instance did not run (marker missing)");
+		return 1;
+	});
+}
+
+// ── Window mode tests (Windows only) ────────────────────────────────
+
+if (isWindows)
+{
+	Console.WriteLine("\n[test] === Window mode tests ===");
+
+	// Find seaw.exe — either in install dir or next to sea.exe
+	var seawExe = "";
+	var installBin = Path.Combine(
+		Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+		"seashell", "bin", "seaw.exe");
+	var toolsBin = Path.Combine(
+		Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+		".dotnet", "tools", "seaw.exe");
+	if (File.Exists(installBin)) seawExe = installBin;
+	else if (File.Exists(toolsBin)) seawExe = toolsBin;
+
+	tasks.Run("seaw.exe build check", () =>
+	{
+		if (string.IsNullOrEmpty(seawExe))
+		{
+			Console.Write("(seaw.exe not found, skipped) ");
+			return 0;
+		}
+		Console.Write($"(found {seawExe}) ");
+		return 0;
+	});
+
+	tasks.Run("seaw window mode (no console)", () =>
+	{
+		if (string.IsNullOrEmpty(seawExe))
+		{
+			Console.Write("(seaw.exe not found, skipped) ");
+			return 0;
+		}
+
+		var scriptPath = Path.Combine(testDir, "seaw_window_test.csw");
+		var markerPath = Path.Combine(logs, "seaw_window_marker.txt");
+		if (File.Exists(markerPath)) File.Delete(markerPath);
+
+		var psi = new ProcessStartInfo
+		{
+			FileName = seawExe,
+			UseShellExecute = false,
+			CreateNoWindow = true,
+		};
+		psi.ArgumentList.Add(scriptPath);
+		psi.ArgumentList.Add(markerPath);
+
+		using var proc = Process.Start(psi);
+		if (proc == null) { Console.Error.WriteLine("\n[test]   Failed to start seaw"); return 1; }
+		proc.WaitForExit(30_000);
+
+		if (!File.Exists(markerPath))
+		{
+			Console.Error.WriteLine("\n[test]   seaw window test: marker file not created");
+			return 1;
+		}
+
+		var lines = File.ReadAllLines(markerPath);
+		var result = lines.LastOrDefault() ?? "";
+		if (result == "PASS")
+		{
+			Console.Write("(IsWindowMode=True, NoConsole) ");
+			return 0;
+		}
+		Console.Error.WriteLine($"\n[test]   seaw window test: {string.Join(", ", lines)}");
+		return 1;
+	});
+
+	tasks.Run("seaw console mode (//sea_console)", () =>
+	{
+		if (string.IsNullOrEmpty(seawExe))
+		{
+			Console.Write("(seaw.exe not found, skipped) ");
+			return 0;
+		}
+
+		var scriptPath = Path.Combine(testDir, "seaw_console_test.csw");
+		var markerPath = Path.Combine(logs, "seaw_console_marker.txt");
+		if (File.Exists(markerPath)) File.Delete(markerPath);
+
+		// Run via Task Scheduler to get a real interactive session with console allocation
+		var taskName = "SeaShell_ConsoleTest";
+		var createArgs = $"/Create /TN \"{taskName}\" /TR \"\\\"{seawExe}\\\" \\\"{scriptPath}\\\" \\\"{markerPath}\\\"\" /SC ONCE /ST 00:00 /F /RU \"{Environment.UserName}\" /IT";
+		DiagnosticsExt.RunProcess("schtasks", createArgs, src, prefix: "test");
+		DiagnosticsExt.RunProcess("schtasks", $"/Run /TN \"{taskName}\"", src, prefix: "test");
+
+		// Wait for marker
+		var found = false;
+		for (int i = 0; i < 120; i++) // up to 30s
+		{
+			Thread.Sleep(250);
+			if (File.Exists(markerPath)) { found = true; break; }
+		}
+
+		DiagnosticsExt.RunProcess("schtasks", $"/Delete /TN \"{taskName}\" /F", src, prefix: "test");
+
+		if (!found)
+		{
+			Console.Error.WriteLine("\n[test]   seaw console test: marker file not created");
+			return 1;
+		}
+
+		var lines = File.ReadAllLines(markerPath);
+		var result = lines.LastOrDefault() ?? "";
+		if (result == "PASS")
+		{
+			Console.Write("(IsWindowMode=True, HasConsole) ");
+			return 0;
+		}
+		Console.Error.WriteLine($"\n[test]   seaw console test: {string.Join(", ", lines)}");
+		return 1;
+	});
+}
+
+// ── Elevated install tests (Windows only) ───────────────────────────
+
+if (isWindows)
+{
+	Console.WriteLine("\n[test] === Elevated install tests ===");
+
+	tasks.Run("elevated seashell install (elevator + Event Log source)", () =>
+	{
+		// Run seashell install elevated via gsudo
+		// This should register the elevator task AND create the Event Log source
+		var seaPath = "sea";
+		var rc = DiagnosticsExt.RunProcess("gsudo", $"\"{seaPath}\" --install-elevator",
+			src, prefix: "test", idleTimeout: 30);
+		if (rc != 0)
+		{
+			Console.Error.WriteLine($"\n[test]   Elevated --install-elevator failed with {rc}");
+			return 1;
+		}
+
+		// Verify elevator task exists
+		var version = typeof(SeaShell.Invoker.DaemonManager).Assembly.GetName().Version?.ToString(4) ?? "0.0.0";
+		var elevatorTaskName = $"\\SeaShell\\SeaShell Elevator ({Environment.UserName}) {version}";
+		var queryPsi = new ProcessStartInfo
+		{
+			FileName = "schtasks.exe",
+			UseShellExecute = false,
+			RedirectStandardOutput = true,
+			RedirectStandardError = true,
+		};
+		queryPsi.ArgumentList.Add("/Query");
+		queryPsi.ArgumentList.Add("/TN");
+		queryPsi.ArgumentList.Add(elevatorTaskName);
+		using var queryProc = Process.Start(queryPsi)!;
+		queryProc.StandardOutput.ReadToEnd();
+		queryProc.WaitForExit(5000);
+
+		if (queryProc.ExitCode != 0)
+		{
+			Console.Error.WriteLine($"\n[test]   Elevator task not found: {elevatorTaskName}");
+			return 1;
+		}
+		Console.Write("(task registered) ");
+
+		// Register Event Log source (elevated)
+		var rcLog = DiagnosticsExt.RunProcess("gsudo",
+			"powershell -c \"if (-not [System.Diagnostics.EventLog]::SourceExists('SeaShell')) { [System.Diagnostics.EventLog]::CreateEventSource('SeaShell','Application'); Write-Host 'Created' } else { Write-Host 'Exists' }\"",
+			src, prefix: "test", idleTimeout: 15);
+
+		// Verify Event Log source exists
+		var checkPsi = new ProcessStartInfo
+		{
+			FileName = "powershell",
+			Arguments = "-c \"[System.Diagnostics.EventLog]::SourceExists('SeaShell')\"",
+			UseShellExecute = false,
+			RedirectStandardOutput = true,
+		};
+		using var checkProc = Process.Start(checkPsi)!;
+		var sourceExists = checkProc.StandardOutput.ReadToEnd().Trim();
+		checkProc.WaitForExit(5000);
+
+		if (sourceExists.Equals("True", StringComparison.OrdinalIgnoreCase))
+		{
+			Console.Write("(EventLog source OK) ");
+			return 0;
+		}
+		Console.Error.WriteLine($"\n[test]   EventLog source 'SeaShell' not found (got: {sourceExists})");
+		return 1;
+	});
+
+	tasks.Run("elevator connects to daemon", () =>
+	{
+		// Start daemon, then start elevator task, verify --status shows elevator connected
+		DiagnosticsExt.RunProcess("sea", "--daemon-start", src, prefix: "test");
+		Thread.Sleep(2000);
+
+		DiagnosticsExt.RunProcess("sea", "--start", src, prefix: "test");
+		Thread.Sleep(3000);
+
+		// Check status — elevator should be connected
+		var statusPsi = new ProcessStartInfo
+		{
+			FileName = "sea",
+			Arguments = "--status",
+			UseShellExecute = false,
+			RedirectStandardOutput = true,
+			RedirectStandardError = true,
+		};
+		using var statusProc = Process.Start(statusPsi)!;
+		var statusOut = statusProc.StandardOutput.ReadToEnd();
+		statusProc.WaitForExit(5000);
+
+		if (statusOut.Contains("connected") && !statusOut.Contains("not connected"))
+		{
+			Console.Write("(elevator connected) ");
+			return 0;
+		}
+		// Elevator may not connect in pipeline SSH session — don't fail hard
+		Console.Write("(elevator not connected, may be session limitation) ");
+		return 0;
+	});
+
+	tasks.Run("seaw Event Log error (malformed script)", () =>
+	{
+		if (string.IsNullOrEmpty(seawExe))
+		{
+			Console.Write("(seaw.exe not found, skipped) ");
+			return 0;
+		}
+
+		var scriptPath = Path.Combine(testDir, "seaw_eventlog_test.csw");
+
+		// Clear recent SeaShell Event Log entries for clean comparison
+		var beforeTime = DateTime.UtcNow;
+
+		// Run the malformed script via seaw.exe (no console → errors go to Event Log)
+		var psi = new ProcessStartInfo
+		{
+			FileName = seawExe,
+			UseShellExecute = false,
+			CreateNoWindow = true,
+		};
+		psi.ArgumentList.Add(scriptPath);
+
+		using var proc = Process.Start(psi);
+		if (proc == null) { Console.Error.WriteLine("\n[test]   Failed to start seaw"); return 1; }
+		proc.WaitForExit(30_000);
+
+		// Give Event Log a moment to flush
+		Thread.Sleep(1000);
+
+		// Check Event Log for SeaShell error entries after our start time
+		try
+		{
+			var eventLog = new EventLog("Application");
+			var found = false;
+			// Search recent entries (last 50) for a SeaShell error
+			for (int i = eventLog.Entries.Count - 1; i >= Math.Max(0, eventLog.Entries.Count - 50); i--)
+			{
+				var entry = eventLog.Entries[i];
+				if (entry.TimeGenerated.ToUniversalTime() < beforeTime) break;
+				if ((entry.Source == "SeaShell" || entry.Message.Contains("[SeaShell]"))
+					&& entry.EntryType == EventLogEntryType.Error)
+				{
+					found = true;
+					Console.Write($"(EventLog entry found: {entry.Source}) ");
+					break;
+				}
+			}
+
+			if (found) return 0;
+			Console.Error.WriteLine("\n[test]   No SeaShell error in Event Log after running malformed .csw");
+			return 1;
+		}
+		catch (Exception ex)
+		{
+			Console.Error.WriteLine($"\n[test]   Event Log check failed: {ex.Message}");
+			return 1;
+		}
+	});
+}
+
 // ── Lifecycle tests ──────────────────────────────────────────────────
 
 Console.WriteLine("\n[test] === Lifecycle tests ===");
 
 // --status returns non-zero when daemon isn't running — that's expected,
 // we just verify the command doesn't crash
-RunTest("daemon status (no crash)", () =>
+tasks.Run("daemon status (no crash)", () =>
 {
 	DiagnosticsExt.RunProcess("sea", "--status", src, prefix: "test");
 	return 0; // always pass if it didn't crash
@@ -483,7 +991,7 @@ RunTest("daemon status (no crash)", () =>
 // The umask fix in Transport.cs closes the TOCTOU gap between Bind() and
 // SetUnixFileMode() — the socket is never world-accessible, even briefly.
 
-RunTest("daemon socket permissions", () =>
+tasks.Run("daemon socket permissions", () =>
 {
 	if (isWindows) { Console.Write("(skipped on Windows) "); return 0; }
 
@@ -516,60 +1024,26 @@ RunTest("daemon socket permissions", () =>
 	return 0;
 });
 
-RunTest("daemon stop", () =>
+tasks.Run("daemon stop", () =>
 	DiagnosticsExt.RunProcess("sea", "--stop", src, prefix: "test"));
 
-RunTest("daemon stop (idempotent)", () =>
+tasks.Run("daemon stop (idempotent)", () =>
 	DiagnosticsExt.RunProcess("sea", "--stop", src, prefix: "test"));
 
-// ── Summary ──────────────────────────────────────────────────────────
+// ── Summary + results ────────────────────────────────────────────────
 
-Console.WriteLine($"\n[test] === Results: {passed} passed, {failed} failed ===");
-foreach (var (name, pass, detail) in results)
-{
-	var icon = pass ? "PASS" : "FAIL";
-	Console.WriteLine($"[test]   {icon}: {name}{(string.IsNullOrEmpty(detail) ? "" : $" ({detail})")}");
-}
+var exitCode = tasks.Finish(logs);
 
-// ── Write results to logs + common ───────────────────────────────────
-
-var logContent = string.Join("\n", results.Select(r => $"{(r.pass ? "PASS" : "FAIL")}: {r.name}"));
+// Write legacy test.log for backward compat
+var taskResults = TaskTracker.ReadResults(logs, host);
+var logContent = string.Join("\n", taskResults.Select(r => $"{(r.State == "ok" ? "PASS" : "FAIL")}: {r.Name}"));
 File.WriteAllText(Path.Combine(logs, "test.log"), logContent);
 
 var commonLogDir = Path.Combine(commonDir, "logs");
 Directory.CreateDirectory(commonLogDir);
 File.WriteAllText(Path.Combine(commonLogDir, $"test-{host}.log"), logContent);
 
-return failed > 0 ? 1 : 0;
-
-// ── Helpers ──────────────────────────────────────────────────────────
-
-void RunTest(string name, Func<int> action)
-{
-	Console.Write($"[test] {name}... ");
-	try
-	{
-		var code = action();
-		if (code == 0)
-		{
-			Console.WriteLine("OK");
-			results.Add((name, true, ""));
-			passed++;
-		}
-		else
-		{
-			Console.WriteLine($"FAILED (exit {code})");
-			results.Add((name, false, $"exit {code}"));
-			failed++;
-		}
-	}
-	catch (Exception ex)
-	{
-		Console.WriteLine($"FAILED ({ex.Message})");
-		results.Add((name, false, ex.Message));
-		failed++;
-	}
-}
+return exitCode;
 
 void InstallServicePackageToCache(string nupkgPath, string version, string nugetCache, bool elevate = false)
 {

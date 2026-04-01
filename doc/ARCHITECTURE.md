@@ -2,13 +2,26 @@
 
 ## Overview
 
-SeaShell has five components that communicate over platform-native IPC:
+SeaShell has six runtime components that communicate over platform-native IPC,
+plus a bootstrapper for installation:
 
 ```
 ┌──────────────────────────────────────────────────┐
-│  CLI (sea.exe)                                   │
+│  Bootstrapper (seashell)                         │
+│  Dotnet tool. Extracts per-RID archives,         │
+│  registers daemon/elevator, manages PATH.        │
+│  install / uninstall / start / stop / status     │
+└──────────────────────────────────────────────────┘
+
+┌──────────────────────────────────────────────────┐
+│  CLI (sea.exe / seaw.exe)                        │
 │  Parses args, talks to daemon, spawns scripts,   │
 │  manages script pipe, handles exit delay.        │
+│  seaw.exe: WinExe subsystem (no console window). │
+├──────────────────────────────────────────────────┤
+│  Invoker (shared engine)                         │
+│  Compilation, mutex, restart, attach, daemon     │
+│  lifecycle. Used by CLI, Host, and ServiceHost.  │
 └──────────┬───────────────────────────────────────┘
            │ Named pipes (Win) / Unix domain sockets (Linux)
 ┌──────────▼───────────────────────────────────────┐
@@ -32,9 +45,9 @@ SeaShell has five components that communicate over platform-native IPC:
 
 ┌──────────────────────────────────────────────────┐
 │  Host (SeaShell.Host)                            │
-│  Embeddable library. Compiles and runs scripts   │
-│  without the daemon. Connects to the script pipe │
-│  the same way the CLI does.                      │
+│  Embeddable library + service hosting.           │
+│  Uses Invoker to compile and run scripts.        │
+│  Connects to the script pipe like the CLI does.  │
 └──────────────────────────────────────────────────┘
 ```
 
@@ -42,15 +55,16 @@ SeaShell has five components that communicate over platform-native IPC:
 
 | Project | Role |
 |---|---|
-| **SeaShell.Cli** | CLI entry point. Argument parsing, daemon lifecycle, script execution (direct, elevated, watch), REPL client, exit delay, file association. |
+| **SeaShell.Bootstrapper** | Dotnet tool (`seashell` command). Extracts per-RID archives, registers daemon/elevator tasks, manages PATH and file associations. |
+| **SeaShell.Cli** | CLI entry point (sea.exe / seaw.exe). Argument parsing, REPL client, exit delay, file association. Thin wrapper around Invoker. |
+| **SeaShell.Invoker** | Shared execution engine. `ScriptInvoker` (compile, execute, watch, reload, restart, mutex, attach, elevate), `DaemonLauncher`, `DaemonManager`, `ScheduledTasks`, `DirectiveScanner`, `ScriptMutex`. Used by CLI, Host, and ServiceHost. |
 | **SeaShell.Daemon** | Compilation server. Listens for `RunRequest`, compiles via Engine, returns artifact paths. Holds Elevator connection. Runs `ScriptWatcher` for hot-swap. |
 | **SeaShell.Elevator** | Elevated worker (Windows). Connects to daemon, receives `SpawnRequest`, starts elevated processes. Registered via Task Scheduler. |
 | **SeaShell.Engine** | Roslyn compiler, NuGet resolver, include system, `.deps.json` writer, compilation cache, script watcher, background updater. |
-| **SeaShell.Script** | Runtime context (`Sea` static class). Loaded into every script process. Manages the script-side pipe server, lifecycle events, and reload state. |
-| **SeaShell.Ipc** | Shared message types and `MessageChannel` (System.IO.Pipelines). Used by both Script (in the script process) and Cli/Host (in the launcher). |
+| **SeaShell.Script** | Runtime context (`Sea` static class). Loaded into every script process. Manages the script-side pipe server, lifecycle events, reload state, and attach server. |
+| **SeaShell.Common** | Shared message types, `MessageChannel` (System.IO.Pipelines). Used by Script (in the script process) and Invoker (in the launcher). |
 | **SeaShell.Protocol** | Daemon/Elevator protocol messages and `TransportStream` (platform IPC abstraction). |
-| **SeaShell.Host** | Embeddable API. Wraps Engine + Script for applications that want to run scripts without the daemon. |
-| **SeaShell.ServiceHost** | Cross-platform service hosting. Auto-detects init system (Windows Service, systemd, runit, OpenRC). Management commands, crash recovery, zero-locking NuGet updates. |
+| **SeaShell.Host** | Embeddable API + cross-platform service hosting. Wraps Invoker for applications that want to run scripts without the CLI. Auto-detects init system (Windows Service, systemd, runit, OpenRC). Management commands, crash recovery, zero-locking NuGet updates. |
 
 ## IPC Layers
 
@@ -77,16 +91,29 @@ Messages: `RunRequest`/`RunResponse`, `PingRequest`/`PingResponse`, `HotSwapNoti
 ### 2. Script pipe
 
 Launcher ↔ Script communication. Bidirectional named pipe with the script as server
-and the CLI (or Host) as client. Uses `MessageChannel` from `SeaShell.Ipc`.
+and the CLI (or Host) as client. Uses `MessageChannel` from `SeaShell.Common`.
 
 Messages: `ScriptInit`, `ScriptReload`, `ScriptStop`, `ScriptExit`, `ScriptState`,
-`HostMessage`, `ScriptMessage`.
+`HostMessage`, `ScriptMessage`, `ScriptReloadRequest`.
 
 The script creates the pipe server with a GUID-based name passed via the `SEASHELL_PIPE`
 environment variable. The launcher connects as client after spawning the process.
 
 `HostMessage`/`ScriptMessage` enable bidirectional application messaging between
 Host and Script during execution. Binary `byte[]` payload with optional topic routing.
+
+### 3. Attach pipe
+
+Blocked-caller ↔ Running-instance communication for `//sea_mutex_attach`. The running
+script starts an `AttachServer` on a well-known pipe name (`seashell-attach-{identity}`).
+Blocked callers connect as clients. Same binary wire format.
+
+Messages: `AttachHello` (args + CWD), `AttachMessage` (bidirectional binary payload),
+`AttachClose` (exit code). Message types 50-52.
+
+The identity is an FNV-1a hash of the normalized script path, computed by
+`DirectiveScanner.ComputeIdentity()`. This is deterministic — any caller of the same
+script gets the same pipe name.
 
 ## Compilation Pipeline
 
@@ -112,7 +139,7 @@ Script source
       ├─ {name}.deps.json             all entries type:"project" (app base dir)
       ├─ {name}.sea.json              SeaShell metadata
       ├─ SeaShell.Script.dll          ┐
-      ├─ SeaShell.Ipc.dll             │ bundled (from engine dir)
+      ├─ SeaShell.Common.dll           │ bundled (from engine dir)
       ├─ MessagePack.dll              │
       ├─ MessagePack.Annotations.dll  ┘
       ├─ Serilog.dll                  ┐
@@ -203,6 +230,51 @@ loop:
   CLI → read ScriptState + ScriptExit → increment reloadCount → loop
 ```
 
+### Restart
+
+```
+CLI → Daemon.RunRequest → compile → RunResponse(restart=true)
+loop:
+  CLI → spawn script → connect → send ScriptInit(restartCount)
+  Script → run Main → ProcessExit → send ScriptExit(restart=true)
+  CLI → read ScriptExit → if restart && Sea.Restart:
+    if exit was fast (<5s): exponential backoff (2s, 4s, 8s, 8s...)
+    increment restartCount → loop
+```
+
+### Mutex (pre-compilation)
+
+```
+CLI → DirectiveScanner.Scan(script) → detect //sea_mutex [scope]
+CLI → ScriptMutex.TryAcquire(identity, scope)
+  Acquired? → proceed to Daemon.RunRequest (normal flow)
+  Blocked + //sea_mutex_attach? → attach to running instance
+  Blocked, no attach? → exit code 200
+```
+
+### Attach (blocked caller)
+
+```
+Blocked CLI → connect to seashell-attach-{identity} pipe
+Blocked CLI → send AttachHello(args, cwd)
+Running script → Sea.Attached event fires with AttachContext
+  Script calls ctx.Send/ctx.Receive for bidirectional messaging
+  Script calls ctx.Close(exitCode)
+Blocked CLI → receives AttachClose → exits with that code
+```
+
+### seaw.exe (Window Mode)
+
+```
+seaw.exe → IsSeawExe() = true → no console allocated
+  If script path: DirectiveScanner.Scan() → //sea_console?
+    Yes: AllocConsole() or AttachConsole(parent)
+    No:  stay windowless
+  If no args: AllocConsole() (dashboard needs stdout)
+  If error + no console: write to Windows Event Log
+seaw.exe → normal Invoker flow (same as sea.exe)
+```
+
 ## Elevated Console (Windows)
 
 Elevated scripts run in a separate process spawned by the Elevator. To share the CLI's
@@ -215,15 +287,57 @@ terminal), the script calls:
 The CLI's PID is passed via `SEASHELL_CLI_PID`. The Elevator spawns with
 `WindowStyle.Hidden` to avoid a visible console flash.
 
+## Script Mutex
+
+`DirectiveScanner` reads the first ~20 lines of a script to detect mutex directives
+before contacting the daemon. `ScriptMutex.TryAcquire()` is called pre-compilation.
+
+| Scope | Windows | Linux |
+|---|---|---|
+| System | `Global\SeaShell_{identity}` (named kernel mutex) | flock in `/tmp/` |
+| User | `SeaShell_{identity}_u{username}` (named kernel mutex) | flock in `~/.local/share/seashell/` |
+| Session | `Local\SeaShell_{identity}_s{sessionId}` (named kernel mutex) | flock in `$XDG_RUNTIME_DIR/` |
+
+The identity is an FNV-1a hash of the normalized script path, so the same script always
+gets the same mutex name regardless of how it's invoked (relative vs absolute path).
+
+When `//sea_mutex_attach` is active, the running instance starts an `AttachServer` on
+pipe `seashell-attach-{identity}`. Blocked callers connect instead of exiting. The
+`Sea.Attached` event fires for each client with an `AttachContext` that provides the
+caller's args, working directory, and bidirectional `Send`/`Receive`/`Close` methods.
+
+## Daemon Hash & Version Check
+
+The daemon computes a self-hash using SHA256 of all assembly `FullName` strings (ordered)
+in its base directory. `DaemonManager.ComputeDirHash()` uses the same algorithm on the
+staged binary directory. On script run, the CLI pings the daemon and compares hashes —
+a mismatch triggers automatic restart.
+
+`PingResponse` carries: `Version` (4-part), `Pid`, `DaemonHash`, `UptimeSeconds`,
+`ActiveScripts`, `IdleSeconds`, `IdleTimeoutSeconds`, `ElevatorVersion`.
+
+## Handle Inheritance
+
+When spawning the daemon, `DaemonManager` prevents handle inheritance through two layers:
+
+1. **Redirect + close** (cross-platform) — stdin/stdout/stderr are redirected and
+   immediately closed after `Process.Start()`.
+2. **StdHandleInheritGuard** (Windows) — temporarily clears `HANDLE_FLAG_INHERIT`
+   on the standard handles before spawning. Prevents the daemon from inheriting any
+   inheritable handles that would block SSH sessions, pipe readers, or test harnesses.
+
 ## Cross-Platform
 
 | Aspect | Windows | Linux |
 |---|---|---|
 | Daemon transport | Named pipes | Unix domain sockets |
 | Script pipe | Named pipes (async) | Named pipes (async) |
+| Attach pipe | Named pipes | Named pipes |
 | Pipe permissions | ACL (current user SID) | File mode 0600 |
+| Mutex | Named kernel mutex (Global/Local) | flock |
 | Elevation | Elevator via Task Scheduler | Ignored (`//sea_elevate` is a no-op) |
+| Window mode | seaw.exe (WinExe subsystem) | N/A |
 | Console management | FreeConsole/AttachConsole | N/A |
-| Exit delay | Ephemeral console detection | N/A |
+| Exit delay | Parent process detection | N/A |
 | Logging | EventLog sink | Syslog sink |
 | Scheduled tasks | Task Scheduler XML | N/A (use systemd) |

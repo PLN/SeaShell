@@ -1,0 +1,7 @@
+// Deliberately malformed script to test seaw Event Log error reporting.
+// This script has a syntax error. When seaw.exe runs it in window mode
+// (no console), the compilation error should appear in the Windows Event Log
+// under the "SeaShell" or "Application" source.
+
+Console.WriteLine("This line is fine");
+THIS IS NOT VALID CSHARP {{{{ @@@@

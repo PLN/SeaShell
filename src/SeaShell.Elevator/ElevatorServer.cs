@@ -61,7 +61,8 @@ public sealed class ElevatorWorker
 		_log.Debug("Connecting to daemon...");
 		await using var conn = await TransportClient.ConnectAsync(daemonAddress, timeoutMs: 5000, ct);
 
-		await conn.Channel.SendAsync(new ElevatorHello(_isElevated), ct);
+		var version = typeof(ElevatorWorker).Assembly.GetName().Version?.ToString(4) ?? "0.0.0";
+		await conn.Channel.SendAsync(new ElevatorHello(_isElevated, version), ct);
 
 		var ackResult = await conn.Channel.ReceiveAsync(ct);
 		if (ackResult == null) throw new InvalidOperationException("Daemon disconnected during handshake");

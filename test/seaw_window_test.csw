@@ -1,0 +1,17 @@
+// seaw.exe window mode test — no //sea_console, so no console allocated.
+// Writes results to a marker file since stdout goes nowhere in window mode.
+
+var marker = args.Length > 0 ? args[0] : Path.Combine(Path.GetTempPath(), "seaw_window_test.txt");
+var lines = new List<string>();
+lines.Add($"pid={Environment.ProcessId}");
+lines.Add($"IsWindowMode={Sea.IsWindowMode}");
+lines.Add($"HasConsole={HasConsole()}");
+lines.Add(Sea.IsWindowMode && !HasConsole() ? "PASS" : "FAIL");
+File.WriteAllLines(marker, lines);
+return 0;
+
+static bool HasConsole()
+{
+	try { _ = Console.WindowWidth; return true; }
+	catch { return false; }
+}

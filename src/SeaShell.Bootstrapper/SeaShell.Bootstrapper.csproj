@@ -1,0 +1,25 @@
+<Project Sdk="Microsoft.NET.Sdk">
+	<PropertyGroup>
+		<OutputType>Exe</OutputType>
+		<AssemblyName>seashell</AssemblyName>
+		<PackageId>SeaShell</PackageId>
+		<PackAsTool>true</PackAsTool>
+		<ToolCommandName>seashell</ToolCommandName>
+		<Description>SeaShell bootstrapper — installs/updates the SeaShell C# scripting engine.</Description>
+		<PackageTags>scripting;seashell;csharp;vb;roslyn;repl;cli;installer</PackageTags>
+		<PackageReadmeFile>README.md</PackageReadmeFile>
+		<IsPackable>true</IsPackable>
+	</PropertyGroup>
+	<ItemGroup>
+		<None Include="..\..\README.md" Pack="true" PackagePath="/" />
+	</ItemGroup>
+	<!--
+	Archives are embedded at pack time by pipeline-package.cs, which copies
+	the per-RID zips into archives/ before running 'dotnet pack'.
+	At dev time, the directory may not exist — that's fine, the tool just
+	won't have any embedded archives and will print an error.
+	-->
+	<ItemGroup>
+		<EmbeddedResource Include="archives\*.zip" Condition="Exists('archives')" />
+	</ItemGroup>
+</Project>

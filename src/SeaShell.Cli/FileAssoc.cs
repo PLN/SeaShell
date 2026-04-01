@@ -26,16 +26,16 @@ static class FileAssoc
 			extension = "." + extension;
 
 		var progId = $"SeaShell_{extension.TrimStart('.').Replace(".", "_")}";
-		var seaExe = GetSeaExePath();
+		var exePath = GetExePathForExtension(extension);
 
 		try
 		{
-			// Register the ProgID: SeaShell_cs (or SeaShell_cscs, etc.)
+			// Register the ProgID: SeaShell_cs (or SeaShell_csw, etc.)
 			using var progKey = Registry.CurrentUser.CreateSubKey($@"Software\Classes\{progId}");
 			progKey.SetValue("", $"SeaShell {extension} Script");
 
 			using var commandKey = Registry.CurrentUser.CreateSubKey($@"Software\Classes\{progId}\shell\open\command");
-			commandKey.SetValue("", $"\"{seaExe}\" \"%1\" %*");
+			commandKey.SetValue("", $"\"{exePath}\" \"%1\" %*");
 
 			// Associate the extension with the ProgID
 			using var extKey = Registry.CurrentUser.CreateSubKey($@"Software\Classes\{extension}");
@@ -45,7 +45,10 @@ static class FileAssoc
 			SHChangeNotify(0x08000000, 0, IntPtr.Zero, IntPtr.Zero);
 
 			Console.WriteLine($"  Associated {extension} -> {progId}");
-			Console.WriteLine($"  Command: \"{seaExe}\" \"%1\" %*");
+			Console.WriteLine($"  Command: \"{exePath}\" \"%1\" %*");
+			Console.WriteLine($"  To set as default: right-click a {extension} file -> Open with -> Always");
+			if (extension.Equals(".csw", StringComparison.OrdinalIgnoreCase))
+				Console.WriteLine($"  Task Scheduler: use \"{System.IO.Path.GetFileName(exePath)}\" as action, script path as argument");
 			return 0;
 		}
 		catch (Exception ex)
@@ -90,15 +93,28 @@ static class FileAssoc
 		}
 	}
 
-	private static string GetSeaExePath()
+	private static string GetExePathForExtension(string extension)
 	{
-		// Use the current binary's path
-		var exe = Environment.ProcessPath;
-		if (!string.IsNullOrEmpty(exe))
-			return exe;
+		// .csw → seaw.exe (Windows subsystem, zero flash)
+		// .cs, .csc, everything else → sea.exe (Console subsystem)
+		var isWindowExt = extension.Equals(".csw", StringComparison.OrdinalIgnoreCase);
+		var targetExe = isWindowExt ? "seaw.exe" : "sea.exe";
 
-		// Fallback: AppContext.BaseDirectory + sea.exe
-		return System.IO.Path.Combine(AppContext.BaseDirectory, "sea.exe");
+		// Try to find the target exe next to the current binary
+		var currentExe = Environment.ProcessPath;
+		if (!string.IsNullOrEmpty(currentExe))
+		{
+			var dir = System.IO.Path.GetDirectoryName(currentExe);
+			if (dir != null)
+			{
+				var candidate = System.IO.Path.Combine(dir, targetExe);
+				if (System.IO.File.Exists(candidate))
+					return candidate;
+			}
+		}
+
+		// Fallback: AppContext.BaseDirectory
+		return System.IO.Path.Combine(AppContext.BaseDirectory, targetExe);
 	}
 
 	[DllImport("shell32.dll")]

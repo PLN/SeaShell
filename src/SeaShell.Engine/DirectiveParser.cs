@@ -35,6 +35,11 @@ public static class DirectiveParser
 		public bool WebApp { get; set; }
 		public bool Elevate { get; set; }
 		public bool Watch { get; set; }
+		public bool Restart { get; set; }
+		public byte MutexScope { get; set; } // 0=None, 1=Session, 2=User, 3=System
+		public bool MutexAttach { get; set; }
+		public bool Window { get; set; }
+		public bool Console { get; set; }
 	}
 
 	public sealed record NuGetRef(string PackageName, string? Version);
@@ -149,7 +154,42 @@ public static class DirectiveParser
 			case "watch":
 				result.Watch = true;
 				break;
+
+			case "restart":
+				result.Restart = true;
+				break;
+
+			case "mutex_attach":
+				result.MutexAttach = true;
+				// mutex_attach implies mutex — parse scope from arg
+				result.MutexScope = ParseMutexScope(arg, 3); // default: System
+				break;
+
+			case "mutex":
+				result.MutexScope = ParseMutexScope(arg, 3); // default: System
+				break;
+
+			case "window":
+				result.Window = true;
+				break;
+
+			case "console":
+				result.Console = true;
+				break;
 		}
+	}
+
+	/// <summary>Parse mutex scope argument: session=1, user=2, system=3.</summary>
+	private static byte ParseMutexScope(string arg, byte defaultScope)
+	{
+		if (string.IsNullOrEmpty(arg)) return defaultScope;
+		return arg.ToLowerInvariant() switch
+		{
+			"session" => 1,
+			"user" => 2,
+			"system" => 3,
+			_ => defaultScope,
+		};
 	}
 
 	/// <summary>

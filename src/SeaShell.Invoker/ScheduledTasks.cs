@@ -17,7 +17,7 @@ namespace SeaShell.Invoker;
 public static class ScheduledTasks
 {
 	private static readonly string Version =
-		typeof(ScheduledTasks).Assembly.GetName().Version?.ToString(3) ?? "0.0.0";
+		typeof(ScheduledTasks).Assembly.GetName().Version?.ToString(4) ?? "0.0.0";
 	private static readonly string DaemonTaskName = $"SeaShell Daemon ({Environment.UserName}) {Version}";
 	private static readonly string ElevatorTaskName = $"SeaShell Elevator ({Environment.UserName}) {Version}";
 	private const string TaskFolder = "\\SeaShell\\";
@@ -111,6 +111,7 @@ public static class ScheduledTasks
 	public static int InstallDaemon(Action<string>? log = null)
 	{
 		if (!RequireWindows(log)) return 1;
+		CleanupOldTasks("Daemon", log);
 		var result = FindAndStageBinary("seashell-daemon", "daemon", log);
 		if (result == null) return 1;
 		log?.Invoke($"binary: {result.Value.command}{(result.Value.arguments != null ? " " + result.Value.arguments : "")}");
@@ -123,6 +124,7 @@ public static class ScheduledTasks
 	public static int InstallElevator(Action<string>? log = null)
 	{
 		if (!RequireWindows(log)) return 1;
+		CleanupOldTasks("Elevator", log);
 		var result = FindAndStageBinary("seashell-elevator", "elevator", log);
 		if (result == null) return 1;
 		log?.Invoke($"binary: {result.Value.command}{(result.Value.arguments != null ? " " + result.Value.arguments : "")}");
@@ -132,6 +134,60 @@ public static class ScheduledTasks
 			return 1;
 		ServiceManifest.UpdateComponent(Version, "elevator", c => c.ScheduledTask = TaskFolder + ElevatorTaskName);
 		return 0;
+	}
+
+	/// <summary>
+	/// Remove old versioned tasks for the current user. Tasks are named
+	/// "SeaShell {component} ({user}) {version}" — on update, the old version's
+	/// task remains. This enumerates \SeaShell\ and deletes stale entries.
+	/// </summary>
+	private static void CleanupOldTasks(string component, Action<string>? log)
+	{
+		try
+		{
+			// List all tasks in \SeaShell\ folder
+			var psi = new ProcessStartInfo
+			{
+				FileName = "schtasks.exe",
+				ArgumentList = { "/Query", "/TN", "\\SeaShell\\", "/FO", "CSV", "/NH" },
+				UseShellExecute = false,
+				RedirectStandardOutput = true,
+				RedirectStandardError = true,
+			};
+			using var proc = Process.Start(psi)!;
+			var output = proc.StandardOutput.ReadToEnd();
+			proc.WaitForExit(5_000);
+			if (proc.ExitCode != 0) return;
+
+			// Pattern: "\SeaShell\SeaShell Daemon (username) 0.3.17.108"
+			// Match tasks for this component + current user, skip the current version
+			var user = Environment.UserName;
+			var prefix = $"SeaShell {component} ({user})";
+			var currentName = component == "Daemon" ? DaemonTaskName : ElevatorTaskName;
+
+			foreach (var line in output.Split('\n', StringSplitOptions.RemoveEmptyEntries))
+			{
+				// CSV: "TaskName","Next Run Time","Status"
+				var parts = line.Split(',');
+				if (parts.Length < 1) continue;
+				var taskPath = parts[0].Trim('"', ' ', '\r');
+
+				// Extract task name from full path: \SeaShell\SeaShell Daemon (user) 0.3.17
+				var taskName = taskPath.StartsWith(TaskFolder)
+					? taskPath[TaskFolder.Length..]
+					: Path.GetFileName(taskPath);
+
+				if (taskName.StartsWith(prefix, StringComparison.OrdinalIgnoreCase)
+					&& !taskName.Equals(currentName, StringComparison.OrdinalIgnoreCase))
+				{
+					// Old version — stop and delete
+					EndTask(taskName);
+					if (DeleteTask(taskName, null))
+						log?.Invoke($"Removed old task: {taskName}");
+				}
+			}
+		}
+		catch { }
 	}
 
 	public static int UninstallDaemon(Action<string>? log = null)

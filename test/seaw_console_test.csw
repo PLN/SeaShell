@@ -1,0 +1,20 @@
+//sea_console
+// seaw.exe with //sea_console — console should be allocated.
+// Writes results to a marker file for verification.
+
+var marker = args.Length > 0 ? args[0] : Path.Combine(Path.GetTempPath(), "seaw_console_test.txt");
+var lines = new List<string>();
+lines.Add($"pid={Environment.ProcessId}");
+lines.Add($"IsWindowMode={Sea.IsWindowMode}");
+lines.Add($"HasConsole={HasConsole()}");
+// seaw.exe always sets IsWindowMode=true (it's the binary type, not console state).
+// With //sea_console, a console IS allocated, so HasConsole should be true.
+lines.Add(Sea.IsWindowMode && HasConsole() ? "PASS" : "FAIL");
+File.WriteAllLines(marker, lines);
+return 0;
+
+static bool HasConsole()
+{
+	try { _ = Console.WindowWidth; return true; }
+	catch { return false; }
+}
