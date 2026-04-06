@@ -1,9 +1,11 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Linq;
 using System.Runtime.InteropServices;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using SeaShell.Protocol;
 
 namespace SeaShell.Invoker;
 
@@ -120,6 +122,37 @@ public static class ServiceManifest
 	public static string? GetOrStageElevator(string version, Action<string>? log = null)
 	{
 		return LookupComponent(version, "elevator", log);
+	}
+
+	/// <summary>
+	/// Get candidate daemon addresses for compatible versions (&gt; requested).
+	/// Returns addresses from the manifest, ordered by version descending
+	/// (newest first). Excludes the exact requested version (caller probes that separately).
+	/// Uses ComponentEntry.Address when available, otherwise constructs from version key.
+	/// </summary>
+	public static string[] GetCompatibleDaemonAddresses(string requestedVersion)
+	{
+		var manifest = Read();
+		var identity = TransportEndpoint.CurrentUserIdentity;
+		var candidates = new List<(string version, string address)>();
+
+		foreach (var kvp in manifest.Installations)
+		{
+			if (string.Compare(kvp.Key, requestedVersion, StringComparison.Ordinal) <= 0)
+				continue; // same or older — skip
+
+			var daemon = kvp.Value.Daemon;
+			if (daemon == null)
+				continue;
+
+			var address = daemon.Address
+				?? TransportEndpoint.GetDaemonAddress(identity, kvp.Key);
+			candidates.Add((kvp.Key, address));
+		}
+
+		// Newest first — probe latest compatible version first
+		candidates.Sort((a, b) => string.Compare(b.version, a.version, StringComparison.Ordinal));
+		return candidates.Select(c => c.address).ToArray();
 	}
 
 	private static string? LookupComponent(string version, string componentName, Action<string>? log)

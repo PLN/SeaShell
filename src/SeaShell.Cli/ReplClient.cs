@@ -11,14 +11,15 @@ static class ReplClient
 	/// <summary>Full interactive REPL loop: connect to daemon, send/receive eval requests.</summary>
 	public static async Task<int> ReplAsync(string daemonAddress, string[] packages)
 	{
-		// Ensure daemon is running (via Invoker)
-		if (!await DaemonLauncher.EnsureRunningAsync(daemonAddress, msg => Console.Error.WriteLine($"sea: {msg}")))
+		// Ensure daemon is running — may resolve to a compatible higher version
+		var resolvedAddress = await DaemonLauncher.EnsureRunningAsync(daemonAddress, msg => Console.Error.WriteLine($"sea: {msg}"));
+		if (resolvedAddress == null)
 		{
 			Console.Error.WriteLine("sea: daemon failed to start");
 			return 1;
 		}
 
-		await using var conn = await TransportClient.ConnectAsync(daemonAddress, timeoutMs: 10000);
+		await using var conn = await TransportClient.ConnectAsync(resolvedAddress, timeoutMs: 10000);
 
 		// Start REPL session
 		await conn.Channel.SendAsync(new ReplStartRequest(packages));
