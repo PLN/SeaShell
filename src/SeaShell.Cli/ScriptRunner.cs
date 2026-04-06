@@ -49,9 +49,11 @@ static class ScriptRunner
 	private static bool HasConsole()
 	{
 		if (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows)) return true;
-		try { _ = Console.WindowWidth; return true; }
-		catch { return false; }
+		return GetConsoleWindow() != IntPtr.Zero;
 	}
+
+	[DllImport("kernel32.dll")]
+	private static extern IntPtr GetConsoleWindow();
 
 	[System.Runtime.Versioning.SupportedOSPlatform("windows")]
 	private static void WriteEventLog(string message)

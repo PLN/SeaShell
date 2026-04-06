@@ -129,7 +129,9 @@ public sealed class ScriptInvoker
 		if (!response.Success)
 		{
 			await conn.DisposeAsync();
-			return new ScriptResult(1, "", response.Error ?? "Compilation failed");
+			var error = response.Error ?? "Compilation failed";
+			_log?.Invoke(error);
+			return new ScriptResult(1, "", error);
 		}
 
 		var compiled = CompiledScript.FromRunResponse(response)!;
@@ -320,7 +322,8 @@ public sealed class ScriptInvoker
 				await channel.SendAsync(BuildScriptInit(compiled, args,
 					reloadCount: 0, launcherPid: Environment.ProcessId,
 					restart: compiled.Restart, restartCount: restartCount,
-					mutexScope: compiled.MutexScope, mutexAttach: compiled.MutexAttach), ct);
+					mutexScope: compiled.MutexScope, mutexAttach: compiled.MutexAttach,
+					log: _log), ct);
 
 				var (exitCode, _, exitDelay, scriptRestart) = await ReceiveUntilExitAsync(channel, ct);
 
@@ -396,7 +399,8 @@ public sealed class ScriptInvoker
 				await scriptChannel.SendAsync(BuildScriptInit(currentCompiled, args,
 					reloadCount: reloadCount, stateBase64: stateBase64, watch: true,
 					restart: initial.Restart, restartCount: restartCount,
-					mutexScope: initial.MutexScope, mutexAttach: initial.MutexAttach), ct);
+					mutexScope: initial.MutexScope, mutexAttach: initial.MutexAttach,
+					windowMode: windowMode, log: _log), ct);
 
 				// Channel reader with reload request signaling
 				var reloadRequests = Channel.CreateUnbounded<(string? reason, bool clearCache)>();
@@ -423,8 +427,7 @@ public sealed class ScriptInvoker
 
 							if (connection != null) connection.Channel = null;
 							await scriptChannel.DisposeAsync();
-							if (!proc.WaitForExit(3000))
-								try { proc.Kill(entireProcessTree: false); } catch { }
+							TryKillAfterTimeout(proc);
 
 							if (elapsed.TotalSeconds < 5)
 							{
@@ -509,8 +512,7 @@ public sealed class ScriptInvoker
 				if (connection != null) connection.Channel = null;
 				await scriptChannel.DisposeAsync();
 
-				if (!proc.WaitForExit(3000))
-					try { proc.Kill(entireProcessTree: false); } catch { }
+				TryKillAfterTimeout(proc);
 				await proc.WaitForExitAsync();
 
 				currentCompiled = new CompiledScript(
@@ -526,8 +528,7 @@ public sealed class ScriptInvoker
 				}
 				finally
 				{
-					if (!proc.HasExited)
-						try { proc.Kill(entireProcessTree: false); } catch { }
+					TryKillIfRunning(proc);
 				}
 			}
 		}
@@ -575,8 +576,7 @@ public sealed class ScriptInvoker
 			if (restart)
 			{
 				_log?.Invoke("IPC pipe failed — //sea_restart requires IPC, aborting");
-				if (!proc.WaitForExit(3000))
-					try { proc.Kill(entireProcessTree: false); } catch { }
+				TryKillAfterTimeout(proc);
 				return new InstanceResult(1, "", "IPC pipe failed — //sea_restart requires IPC", 0, false, false, null, null, false);
 			}
 
@@ -598,7 +598,8 @@ public sealed class ScriptInvoker
 		await channel.SendAsync(BuildScriptInit(compiled, args,
 			reloadCount: reloadCount, stateBase64: stateBase64, watch: watch,
 			restart: restart, restartCount: restartCount,
-			mutexScope: compiled.MutexScope, mutexAttach: compiled.MutexAttach), ct);
+			mutexScope: compiled.MutexScope, mutexAttach: compiled.MutexAttach,
+			windowMode: windowMode, log: _log), ct);
 
 		// Drain channel with reload awareness
 		var reloadRequests = Channel.CreateUnbounded<(string?, bool)>();
@@ -632,8 +633,7 @@ public sealed class ScriptInvoker
 		{
 			// Graceful shutdown
 			try { await channel.SendAsync(new ScriptStop()); } catch { }
-			if (!proc.WaitForExit(5000))
-				try { proc.Kill(entireProcessTree: false); } catch { }
+			TryKillAfterTimeout(proc, 5000);
 
 			var stdout = stdoutTask != null ? await stdoutTask : "";
 			var stderr = stderrTask != null ? await stderrTask : "";
@@ -655,8 +655,7 @@ public sealed class ScriptInvoker
 		}
 		catch { }
 
-		if (!proc.WaitForExit(3000))
-			try { proc.Kill(entireProcessTree: false); } catch { }
+		TryKillAfterTimeout(proc);
 
 		var so2 = stdoutTask != null ? await stdoutTask : "";
 		var se2 = stderrTask != null ? await stderrTask : "";
@@ -666,8 +665,7 @@ public sealed class ScriptInvoker
 		}
 		finally
 		{
-			if (!proc.HasExited)
-				try { proc.Kill(entireProcessTree: false); } catch { }
+			TryKillIfRunning(proc);
 		}
 	}
 
@@ -733,6 +731,30 @@ public sealed class ScriptInvoker
 			log?.Invoke($"attach failed: {ex.Message}");
 			return new ScriptResult(200, "", $"Attach failed: {ex.Message}");
 		}
+	}
+
+	// ── Process lifecycle ───────────────────────────────────────────────
+
+	/// <summary>Wait for the process to exit within <paramref name="timeoutMs"/>, then kill if still running.</summary>
+	private static void TryKillAfterTimeout(Process proc, int timeoutMs = 3000)
+	{
+		try
+		{
+			if (!proc.WaitForExit(timeoutMs))
+				proc.Kill(entireProcessTree: false);
+		}
+		catch { }
+	}
+
+	/// <summary>Kill the process if it hasn't exited yet (for finally blocks).</summary>
+	private static void TryKillIfRunning(Process proc)
+	{
+		try
+		{
+			if (!proc.HasExited)
+				proc.Kill(entireProcessTree: false);
+		}
+		catch { }
 	}
 
 	// ── Helpers ─────────────────────────────────────────────────────────
@@ -813,7 +835,8 @@ public sealed class ScriptInvoker
 		bool isConsoleEphemeral = false,
 		bool restart = false, int restartCount = 0,
 		byte mutexScope = 0, bool mutexAttach = false,
-		bool windowMode = false)
+		bool windowMode = false,
+		Action<string>? log = null)
 	{
 		string? scriptPath = null;
 		string[]? sources = null;
@@ -835,7 +858,10 @@ public sealed class ScriptInvoker
 					assemblies = manifest.Assemblies;
 				}
 			}
-			catch { } // TODO: log manifest deserialization failures
+			catch (Exception ex)
+			{
+				log?.Invoke($"manifest deserialization failed ({compiled.ManifestPath}): {ex.Message}");
+			}
 		}
 
 		return new ScriptInit(

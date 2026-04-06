@@ -45,7 +45,7 @@ jobs:
           dotnet publish src/SeaShell.Cli/SeaShell.Cli.csproj -c Release -r ${{ matrix.rid }} --self-contained false -o ./publish/cli-tmp
         # Merge into main publish dir (sea.* files)
       - name: Merge CLI into publish
-        shell: bash
+        shell: sh
         run: cp -f publish/cli-tmp/* publish/${{ matrix.rid }}/ && rm -rf publish/cli-tmp
 
       - name: Publish seaw (Windows only)
@@ -55,7 +55,7 @@ jobs:
         # Merge seaw.* into main publish dir
       - name: Merge seaw into publish
         if: matrix.rid == 'win-x64'
-        shell: bash
+        shell: sh
         run: cp -f publish/seaw-tmp/seaw.* publish/win-x64/ && rm -rf publish/seaw-tmp
 
       - name: Upload binaries
@@ -162,10 +162,16 @@ jobs:
           $pkg = (Get-ChildItem nupkg/SeaShell.0.*.nupkg).FullName
           Assert-Contains $pkg @('tools/net10.0/any/seashell.dll')
 
-          # Check embedded archives
+          # Check embedded archives (compiled into seashell.dll as EmbeddedResource)
+          $tmp = New-TemporaryFile
           $zip = [System.IO.Compression.ZipFile]::OpenRead($pkg)
-          $archives = ($zip.Entries | Where-Object { $_.FullName -like '*archives*' -and $_.FullName -like '*.zip' }).Count
+          $dllEntry = $zip.Entries | Where-Object { $_.FullName -like '*/seashell.dll' } | Select-Object -First 1
+          [System.IO.Compression.ZipFileExtensions]::ExtractToFile($dllEntry, $tmp.FullName, $true)
           $zip.Dispose()
+          $bytes = [System.IO.File]::ReadAllBytes($tmp.FullName)
+          Remove-Item $tmp.FullName -Force
+          $asm = [System.Reflection.Assembly]::Load($bytes)
+          $archives = ($asm.GetManifestResourceNames() | Where-Object { $_ -like '*.zip' }).Count
           Write-Host "  Embedded archives: $archives"
           if ($archives -lt 3) { Write-Host "  Expected 3 archives" -ForegroundColor Red; $failed = $true }
 

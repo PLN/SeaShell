@@ -99,35 +99,34 @@ public static class ServiceManifest
 		return manifest.Installations.TryGetValue(version, out var entry) ? entry : null;
 	}
 
-	// ── Staging ────────────────────────────────────────────────────────
+	// ── Lookup ─────────────────────────────────────────────────────────
+	// Daemon and elevator binaries are staged by the bootstrapper during
+	// 'seashell install'. The Invoker just looks up the manifest.
 
 	/// <summary>
-	/// Get or stage the daemon binary for the given version.
-	/// Returns the staged directory path, or null if the service package is not available.
+	/// Get the staged daemon directory for the given version.
+	/// Falls back to the latest version >= requested if exact match not found
+	/// (covers Host embedding: app compiled at v140, user upgraded to v143).
+	/// Returns null if SeaShell is not installed.
 	/// </summary>
 	public static string? GetOrStageDaemon(string version, Action<string>? log = null)
 	{
-		return GetOrStageComponent(version, "daemon", "seashell-daemon", log);
+		return LookupComponent(version, "daemon", log);
 	}
 
 	/// <summary>
-	/// Get or stage the elevator binary for the given version.
-	/// Returns the staged directory path, or null if the service package is not available.
+	/// Get the staged elevator directory for the given version.
 	/// </summary>
 	public static string? GetOrStageElevator(string version, Action<string>? log = null)
 	{
-		return GetOrStageComponent(version, "elevator", "seashell-elevator", log);
+		return LookupComponent(version, "elevator", log);
 	}
 
-	private static string? GetOrStageComponent(
-		string version, string componentName, string assemblyName,
-		Action<string>? log)
+	private static string? LookupComponent(string version, string componentName, Action<string>? log)
 	{
-		using var _ = AcquireLock();
-
 		var manifest = Read();
 
-		// Check existing entry
+		// Exact version match
 		if (manifest.Installations.TryGetValue(version, out var entry))
 		{
 			var existing = componentName == "daemon" ? entry.Daemon : entry.Elevator;
@@ -138,76 +137,34 @@ public static class ServiceManifest
 			}
 		}
 
-		// Need to stage — find source
-		var (sourceDir, sharedDir, servicePackagePath) = FindComponentSource(componentName, assemblyName);
-		if (sourceDir == null)
+		// Fallback: find the latest version >= requested
+		// (Host compiled at older version, SeaShell upgraded since)
+		string? bestVersion = null;
+		string? bestPath = null;
+		foreach (var kvp in manifest.Installations)
 		{
-			log?.Invoke($"{componentName}: source not found");
-			return null;
-		}
+			if (string.Compare(kvp.Key, version, StringComparison.Ordinal) < 0)
+				continue; // older than requested
 
-		// Stage binary (platform-specific)
-		var (stagedDir, hash) = DaemonManager.StageBinary(sourceDir, componentName);
+			var comp = componentName == "daemon" ? kvp.Value.Daemon : kvp.Value.Elevator;
+			if (comp?.Path == null || !Directory.Exists(comp.Path))
+				continue;
 
-		// On Linux, the apphost extracted from a nupkg loses its execute bit.
-		// Set it explicitly so the daemon/elevator can be started.
-		if (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
-		{
-			var apphost = System.IO.Path.Combine(stagedDir, assemblyName);
-			if (File.Exists(apphost))
+			if (bestVersion == null || string.Compare(kvp.Key, bestVersion, StringComparison.Ordinal) > 0)
 			{
-				try
-				{
-					File.SetUnixFileMode(apphost,
-						File.GetUnixFileMode(apphost) | UnixFileMode.UserExecute);
-				}
-				catch { }
+				bestVersion = kvp.Key;
+				bestPath = comp.Path;
 			}
 		}
 
-		// Also stage shared DLLs from runtimes/any/ (Service package layout)
-		if (sharedDir != null && Directory.Exists(sharedDir))
+		if (bestPath != null)
 		{
-			foreach (var file in Directory.GetFiles(sharedDir))
-			{
-				var dest = System.IO.Path.Combine(stagedDir, System.IO.Path.GetFileName(file));
-				if (!File.Exists(dest))
-					try { File.Copy(file, dest); } catch { }
-			}
+			log?.Invoke($"{componentName}: version {version} not found, using {bestVersion} at {bestPath}");
+			return bestPath;
 		}
 
-		log?.Invoke($"{componentName}: staged to {stagedDir}");
-
-		// Update manifest (lock held — no concurrent write possible)
-		manifest = Read();
-		if (!manifest.Installations.TryGetValue(version, out entry))
-		{
-			entry = new InstallationEntry
-			{
-				InstalledAt = DateTime.Now.ToString("yyyy.MMdd.HHmm"),
-				Rid = CurrentRid,
-				ServicePackage = servicePackagePath,
-			};
-			manifest.Installations[version] = entry;
-		}
-
-		var component = new ComponentEntry
-		{
-			Hash = hash,
-			Path = stagedDir,
-			Address = componentName == "daemon"
-				? Protocol.TransportEndpoint.GetDaemonAddress(
-					Protocol.TransportEndpoint.CurrentUserIdentity, version)
-				: null,
-		};
-
-		if (componentName == "daemon")
-			entry.Daemon = component;
-		else
-			entry.Elevator = component;
-
-		Write(manifest);
-		return stagedDir;
+		log?.Invoke($"{componentName}: not installed (run 'seashell install')");
+		return null;
 	}
 
 	/// <summary>
@@ -229,73 +186,4 @@ public static class ServiceManifest
 		Write(manifest);
 	}
 
-	// ── Source discovery ───────────────────────────────────────────────
-
-	private static string CurrentRid =>
-		DaemonManager.IsMuslRuntime ? "linux-musl-x64"
-		: RuntimeInformation.IsOSPlatform(OSPlatform.Windows) ? "win-x64"
-		: "linux-x64";
-
-	/// <summary>
-	/// Find the source directory for a component binary.
-	/// Returns (ridDir, sharedDir, servicePackagePath). sharedDir is non-null
-	/// when source is a NuGet Service package (shared DLLs in runtimes/any/).
-	/// </summary>
-	private static (string? sourceDir, string? sharedDir, string? servicePackagePath) FindComponentSource(
-		string componentName, string assemblyName)
-	{
-		var ext = RuntimeInformation.IsOSPlatform(OSPlatform.Windows) ? ".exe" : "";
-
-		// Priority 1: next to calling binary (CLI tool install — all DLLs
-		// are in the same flat directory, no shared dir needed)
-		var baseDir = AppContext.BaseDirectory;
-		if (File.Exists(System.IO.Path.Combine(baseDir, assemblyName + ".dll"))
-			|| File.Exists(System.IO.Path.Combine(baseDir, assemblyName + ext)))
-		{
-			return (baseDir, null, null);
-		}
-
-		// Priority 2: SeaShell.Service NuGet package in the NuGet cache
-		var (nugetDir, sharedDir, packagePath) = FindServicePackageInNuGetCache(assemblyName);
-		if (nugetDir != null)
-			return (nugetDir, sharedDir, packagePath);
-
-		return (null, null, null);
-	}
-
-	/// <summary>
-	/// Find the SeaShell.Service package in the NuGet cache and return the
-	/// RID-specific directory, the shared directory (runtimes/any/), and the package path.
-	/// </summary>
-	private static (string? sourceDir, string? sharedDir, string? packagePath) FindServicePackageInNuGetCache(
-		string assemblyName)
-	{
-		var nugetCache = System.IO.Path.Combine(
-			Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".nuget", "packages");
-		var serviceDir = System.IO.Path.Combine(nugetCache, "seashell.service");
-		if (!Directory.Exists(serviceDir))
-			return (null, null, null);
-
-		// Find the latest installed version
-		var latestVersion = System.Linq.Enumerable.FirstOrDefault(
-			System.Linq.Enumerable.OrderByDescending(
-				Directory.GetDirectories(serviceDir),
-				d => System.IO.Path.GetFileName(d)));
-		if (latestVersion == null)
-			return (null, null, null);
-
-		var rid = CurrentRid;
-		var ridDir = System.IO.Path.Combine(latestVersion, "runtimes", rid);
-		var anyDir = System.IO.Path.Combine(latestVersion, "runtimes", "any");
-		var sharedDir = Directory.Exists(anyDir) ? anyDir : null;
-
-		if (Directory.Exists(ridDir) && Directory.GetFiles(ridDir, assemblyName + "*").Length > 0)
-			return (ridDir, sharedDir, latestVersion);
-
-		// Fallback: managed-only (no platform-specific binary)
-		if (sharedDir != null && Directory.GetFiles(anyDir, assemblyName + "*").Length > 0)
-			return (anyDir, null, latestVersion);
-
-		return (null, null, null);
-	}
 }

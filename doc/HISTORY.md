@@ -120,8 +120,10 @@ directive families: script mutex, attach protocol, and auto-restart.
   conflicts with sea.exe.
 - **Archive embedding** — Per-RID zips embedded in bootstrapper nupkg. Versioned
   copies attached to GitHub release.
-- **Package validation** — Checks bootstrapper contains embedded archives and Host
-  contains targets files. Rejects unexpected packages.
+- **Package validation** — Checks bootstrapper DLL contains embedded archives (via
+  reflection) and Host contains targets files. Rejects unexpected packages.
+- **Alpine container fix** — Build steps use `sh` instead of `bash` for Alpine
+  compatibility (Alpine has no bash).
 - **Attestation + NuGet push** preserved from v0.3.
 
 ### Tests

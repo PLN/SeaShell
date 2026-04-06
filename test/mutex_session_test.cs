@@ -26,7 +26,7 @@ if (args.Length > 0 && args[0].EndsWith(".txt"))
 	return 0;
 }
 
-Console.WriteLine("  mutex_session_test: holding mutex for 8s...");
-Thread.Sleep(8000);
+Console.WriteLine("  mutex_session_test: holding mutex for 30s...");
+Thread.Sleep(30000);
 Console.WriteLine("  mutex_session_test: done");
 return 0;

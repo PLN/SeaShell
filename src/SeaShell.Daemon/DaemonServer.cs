@@ -28,6 +28,8 @@ public sealed class DaemonServer : IAsyncDisposable
 	private string? _elevatorVersion;
 	private readonly SemaphoreSlim _elevatorLock = new(1, 1);
 	private TaskCompletionSource<bool>? _elevatorArrived;
+	private DateTime? _elevatorConnectedTime;
+	private long _elevatorLastActivityTicks;
 
 	private static readonly TimeSpan UpdateInterval = TimeSpan.FromHours(8);
 	private static readonly string Version = typeof(DaemonServer).Assembly.GetName().Version?.ToString(4) ?? "0.1.0";
@@ -218,6 +220,8 @@ public sealed class DaemonServer : IAsyncDisposable
 			_elevator = conn;
 			_elevatorIsElevated = hello.IsElevated;
 			_elevatorVersion = hello.Version;
+			_elevatorConnectedTime = DateTime.UtcNow;
+			_elevatorLastActivityTicks = DateTime.UtcNow.Ticks;
 		}
 		finally
 		{
@@ -427,8 +431,13 @@ public sealed class DaemonServer : IAsyncDisposable
 		var uptime = (int)(now - _startTime).TotalSeconds;
 		var idle = (int)((now.Ticks - Interlocked.Read(ref _lastActivityTicks)) / TimeSpan.TicksPerSecond);
 		var timeout = (int)IdleTimeout.TotalSeconds;
+		var elevUptime = _elevatorConnectedTime.HasValue
+			? (int)(now - _elevatorConnectedTime.Value).TotalSeconds : 0;
+		var elevIdle = _elevatorConnectedTime.HasValue
+			? (int)((now.Ticks - Interlocked.Read(ref _elevatorLastActivityTicks)) / TimeSpan.TicksPerSecond) : 0;
 		return new PingResponse(Version, false, _elevator != null, uptime, _activeConnections,
-			Environment.ProcessId, _daemonHash, idle, timeout, _elevatorVersion);
+			Environment.ProcessId, _daemonHash, idle, timeout, _elevatorVersion,
+			elevUptime, elevIdle);
 	}
 
 	/// <summary>Compute hash of our own directory — must match DaemonManager.ComputeDirHash.</summary>
@@ -540,6 +549,7 @@ public sealed class DaemonServer : IAsyncDisposable
 				await DetachElevator();
 				return new SpawnResponse(false, 0, "Elevator disconnected during spawn");
 			}
+			Interlocked.Exchange(ref _elevatorLastActivityTicks, DateTime.UtcNow.Ticks);
 			return (SpawnResponse)reply.Value.Message;
 		}
 		catch (Exception ex)
@@ -559,6 +569,7 @@ public sealed class DaemonServer : IAsyncDisposable
 				_log.Information("Elevator disconnected");
 				await _elevator.DisposeAsync();
 				_elevator = null;
+				_elevatorConnectedTime = null;
 			}
 		}
 		finally
