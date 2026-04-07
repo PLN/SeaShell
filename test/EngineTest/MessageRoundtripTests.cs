@@ -96,4 +96,35 @@ public class MessageRoundtripTests
 		Assert.Equal(7, result.ExitDelay);
 		Assert.False(result.Restart);
 	}
+
+	[Fact]
+	public void PingResponse_ElevatorMetrics_RoundTrip()
+	{
+		var resp = new PingResponse(
+			"1.0.0", false, true, 300, 2,
+			1234, "abc", 10, 600, "1.0.0",
+			ElevatorUptimeSeconds: 250, ElevatorIdleSeconds: 5);
+
+		var bytes = MessagePackSerializer.Serialize(resp, Opts);
+		var result = MessagePackSerializer.Deserialize<PingResponse>(bytes, Opts);
+
+		Assert.Equal(250, result.ElevatorUptimeSeconds);
+		Assert.Equal(5, result.ElevatorIdleSeconds);
+		Assert.True(result.ElevatorConnected);
+		Assert.Equal("1.0.0", result.ElevatorVersion);
+	}
+
+	[Fact]
+	public void PingResponse_BackwardCompat_MissingElevatorMetrics()
+	{
+		// Simulate old PingResponse without elevator metrics
+		var old = new PingResponse("1.0.0", false, true, 300, 2,
+			1234, "abc", 10, 600, "1.0.0");
+
+		var bytes = MessagePackSerializer.Serialize(old, Opts);
+		var result = MessagePackSerializer.Deserialize<PingResponse>(bytes, Opts);
+
+		Assert.Equal(0, result.ElevatorUptimeSeconds);
+		Assert.Equal(0, result.ElevatorIdleSeconds);
+	}
 }

@@ -17,7 +17,8 @@ public sealed class SysvinitInstaller : IServiceInstaller
 			.Replace("{displayName}", config.DisplayName)
 			.Replace("{description}", config.Description)
 			.Replace("{exePath}", config.ExePath)
-			.Replace("{user}", config.User ?? Environment.UserName);
+			.Replace("{user}", config.User ?? Environment.UserName)
+			.Replace("\r\n", "\n");
 
 		File.WriteAllText(initPath, content);
 		RunCommand("chmod", "+x", initPath);
@@ -60,6 +61,13 @@ public sealed class SysvinitInstaller : IServiceInstaller
 		var psi = new ProcessStartInfo(command) { UseShellExecute = false };
 		foreach (var arg in arguments)
 			psi.ArgumentList.Add(arg);
+
+		// Ensure /sbin and /usr/sbin are in PATH — sysvinit tools live there,
+		// but some environments (CI runners, restricted sudo) strip them.
+		var path = Environment.GetEnvironmentVariable("PATH") ?? "";
+		if (!path.Contains("/sbin"))
+			psi.Environment["PATH"] = $"/sbin:/usr/sbin:{path}";
+
 		using var proc = Process.Start(psi)!;
 		proc.WaitForExit();
 		return proc.ExitCode;

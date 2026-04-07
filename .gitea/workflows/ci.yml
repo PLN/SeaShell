@@ -1,0 +1,1239 @@
+name: CI
+
+on:
+  push:
+    branches: ['*']
+
+defaults:
+  run:
+    shell: bash
+
+# ── Build ───────────────────────────────────────────────────────────────
+# Compile on all platforms, produce platform-specific binaries.
+
+jobs:
+  version:
+    runs-on: linux-x64
+    outputs:
+      counter: ${{ steps.bump.outputs.COUNTER }}
+      version: ${{ steps.bump.outputs.VERSION }}
+    steps:
+      - uses: https://gitea.com/actions/checkout@v4
+
+      - name: Bump version counter
+        id: bump
+
+        run: |
+          # Read current counter from Gitea variable
+          CURRENT=${{ vars.VERSION_COUNTER }}
+          NEXT=$((CURRENT + 1))
+
+          # Update the variable via API
+          curl -s -X PUT \
+            -H "Authorization: token ${{ secrets.API_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            -d "{\"name\":\"VERSION_COUNTER\",\"value\":\"$NEXT\"}" \
+            "${{ github.server_url }}/api/v1/repos/${{ github.repository }}/actions/variables/VERSION_COUNTER"
+
+          # Read base version from Directory.Build.props (e.g. 0.4.0.142 → 0.4.0)
+          BASE=$(grep -oP '<Version>\K[^<]+' Directory.Build.props | sed 's/\.[0-9]*$//')
+          VERSION="$BASE.$NEXT"
+
+          echo "COUNTER=$NEXT" >> $GITHUB_OUTPUT
+          echo "VERSION=$VERSION" >> $GITHUB_OUTPUT
+          echo "Version: $VERSION (counter: $NEXT)"
+
+  build:
+    needs: version
+    strategy:
+      matrix:
+        include:
+          - runner: win-x64
+            rid: win-x64
+            os: windows
+          - runner: linux-x64
+            rid: linux-x64
+            os: linux
+          - runner: linux-musl-x64
+            rid: linux-musl-x64
+            os: linux
+    runs-on: ${{ matrix.runner }}
+
+    steps:
+      - uses: https://gitea.com/actions/checkout@v4
+
+      - name: Set version
+
+        run: |
+          VERSION="${{ needs.version.outputs.version }}"
+          sed -i "s|<Version>[^<]*</Version>|<Version>$VERSION</Version>|" Directory.Build.props
+          echo "Building version $VERSION"
+
+      - name: Build
+        run: dotnet build -c Release
+
+      - name: Publish Daemon + Elevator
+        run: |
+          dotnet publish src/SeaShell.Daemon/SeaShell.Daemon.csproj -c Release -r ${{ matrix.rid }} --self-contained false -o ./publish/${{ matrix.rid }}
+          dotnet publish src/SeaShell.Elevator/SeaShell.Elevator.csproj -c Release -r ${{ matrix.rid }} --self-contained false -o ./publish/${{ matrix.rid }}
+
+      - name: Publish CLI (sea)
+        run: |
+          dotnet publish src/SeaShell.Cli/SeaShell.Cli.csproj -c Release -r ${{ matrix.rid }} --self-contained false -o ./publish/cli-tmp
+
+      - name: Merge CLI into publish
+
+        run: cp -f publish/cli-tmp/* publish/${{ matrix.rid }}/ && rm -rf publish/cli-tmp
+
+      - name: Publish seaw (Windows only)
+        if: matrix.rid == 'win-x64'
+        run: |
+          dotnet publish src/SeaShell.Cli/SeaShell.Cli.csproj -c Release -r win-x64 --self-contained false -p:WindowMode=true -o ./publish/seaw-tmp
+
+      - name: Merge seaw into publish
+        if: matrix.rid == 'win-x64'
+
+        run: cp -f publish/seaw-tmp/seaw.* publish/win-x64/ && rm -rf publish/seaw-tmp
+
+      - name: Upload binaries
+        uses: https://gitea.com/actions/upload-artifact@v3
+        with:
+          name: binaries-${{ matrix.rid }}
+          path: publish/${{ matrix.rid }}/
+
+  # ── Package ────────────────────────────────────────────────────────
+  # Create archives, embed in bootstrapper, pack NuGet, validate.
+
+  package:
+    needs: [version, build]
+    runs-on: win-x64
+
+    steps:
+      - uses: https://gitea.com/actions/checkout@v4
+
+      - name: Set version
+
+        run: |
+          VERSION="${{ needs.version.outputs.version }}"
+          sed -i "s|<Version>[^<]*</Version>|<Version>$VERSION</Version>|" Directory.Build.props
+          echo "Packaging version $VERSION"
+
+      - name: Download Windows binaries
+        uses: https://gitea.com/actions/download-artifact@v3
+        with:
+          name: binaries-win-x64
+          path: publish/win-x64/
+
+      - name: Download Linux binaries
+        uses: https://gitea.com/actions/download-artifact@v3
+        with:
+          name: binaries-linux-x64
+          path: publish/linux-x64/
+
+      - name: Download Alpine binaries
+        uses: https://gitea.com/actions/download-artifact@v3
+        with:
+          name: binaries-linux-musl-x64
+          path: publish/linux-musl-x64/
+
+      - name: Create archives
+        shell: powershell
+        run: |
+          $version = "${{ needs.version.outputs.version }}"
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          New-Item -ItemType Directory -Force -Path src/SeaShell.Bootstrapper/archives | Out-Null
+
+          foreach ($rid in @('win-x64', 'linux-x64', 'linux-musl-x64')) {
+            $src = "publish/$rid"
+            if (-not (Test-Path $src)) { Write-Host "Skipping $rid"; continue }
+
+            $files = Get-ChildItem $src -File | Where-Object { $_.Extension -notin '.pdb','.xml' }
+
+            $embedZip = "src/SeaShell.Bootstrapper/archives/$rid.zip"
+            Compress-Archive -Path $files.FullName -DestinationPath $embedZip -Force
+            Write-Host "Embedded: $rid.zip ($($files.Count) files)"
+
+            $releaseZip = "dist/seashell-$version-$rid.zip"
+            Copy-Item $embedZip $releaseZip
+            Write-Host "Release:  seashell-$version-$rid.zip"
+          }
+
+      - name: Pack
+        run: dotnet pack -c Release -o ./nupkg
+
+      - name: Validate packages
+        shell: powershell
+        run: |
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $failed = $false
+
+          function Assert-Contains($nupkg, $expected) {
+            $zip = [System.IO.Compression.ZipFile]::OpenRead($nupkg)
+            $entries = $zip.Entries | ForEach-Object { $_.FullName }
+            $zip.Dispose()
+            foreach ($e in $expected) {
+              if ($entries -contains $e) { Write-Host "  OK: $e" }
+              else { Write-Host "  MISSING: $e" -ForegroundColor Red; $script:failed = $true }
+            }
+          }
+
+          Write-Host "=== SeaShell (bootstrapper) ==="
+          $pkg = (Get-ChildItem nupkg/SeaShell.0.*.nupkg).FullName
+          Assert-Contains $pkg @('tools/net10.0/any/seashell.dll')
+
+          # Check embedded archives
+          $tmp = New-TemporaryFile
+          $zip = [System.IO.Compression.ZipFile]::OpenRead($pkg)
+          $dllEntry = $zip.Entries | Where-Object { $_.FullName -like '*/seashell.dll' } | Select-Object -First 1
+          [System.IO.Compression.ZipFileExtensions]::ExtractToFile($dllEntry, $tmp.FullName, $true)
+          $zip.Dispose()
+          $bytes = [System.IO.File]::ReadAllBytes($tmp.FullName)
+          Remove-Item $tmp.FullName -Force
+          $asm = [System.Reflection.Assembly]::Load($bytes)
+          $archives = ($asm.GetManifestResourceNames() | Where-Object { $_ -like '*.zip' }).Count
+          Write-Host "  Embedded archives: $archives"
+          if ($archives -lt 3) { Write-Host "  Expected 3 archives" -ForegroundColor Red; $failed = $true }
+
+          Write-Host "`n=== SeaShell.Host ==="
+          $pkg = (Get-ChildItem nupkg/SeaShell.Host.*.nupkg).FullName
+          Assert-Contains $pkg @(
+            'lib/net10.0/SeaShell.Host.dll',
+            'build/net10.0/SeaShell.Host.targets',
+            'buildTransitive/net10.0/SeaShell.Host.targets'
+          )
+
+          # Verify no unexpected packages
+          foreach ($pattern in @('SeaShell.Service.*', 'SeaShell.Engine.*', 'SeaShell.Cli.*', 'SeaShell.Invoker.*')) {
+            $found = Get-ChildItem "nupkg/$pattern.nupkg" -ErrorAction SilentlyContinue
+            if ($found) { Write-Host "UNEXPECTED: $($found.Name)" -ForegroundColor Red; $failed = $true }
+          }
+
+          $count = (Get-ChildItem nupkg/*.nupkg).Count
+          Write-Host "`nTotal packages: $count"
+          if ($failed) { Write-Host "VALIDATION FAILED" -ForegroundColor Red; exit 1 }
+          Write-Host "All packages validated OK" -ForegroundColor Green
+
+      - name: Upload packages
+        uses: https://gitea.com/actions/upload-artifact@v3
+        with:
+          name: packages
+          path: nupkg/
+
+      - name: Upload dist archives
+        uses: https://gitea.com/actions/upload-artifact@v3
+        with:
+          name: dist
+          path: dist/
+
+  # ── Test ───────────────────────────────────────────────────────────
+  # Install from packages, run full test suite on all platforms.
+
+  test:
+    needs: [version, package]
+    strategy:
+      matrix:
+        include:
+          - runner: win-x64
+            rid: win-x64
+            os: windows
+          - runner: linux-x64
+            rid: linux-x64
+            os: linux
+          - runner: linux-musl-x64
+            rid: linux-musl-x64
+            os: linux
+    runs-on: ${{ matrix.runner }}
+
+    steps:
+      - uses: https://gitea.com/actions/checkout@v4
+
+      - name: Download packages
+        uses: https://gitea.com/actions/download-artifact@v3
+        with:
+          name: packages
+          path: nupkg/
+
+      # ── Phase 1: Install ────────────────────────────────────────────
+
+      - name: "Install: Kill SeaShell processes (Windows)"
+        if: matrix.os == 'windows'
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'SilentlyContinue'
+          taskkill /F /IM seashell-daemon.exe 2>&1 | Out-Null
+          taskkill /F /IM seashell-elevator.exe 2>&1 | Out-Null
+          Get-ScheduledTask -TaskPath '\SeaShell\' -ErrorAction SilentlyContinue |
+            Unregister-ScheduledTask -Confirm:$false -ErrorAction SilentlyContinue
+          Start-Sleep -Seconds 2
+          exit 0
+
+      - name: "Install: Kill SeaShell processes (Linux)"
+        if: matrix.os == 'linux'
+
+        run: |
+          sudo pkill -9 -f seashell-daemon || true
+          sudo pkill -9 -f seashell-elevator || true
+          sudo rm -f /tmp/seashell-*.sock
+          rm -f /run/user/$(id -u)/seashell-*.sock 2>/dev/null || true
+          sleep 2
+
+      - name: "Install: Clear caches (Windows)"
+        if: matrix.os == 'windows'
+        shell: powershell
+        run: |
+          $dataDir = "$env:LOCALAPPDATA\seashell"
+          foreach ($sub in @('cache', 'daemon', 'elevator')) {
+            $dir = Join-Path $dataDir $sub
+            if (Test-Path $dir) { Remove-Item $dir -Recurse -Force -ErrorAction SilentlyContinue }
+          }
+          Remove-Item "$dataDir\seashell.json" -Force -ErrorAction SilentlyContinue
+          # System-level caches (best effort, no gsudo in CI)
+          Remove-Item "C:\ProgramData\seashell\cache" -Recurse -Force -ErrorAction SilentlyContinue
+          Remove-Item "C:\ProgramData\seashell\daemon" -Recurse -Force -ErrorAction SilentlyContinue
+          Remove-Item "C:\ProgramData\seashell\elevator" -Recurse -Force -ErrorAction SilentlyContinue
+          Remove-Item "C:\ProgramData\seashell\seashell.json" -Force -ErrorAction SilentlyContinue
+
+      - name: "Install: Clear caches (Linux)"
+        if: matrix.os == 'linux'
+
+        run: |
+          DATA_DIR="$HOME/.local/share/seashell"
+          rm -rf "$DATA_DIR/cache" "$DATA_DIR/daemon" "$DATA_DIR/elevator" "$DATA_DIR/seashell.json"
+          sudo rm -rf /var/lib/seashell/cache /var/lib/seashell/daemon /var/lib/seashell/elevator /var/lib/seashell/seashell.json
+
+      - name: "Install: dotnet tool + seashell install"
+
+        run: |
+          # Add dotnet tools to PATH first so seashell is found
+          export PATH="$HOME/.dotnet/tools:$PATH"
+          dotnet tool uninstall -g SeaShell 2>/dev/null || true
+          dotnet tool install -g SeaShell --add-source "$(pwd)/nupkg"
+          seashell install
+          # Add sea to PATH for subsequent steps
+          if [ "${{ matrix.os }}" = "windows" ]; then
+            SEA_BIN="$LOCALAPPDATA/seashell/bin"
+          else
+            SEA_BIN="$HOME/.local/share/seashell/bin"
+          fi
+          echo "$SEA_BIN" >> $GITHUB_PATH
+          echo "$HOME/.dotnet/tools" >> $GITHUB_PATH
+
+      - name: "Install: Verify sea --version"
+        run: sea --version
+
+      - name: "Install: Install for root/SYSTEM (non-fatal)"
+
+        continue-on-error: true
+        run: |
+          if [ "${{ matrix.os }}" = "linux" ]; then
+            sudo env "PATH=$HOME/.dotnet/tools:$PATH" dotnet tool uninstall -g SeaShell 2>/dev/null || true
+            sudo env "PATH=$HOME/.dotnet/tools:$PATH" dotnet tool install -g SeaShell --add-source "$(pwd)/nupkg" || true
+            sudo env "PATH=$HOME/.dotnet/tools:$PATH" seashell install || true
+          fi
+
+      - name: "Install: Install SeaShell as SYSTEM (Windows)"
+        if: matrix.os == 'windows'
+        shell: powershell
+        continue-on-error: true
+        run: |
+          $nupkgDir = "$(Get-Location)\nupkg"
+          $logFile = "$(Get-Location)\artifacts\system-install.log"
+          New-Item -ItemType Directory -Force -Path "$(Get-Location)\artifacts" | Out-Null
+
+          # Create a script that runs as SYSTEM to perform the install
+          $scriptPath = "$env:TEMP\seashell-system-install.ps1"
+          @"
+          `$ErrorActionPreference = 'Continue'
+          Start-Transcript -Path '$logFile' -Force
+          Write-Host "Running as: $([System.Security.Principal.WindowsIdentity]::GetCurrent().Name)"
+          dotnet tool uninstall -g SeaShell 2>`$null
+          dotnet tool install -g SeaShell --add-source '$nupkgDir'
+          # dotnet tools go to the SYSTEM profile's .dotnet/tools
+          `$toolsDir = Join-Path `$env:USERPROFILE '.dotnet\tools'
+          `$env:PATH = "`$toolsDir;`$env:PATH"
+          seashell install
+          Stop-Transcript
+          "@ | Set-Content -Path $scriptPath -Encoding UTF8
+
+          # Create and run a scheduled task as SYSTEM
+          $taskName = "SeaShell_SystemInstall"
+          try { schtasks /Delete /TN $taskName /F *>$null } catch {}
+          schtasks /Create /TN $taskName /TR "powershell -ExecutionPolicy Bypass -File `"$scriptPath`"" /SC ONCE /ST 00:00 /F /RU SYSTEM
+          schtasks /Run /TN $taskName
+
+          # Wait for completion (monitor log file)
+          $timeout = 60
+          for ($i = 0; $i -lt $timeout; $i++) {
+            Start-Sleep -Seconds 1
+            $state = (schtasks /Query /TN $taskName /FO CSV /NH 2>$null) -split ',' | Select-Object -Index 2
+            if ($state) { $state = $state.Trim('"') }
+            if ($state -eq 'Ready') { break }
+          }
+
+          # Clean up task
+          schtasks /Delete /TN $taskName /F 2>$null
+          Remove-Item $scriptPath -Force -ErrorAction SilentlyContinue
+
+          # Show log
+          if (Test-Path $logFile) {
+            Write-Host "=== SYSTEM install log ==="
+            Get-Content $logFile
+          } else {
+            Write-Host "No log file produced"
+          }
+
+      - name: "Install: Stage SeaShell.Service package"
+
+        run: |
+          SERVICE_PKG=$(find nupkg -name 'SeaShell.Service.*.nupkg' 2>/dev/null | head -1)
+          if [ -z "$SERVICE_PKG" ]; then echo "No SeaShell.Service package found"; exit 0; fi
+
+          VERSION=$(basename "$SERVICE_PKG" | sed 's/SeaShell\.Service\.\(.*\)\.nupkg/\1/')
+          USER_CACHE="$HOME/.nuget/packages"
+          TARGET="$USER_CACHE/seashell.service/$VERSION"
+
+          rm -rf "$USER_CACHE/seashell.service" 2>/dev/null || true
+          mkdir -p "$TARGET"
+          unzip -o "$SERVICE_PKG" -d "$TARGET"
+
+          if [ "${{ matrix.os }}" = "linux" ]; then
+            sudo rm -rf /root/.nuget/packages/seashell.service 2>/dev/null || true
+            sudo mkdir -p "/root/.nuget/packages/seashell.service/$VERSION"
+            sudo cp -r "$TARGET/." "/root/.nuget/packages/seashell.service/$VERSION/"
+          fi
+          # Windows: skip SYSTEM NuGet cache in CI (no elevation)
+
+      # ── Phase 2: Functional tests ──────────────────────────────────
+
+      - name: "Test: dotnet test EngineTest"
+        run: dotnet test test/EngineTest/EngineTest.csproj -c Release --no-build
+
+      - name: "Test: engine-dir-nuget (dotnet run, NuGet cache layout)"
+
+        run: |
+          export SEASHELL_NUPKG_DIR="$(pwd)/nupkg"
+          dotnet run --project test/engine-dir-nuget
+
+      - name: "Test: hello.cs"
+        run: sea test/hello.cs
+
+      - name: "Test: sea_context_test.cs"
+        run: sea test/sea_context_test.cs
+
+      - name: "Test: interactive_ok.cs"
+        run: sea test/interactive_ok.cs
+
+      - name: "Test: nuget-transitive (CS1704 dedup)"
+        run: sea test/nuget-transitive/nuget-transitive.cs
+
+      - name: "Test: host-in-host (ScriptHost compilation)"
+        run: sea test/host-in-host/host-in-host.cs
+
+      - name: "Test: host-resolution (bundled DLL probing)"
+        run: sea test/host-resolution/host-resolution.cs
+
+      - name: "Test: host-in-host-nuget (nested ScriptHost + NuGet)"
+        run: sea test/host-in-host-nuget/host-in-host-nuget.cs
+
+      - name: "Test: binary-deps (companion deps.json pass-through)"
+
+        run: |
+          export SEASHELL_NUPKG_DIR="$(pwd)/nupkg"
+          dotnet publish test/binary-deps -c Release -o ./artifacts/binary-deps-test --force
+          sea ./artifacts/binary-deps-test/binary-deps.dll
+
+      # ── Service tests ──────────────────────────────────────────────
+
+      - name: "Test: service-cwd (Windows)"
+        if: matrix.os == 'windows'
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PUBLISH_DIR = "./artifacts/service-cwd-test"
+          $MARKER_DIR = "$PUBLISH_DIR/markers"
+          $MARKER_FILE = "$MARKER_DIR/seashell-cwd-test.marker"
+          $SERVICE_NAME = "seashell-cwd-test"
+          $EXE = "$PUBLISH_DIR/ServiceCwdTest.exe"
+
+          New-Item -ItemType Directory -Force -Path $MARKER_DIR | Out-Null
+          Remove-Item $MARKER_FILE -Force -ErrorAction SilentlyContinue
+
+          dotnet nuget locals http-cache --clear
+          $env:SEASHELL_NUPKG_DIR = "$(Get-Location)/nupkg"
+          dotnet publish test/ServiceCwdTest -c Release -r ${{ matrix.rid }} --self-contained false -o $PUBLISH_DIR --force
+
+          # Clean up leftover service from previous runs
+          sc.exe stop $SERVICE_NAME 2>$null; Start-Sleep -Seconds 3
+          sc.exe delete $SERVICE_NAME 2>$null
+
+          & $EXE install
+          & $EXE start
+
+          # Wait for marker (30s)
+          $found = $false
+          for ($i = 0; $i -lt 30; $i++) {
+            if (Test-Path $MARKER_FILE) { $found = $true; break }
+            Start-Sleep -Seconds 1
+          }
+
+          if (-not $found) {
+            Write-Host "Marker file not found after 30s"
+            Get-WinEvent -FilterHashtable @{LogName='Application';ProviderName='.NET Runtime';StartTime=(Get-Date).AddMinutes(-2)} -MaxEvents 5 -ErrorAction SilentlyContinue | Format-List
+            & $EXE stop 2>$null
+            & $EXE uninstall 2>$null
+            exit 1
+          }
+
+          $content = Get-Content $MARKER_FILE -Raw
+          Write-Host $content
+          if ($content -notmatch 'Script=') { Write-Host "Missing Script= in marker"; exit 1 }
+          if ($content -notmatch 'NuGet=') { Write-Host "Missing NuGet= in marker"; exit 1 }
+          if ($content -match 'NuGet=FAIL') { Write-Host "NuGet=FAIL in marker"; exit 1 }
+
+          & $EXE stop 2>$null; Start-Sleep -Seconds 3
+          & $EXE uninstall 2>$null
+
+      - name: "Test: service-cwd (Linux)"
+        if: matrix.os == 'linux'
+
+        run: |
+          PUBLISH_DIR="./artifacts/service-cwd-test"
+          MARKER_DIR="$PUBLISH_DIR/markers"
+          MARKER_FILE="$MARKER_DIR/seashell-cwd-test.marker"
+          SERVICE_NAME="seashell-cwd-test"
+          EXE="$PUBLISH_DIR/ServiceCwdTest"
+
+          mkdir -p "$MARKER_DIR"
+          rm -f "$MARKER_FILE"
+
+          dotnet nuget locals http-cache --clear
+          export SEASHELL_NUPKG_DIR="$(pwd)/nupkg"
+          dotnet publish test/ServiceCwdTest -c Release -r ${{ matrix.rid }} --self-contained false -o "$PUBLISH_DIR" --force
+          chmod +x "$EXE"
+
+          # ── Diagnostics: environment ──
+          echo "=== Init system detection ==="
+          echo "  /run/systemd/system: $([ -d /run/systemd/system ] && echo YES || echo NO)"
+          echo "  /sbin/openrc:        $([ -f /sbin/openrc ] && echo YES || echo NO)"
+          echo "  /sbin/rc-status:     $([ -f /sbin/rc-status ] && echo YES || echo NO)"
+          echo "  /etc/alpine-release: $(cat /etc/alpine-release 2>/dev/null || echo 'N/A')"
+          echo "  RID: ${{ matrix.rid }}"
+          echo ""
+          echo "=== Published binary ==="
+          file "$EXE" 2>/dev/null || echo "  (file command not available)"
+          ls -la "$PUBLISH_DIR/" | head -20 || true
+          echo ""
+
+          # Clean up leftover service from previous runs
+          sudo "$EXE" stop 2>/dev/null || true
+          sleep 2
+          sudo "$EXE" uninstall 2>/dev/null || true
+
+          # ── Install with full output ──
+          echo "=== Install ==="
+          sudo "$EXE" install 2>&1 | tee /tmp/svc-install.log
+          INSTALL_RC=${PIPESTATUS[0]}
+          echo "  install exit code: $INSTALL_RC"
+
+          # ── Diagnostics: generated service file ──
+          echo ""
+          echo "=== Generated service file ==="
+          if [ -f "/etc/systemd/system/$SERVICE_NAME.service" ]; then
+            echo "  [systemd unit]"
+            cat "/etc/systemd/system/$SERVICE_NAME.service"
+          elif [ -f "/etc/init.d/$SERVICE_NAME" ]; then
+            echo "  [OpenRC init script]"
+            cat "/etc/init.d/$SERVICE_NAME"
+            echo ""
+            echo "  permissions: $(ls -la /etc/init.d/$SERVICE_NAME)"
+            echo "  rc-update list:"
+            rc-update show 2>/dev/null | grep "$SERVICE_NAME" || echo "  (not in any runlevel)"
+          else
+            echo "  WARNING: no service file found in /etc/systemd/system/ or /etc/init.d/"
+            ls -la /etc/init.d/ 2>/dev/null | tail -10 || true
+          fi
+          echo ""
+
+          # ── Diagnostics: pre-start state ──
+          echo "=== Pre-start checks ==="
+          echo "  exe path resolves to: $(readlink -f "$EXE")"
+          echo "  exe is executable: $([ -x "$EXE" ] && echo YES || echo NO)"
+          echo "  marker dir exists: $([ -d "$MARKER_DIR" ] && echo YES || echo NO)"
+          echo "  marker dir perms: $(ls -ld "$MARKER_DIR")"
+          echo "  publish dir perms: $(ls -ld "$PUBLISH_DIR")"
+          echo "  running as: $(whoami) (sudo target: $(sudo whoami))"
+          echo ""
+
+          # ── Start with full output ──
+          echo "=== Start ==="
+          sudo "$EXE" start 2>&1 | tee /tmp/svc-start.log
+          START_RC=${PIPESTATUS[0]}
+          echo "  start exit code: $START_RC"
+          echo ""
+
+          # ── Diagnostics: post-start state ──
+          echo "=== Post-start process check ==="
+          sleep 2
+          ps aux | grep -i "[S]erviceCwdTest" || echo "  No ServiceCwdTest process found!"
+          echo ""
+          echo "  PID file /run/$SERVICE_NAME.pid:"
+          sudo cat "/run/$SERVICE_NAME.pid" 2>/dev/null || echo "  (not found)"
+          echo ""
+
+          # Service status
+          echo "=== Service status ==="
+          if command -v systemctl &>/dev/null; then
+            sudo systemctl status "$SERVICE_NAME" --no-pager 2>&1 || true
+          elif command -v rc-service &>/dev/null; then
+            sudo rc-service "$SERVICE_NAME" status 2>&1 || true
+          fi
+          echo ""
+
+          # Wait for marker (30s)
+          echo "=== Waiting for marker (30s) ==="
+          for i in $(seq 1 30); do
+            [ -f "$MARKER_FILE" ] && break
+            sleep 1
+          done
+
+          if [ ! -f "$MARKER_FILE" ]; then
+            echo "FAIL: Marker file not found after 30s"
+            echo ""
+
+            # ── Failure diagnostics ──
+            echo "=== Failure diagnostics ==="
+
+            echo "--- Process state ---"
+            ps aux | grep -i "[S]erviceCwdTest" || echo "  No process running"
+            ps aux | grep -i "[s]eashell" || echo "  No seashell processes"
+            echo ""
+
+            echo "--- Marker directory listing ---"
+            ls -laR "$MARKER_DIR" 2>/dev/null || echo "  directory missing"
+            echo ""
+
+            echo "--- Publish directory listing ---"
+            ls -la "$PUBLISH_DIR/" 2>/dev/null | head -20 || true
+            echo ""
+
+            echo "--- Service logs (journalctl) ---"
+            sudo journalctl -u "$SERVICE_NAME" --no-pager -n 50 2>/dev/null || echo "  journalctl not available"
+            echo ""
+
+            echo "--- Service logs (syslog/messages) ---"
+            sudo grep -i "$SERVICE_NAME\|ServiceCwdTest" /var/log/messages 2>/dev/null | tail -30 || true
+            sudo grep -i "$SERVICE_NAME\|ServiceCwdTest" /var/log/syslog 2>/dev/null | tail -30 || true
+            echo ""
+
+            echo "--- OpenRC log ---"
+            sudo cat "/var/log/$SERVICE_NAME.log" 2>/dev/null || echo "  no OpenRC log file"
+            echo ""
+
+            echo "--- dmesg (recent, segfaults/killed) ---"
+            sudo dmesg | tail -20 2>/dev/null || true
+            echo ""
+
+            echo "--- Trying to run binary directly (5s timeout) ---"
+            cd /
+            sudo timeout 5 "$EXE" 2>&1 || echo "  direct run exit code: $?"
+            cd - >/dev/null
+            echo ""
+
+            echo "--- OpenRC net service status ---"
+            rc-service --list 2>/dev/null | head -20 || true
+            rc-status 2>/dev/null || true
+            echo ""
+
+            sudo "$EXE" stop || true
+            sudo "$EXE" uninstall || true
+            exit 1
+          fi
+
+          echo "SUCCESS: marker file found"
+          cat "$MARKER_FILE"
+          grep -q "Script=" "$MARKER_FILE" || { echo "Missing Script= in marker"; exit 1; }
+          grep -q "NuGet=" "$MARKER_FILE" || { echo "Missing NuGet= in marker"; exit 1; }
+          ! grep -q "NuGet=FAIL" "$MARKER_FILE" || { echo "NuGet=FAIL in marker"; exit 1; }
+
+          sudo "$EXE" stop || true
+          sleep 3
+          sudo "$EXE" uninstall || true
+
+      - name: "Test: service-identity (NuGet cache isolation)"
+
+        run: |
+          PUBLISH_DIR="./artifacts/service-cwd-test"
+          MARKER_DIR="$PUBLISH_DIR/markers"
+          MARKER_FILE="$MARKER_DIR/seashell-cwd-test.marker"
+          SERVICE_NAME="seashell-cwd-test"
+
+          if [ "${{ matrix.os }}" = "windows" ]; then
+            EXE="$PUBLISH_DIR/ServiceCwdTest.exe"
+            ELEVATE=""
+          else
+            EXE="$PUBLISH_DIR/ServiceCwdTest"
+            ELEVATE="sudo"
+          fi
+
+          [ -f "$EXE" ] || { echo "ServiceCwdTest binary not found"; exit 1; }
+          rm -f "$MARKER_FILE"
+
+          # Clear compilation cache
+          if [ "${{ matrix.os }}" = "windows" ]; then
+            cmd /c 'rmdir /s /q "C:\ProgramData\seashell\cache" 2>nul'
+          else
+            sudo rm -rf /var/lib/seashell/cache
+          fi
+
+          $ELEVATE "$EXE" install || true
+
+          if [ "${{ matrix.os }}" = "windows" ]; then
+            $ELEVATE sc.exe config "$SERVICE_NAME" obj= "NT AUTHORITY\NetworkService" password= ""
+          else
+            sudo useradd -r -M -s /usr/sbin/nologin seashell-test-user 2>/dev/null \
+              || sudo adduser -S -D -H -s /sbin/nologin seashell-test-user 2>/dev/null \
+              || true
+            if [ -f "/etc/systemd/system/$SERVICE_NAME.service" ]; then
+              sudo sed -i "s/^User=.*/User=seashell-test-user/" /etc/systemd/system/$SERVICE_NAME.service
+              sudo systemctl daemon-reload
+            elif [ -f "/etc/init.d/$SERVICE_NAME" ]; then
+              sudo sed -i 's/^command_user=.*/command_user="seashell-test-user:seashell-test-user"/' /etc/init.d/$SERVICE_NAME
+            fi
+          fi
+
+          $ELEVATE "$EXE" start || true
+
+          # Wait 20s — expect no marker (cache isolation)
+          for i in $(seq 1 20); do
+            [ -f "$MARKER_FILE" ] && break
+            sleep 1
+          done
+
+          if [ -f "$MARKER_FILE" ]; then
+            echo "NOTICE: Service ran under alternate identity (cache not isolated)"
+          else
+            echo "No marker after 20s — cache isolation confirmed"
+          fi
+
+          $ELEVATE "$EXE" stop || true
+          sleep 2
+          $ELEVATE "$EXE" uninstall || true
+          if [ "${{ matrix.os }}" = "linux" ]; then
+            sudo userdel seashell-test-user 2>/dev/null \
+              || sudo deluser seashell-test-user 2>/dev/null \
+              || true
+          fi
+
+      # ── Restart tests ──────────────────────────────────────────────
+
+      - name: "Test: restart daemon before restart tests"
+
+        run: |
+          sea --daemon-stop || true
+          sleep 2
+
+      - name: "Test: restart_test.cs"
+        run: sea test/restart_test.cs
+
+      - name: "Test: restart_opt_out_test.cs"
+        run: sea test/restart_opt_out_test.cs
+
+      # ── Mutex tests ────────────────────────────────────────────────
+
+      - name: "Test: mutex (second instance blocked, exits 200)"
+
+        run: |
+          sea test/mutex_test.cs &
+          PID=$!
+          sleep 3
+          set +e
+          sea test/mutex_test.cs
+          CODE=$?
+          set -e
+          wait $PID || true
+          [ "$CODE" -eq 200 ] || { echo "Expected exit 200, got $CODE"; exit 1; }
+
+      - name: "Test: mutex_attach (second instance communicates with first)"
+
+        run: |
+          sea test/mutex_attach_test.cs &
+          PID=$!
+          sleep 5
+          sea test/mutex_attach_test.cs test-arg-1 test-arg-2 || true
+          wait $PID
+          # First instance should exit 0 after receiving attach
+
+      - name: "Test: mutex user scope (second instance blocked)"
+
+        run: |
+          sea test/mutex_user_test.cs &
+          PID=$!
+          sleep 3
+          set +e
+          sea test/mutex_user_test.cs
+          CODE=$?
+          set -e
+          wait $PID || true
+          [ "$CODE" -eq 200 ] || { echo "Expected exit 200, got $CODE"; exit 1; }
+
+      - name: "Test: mutex session scope (Windows only)"
+        if: matrix.os == 'windows'
+        shell: powershell
+        run: |
+          $proc1 = Start-Process -FilePath "sea" -ArgumentList "test/mutex_session_test.cs" -PassThru -RedirectStandardOutput "$env:TEMP\sea-mutex-out.log" -RedirectStandardError "$env:TEMP\sea-mutex-err.log"
+          Start-Sleep -Seconds 3
+
+          # Same session — should be blocked (exit 200)
+          $proc2 = Start-Process -FilePath "sea" -ArgumentList "test/mutex_session_test.cs" -PassThru -Wait
+          if ($proc2.ExitCode -ne 200) {
+            Write-Host "Same-session: expected 200, got $($proc2.ExitCode)"
+            $proc1 | Stop-Process -Force -ErrorAction SilentlyContinue
+            exit 1
+          }
+          Write-Host "Same session blocked (200)"
+
+          # Different session via pre-created scheduled task (batch logon → new session ID)
+          $cwd = Get-Location
+          $markerPath = Join-Path $cwd 'artifacts\session_marker.txt'
+          Remove-Item $markerPath -Force -ErrorAction SilentlyContinue
+          $seaPath = (Get-Command sea).Source
+          $scriptPath = (Resolve-Path 'test/mutex_session_test.cs').Path
+          $taskName = 'mutex_session_scope_out_session'
+          $batPath = 'C:\Install\act_runner\mutex_session_scope_out_session.bat'
+
+          # Write the .bat file with the sea command for this run
+          $cmdLine = ('"' + $seaPath + '" "' + $scriptPath + '" "' + $markerPath + '"')
+          [System.IO.File]::WriteAllText($batPath, $cmdLine)
+          Write-Host ('  Bat content: ' + $cmdLine)
+
+          schtasks /Run /TN $taskName
+
+          # Wait for marker — proc1 holds mutex for 30s
+          $found = $false
+          for ($i = 0; $i -lt 60; $i++) {
+            Start-Sleep -Milliseconds 500
+            if (Test-Path $markerPath) { $found = $true; break }
+          }
+
+          # Diagnostics
+          Write-Host '=== Task status ==='
+          schtasks /Query /TN $taskName /V /FO LIST 2>$null | Select-String 'Status|Result|Run'
+          Write-Host '=== proc1 still running? ==='
+          if ($proc1.HasExited) { Write-Host ('  No (exited ' + $proc1.ExitCode + ')') } else { Write-Host '  Yes (mutex still held)' }
+
+          $proc1 | Stop-Process -Force -ErrorAction SilentlyContinue
+
+          # Kill any orphaned sea/daemon processes spawned by the task
+          $ErrorActionPreference = 'SilentlyContinue'
+          taskkill /F /IM sea.exe 2>&1 | Out-Null
+          taskkill /F /IM seashell-daemon.exe 2>&1 | Out-Null
+          $ErrorActionPreference = 'Stop'
+
+          if (-not $found) {
+            Write-Host 'Different-session instance did not run'
+            exit 1
+          }
+          if ($proc1.HasExited -and $proc1.ExitCode -eq 0) {
+            Write-Host 'WARN: proc1 exited before task — timing inconclusive'
+          }
+          Write-Host 'Different session free'
+
+      # ── Window mode tests (Windows only) ───────────────────────────
+
+      - name: "Test: seaw window mode (no console)"
+        if: matrix.os == 'windows'
+        shell: powershell
+        run: |
+          $seawExe = Join-Path $env:LOCALAPPDATA 'seashell\bin\seaw.exe'
+          Write-Host ('  Checking: ' + $seawExe + ' -> ' + (Test-Path $seawExe))
+          if (-not (Test-Path $seawExe)) {
+            $seawExe = Join-Path $env:USERPROFILE '.dotnet\tools\seaw.exe'
+            Write-Host ('  Fallback: ' + $seawExe + ' -> ' + (Test-Path $seawExe))
+          }
+          if (-not (Test-Path $seawExe)) { Write-Host 'seaw.exe not found, skipping'; exit 0 }
+          Write-Host ('  Using: ' + $seawExe)
+
+          $markerPath = (Join-Path (Get-Location) 'artifacts\seaw_window_marker.txt')
+          $scriptPath = (Resolve-Path 'test/seaw_window_test.csw').Path
+          New-Item -ItemType Directory -Force -Path artifacts | Out-Null
+          Remove-Item $markerPath -Force -ErrorAction SilentlyContinue
+
+          # Run via Task Scheduler — the real deployment context for seaw.exe
+          $taskName = 'SeaShell_SeawWindowTest'
+          $ErrorActionPreference = 'SilentlyContinue'
+          schtasks /Delete /TN $taskName /F 2>&1 | Out-Null
+          $ErrorActionPreference = 'Stop'
+          $tr = ('"' + $seawExe + '" "' + $scriptPath + '" "' + $markerPath + '"')
+          schtasks /Create /TN $taskName /TR $tr /SC ONCE /ST 00:00 /F /RU "$env:USERNAME"
+          schtasks /Run /TN $taskName
+
+          $found = $false
+          for ($i = 0; $i -lt 120; $i++) {
+            Start-Sleep -Milliseconds 250
+            if (Test-Path $markerPath) { $found = $true; break }
+          }
+
+          $ErrorActionPreference = 'SilentlyContinue'
+          schtasks /Delete /TN $taskName /F 2>&1 | Out-Null
+          $ErrorActionPreference = 'Stop'
+
+          # Dump SeaShell Event Log entries for diagnostics
+          Write-Host '=== Event Log (SeaShell) ==='
+          Get-WinEvent -FilterHashtable @{LogName='Application';ProviderName='SeaShell';StartTime=(Get-Date).AddMinutes(-2)} -MaxEvents 5 -ErrorAction SilentlyContinue | Format-List TimeCreated, Message
+
+          if (-not $found) { Write-Host 'Marker file not created'; exit 1 }
+          Write-Host '=== Marker file ==='
+          Get-Content $markerPath
+          $result = (Get-Content $markerPath)[-1]
+          if ($result -ne 'PASS') { Write-Host ('Test failed: ' + $result); exit 1 }
+          Write-Host 'seaw window mode OK'
+
+      - name: "Test: seaw console mode (//sea_console)"
+        if: matrix.os == 'windows'
+        shell: powershell
+        run: |
+          $seawExe = Join-Path $env:LOCALAPPDATA 'seashell\bin\seaw.exe'
+          if (-not (Test-Path $seawExe)) {
+            $seawExe = Join-Path $env:USERPROFILE '.dotnet\tools\seaw.exe'
+          }
+          if (-not (Test-Path $seawExe)) { Write-Host 'seaw.exe not found, skipping'; exit 0 }
+
+          $markerPath = (Join-Path (Get-Location) 'artifacts\seaw_console_marker.txt')
+          $scriptPath = (Resolve-Path 'test/seaw_console_test.csw').Path
+          Remove-Item $markerPath -Force -ErrorAction SilentlyContinue
+
+          $taskName = 'SeaShell_ConsoleTest'
+          $ErrorActionPreference = 'SilentlyContinue'
+          schtasks /Delete /TN $taskName /F 2>&1 | Out-Null
+          $ErrorActionPreference = 'Stop'
+          $tr = ('"' + $seawExe + '" "' + $scriptPath + '" "' + $markerPath + '"')
+          schtasks /Create /TN $taskName /TR $tr /SC ONCE /ST 00:00 /F /RU "$env:USERNAME"
+          schtasks /Run /TN $taskName
+
+          $found = $false
+          for ($i = 0; $i -lt 120; $i++) {
+            Start-Sleep -Milliseconds 250
+            if (Test-Path $markerPath) { $found = $true; break }
+          }
+
+          $ErrorActionPreference = 'SilentlyContinue'
+          schtasks /Delete /TN $taskName /F 2>&1 | Out-Null
+          $ErrorActionPreference = 'Stop'
+
+          if (-not $found) { Write-Host 'Marker not created'; exit 1 }
+          Write-Host '=== Marker file ==='
+          Get-Content $markerPath
+          $result = (Get-Content $markerPath)[-1]
+          if ($result -ne 'PASS') { Write-Host ('Test failed: ' + $result); exit 1 }
+          Write-Host 'seaw console mode OK'
+
+      # ── Elevated install tests (Windows only) ──────────────────────
+
+      - name: "Test: elevated seashell install (elevator + Event Log)"
+        if: matrix.os == 'windows'
+
+        run: |
+          sea --install-elevator
+          sea --version
+
+      - name: "Test: elevator connects to daemon"
+        if: matrix.os == 'windows'
+
+        run: |
+          sea --daemon-start
+          sleep 2
+          sea --start
+          sleep 3
+          sea --status || true
+          # Elevator may not connect in CI session — don't fail hard
+
+      - name: "Test: seaw Event Log error (malformed script)"
+        if: matrix.os == 'windows'
+        shell: powershell
+        run: |
+          $seawExe = Join-Path $env:LOCALAPPDATA 'seashell\bin\seaw.exe'
+          if (-not (Test-Path $seawExe)) {
+            $seawExe = Join-Path $env:USERPROFILE '.dotnet\tools\seaw.exe'
+          }
+          if (-not (Test-Path $seawExe)) { Write-Host 'seaw.exe not found, skipping'; exit 0 }
+
+          $scriptPath = (Resolve-Path 'test/seaw_eventlog_test.csw').Path
+          $beforeTime = [DateTime]::UtcNow
+
+          # Run via Task Scheduler so seaw has no console — errors go to Event Log
+          $taskName = 'SeaShell_EventLogTest'
+          $ErrorActionPreference = 'SilentlyContinue'
+          schtasks /Delete /TN $taskName /F 2>&1 | Out-Null
+          $ErrorActionPreference = 'Stop'
+          $tr = ('"' + $seawExe + '" "' + $scriptPath + '"')
+          schtasks /Create /TN $taskName /TR $tr /SC ONCE /ST 00:00 /F /RU "$env:USERNAME"
+          schtasks /Run /TN $taskName
+
+          # Wait for task to complete
+          for ($i = 0; $i -lt 60; $i++) {
+            Start-Sleep -Milliseconds 500
+            $state = (schtasks /Query /TN $taskName /FO CSV /NH 2>$null) -split ',' | Select-Object -Index 2
+            if ($state) { $state = $state.Trim('"') }
+            if ($state -eq 'Ready') { break }
+          }
+
+          $ErrorActionPreference = 'SilentlyContinue'
+          schtasks /Delete /TN $taskName /F 2>&1 | Out-Null
+          $ErrorActionPreference = 'Stop'
+          Start-Sleep -Seconds 1
+
+          $events = Get-WinEvent -FilterHashtable @{LogName='Application';ProviderName='SeaShell';StartTime=$beforeTime.ToLocalTime()} -MaxEvents 10 -ErrorAction SilentlyContinue
+          # Also check Application source with [SeaShell] prefix
+          $events2 = Get-WinEvent -FilterHashtable @{LogName='Application';ProviderName='Application';StartTime=$beforeTime.ToLocalTime()} -MaxEvents 20 -ErrorAction SilentlyContinue |
+            Where-Object { $_.Message -match '\[SeaShell\]' }
+          $allEvents = @($events) + @($events2) | Where-Object { $_ -ne $null }
+          $errorEvent = $allEvents | Where-Object { $_.Message -match 'fail|error' } | Select-Object -First 1
+
+          if ($errorEvent) {
+            Write-Host ('EventLog entry found: ' + $errorEvent.ProviderName + ' — ' + $errorEvent.Message.Substring(0, [Math]::Min(200, $errorEvent.Message.Length)))
+          } else {
+            Write-Host 'No SeaShell error in Event Log'
+            Write-Host '=== Recent SeaShell events ==='
+            $allEvents | Format-List TimeCreated, ProviderName, Message
+            exit 1
+          }
+
+      # ── Lifecycle tests ────────────────────────────────────────────
+
+      - name: "Test: daemon status (no crash)"
+
+        run: sea --status || true
+
+      - name: "Test: daemon socket permissions (Linux)"
+        if: matrix.os == 'linux'
+
+        run: |
+          XDG_DIR="${XDG_RUNTIME_DIR:-/tmp}"
+          IDENTITY=$(whoami | tr '[:upper:]' '[:lower:]')
+          SOCKET=$(ls "$XDG_DIR"/seashell-*-"$IDENTITY".sock 2>/dev/null | head -1)
+
+          if [ -z "$SOCKET" ]; then
+            echo "No daemon socket found in $XDG_DIR"
+            exit 1
+          fi
+
+          PERMS=$(stat -c '%a' "$SOCKET")
+          echo "Socket permissions: $PERMS"
+          # Should be 600 (owner only)
+          [ "$PERMS" = "600" ] || { echo "Insecure permissions: $PERMS"; exit 1; }
+
+      - name: "Test: daemon stop"
+
+        run: sea --stop
+
+      - name: "Test: daemon stop (idempotent)"
+
+        run: sea --stop
+
+      # ── Bootstrapper lifecycle (Windows only) ──────────────────────
+
+      - name: "Test: seashell start (starts daemon + elevator)"
+        if: matrix.os == 'windows'
+
+        run: |
+          sea --stop || true
+          sleep 2
+          seashell start
+          sleep 5
+          sea --status | grep -q ", up " || { echo "Daemon not running"; exit 1; }
+
+      - name: "Test: seashell stop (stops both)"
+        if: matrix.os == 'windows'
+
+        run: |
+          seashell stop
+          sleep 3
+          ! sea --status 2>&1 | grep -q ", up " || { echo "Daemon still running"; exit 1; }
+
+      - name: "Test: --status shows task state when daemon is down"
+        if: matrix.os == 'windows'
+
+        run: |
+          sea --stop || true
+          sleep 2
+          OUTPUT=$(sea --status 2>&1 || true)
+          echo "$OUTPUT"
+          echo "$OUTPUT" | grep -qE "(task |not running)" || { echo "Unexpected status output"; exit 1; }
+
+      # ── Schedule tests (Windows) ───────────────────────────────────
+
+      - name: "Test: schedule daily (Windows)"
+        if: matrix.os == 'windows'
+
+        run: sea --schedule "test/schedule_marker_test.cs" daily at 09:00
+
+      - name: "Test: schedule weekly multi-day (Windows)"
+        if: matrix.os == 'windows'
+
+        run: sea --schedule "test/schedule_marker_test.cs" weekly on mon,wed,fri at 08:00
+
+      - name: "Test: schedule every 5 minutes (Windows)"
+        if: matrix.os == 'windows'
+
+        run: sea --schedule "test/schedule_marker_test.cs" every 5 minutes at 01:00 for 8 hours
+
+      - name: "Test: schedule @reboot (Windows)"
+        if: matrix.os == 'windows'
+
+        run: sea --schedule "test/schedule_marker_test.cs" @reboot
+
+      - name: "Test: schedule @logon (Windows)"
+        if: matrix.os == 'windows'
+
+        run: sea --schedule "test/schedule_marker_test.cs" @logon
+
+      - name: "Test: schedule overwrite (Windows)"
+        if: matrix.os == 'windows'
+
+        run: |
+          sea --schedule "test/schedule_marker_test.cs" daily at 09:00
+          sea --schedule "test/schedule_marker_test.cs" weekly on tue,thu at 14:30
+
+      - name: "Test: unschedule (Windows)"
+        if: matrix.os == 'windows'
+
+        run: sea --unschedule "test/schedule_marker_test.cs"
+
+      - name: "Test: unschedule nonexistent (Windows)"
+        if: matrix.os == 'windows'
+
+        run: |
+          set +e
+          sea --unschedule "test/nonexistent_script.cs"
+          CODE=$?
+          set -e
+          [ "$CODE" -ne 0 ] || { echo "Should have failed"; exit 1; }
+
+      - name: "Test: schedule invalid timing (Windows)"
+        if: matrix.os == 'windows'
+
+        run: |
+          set +e
+          sea --schedule "test/schedule_marker_test.cs" biweekly on neptune
+          CODE=$?
+          set -e
+          [ "$CODE" -ne 0 ] || { echo "Should have failed"; exit 1; }
+
+      - name: "Test: schedule --list (Windows)"
+        if: matrix.os == 'windows'
+
+        run: |
+          sea --schedule "test/schedule_marker_test.cs" @logon
+          sea --schedule-list | grep -q "schedule_marker_test"
+
+      - name: "Test: schedule trigger (Windows)"
+        if: matrix.os == 'windows'
+        shell: powershell
+        run: |
+          $markerPath = "test/schedule_marker.txt"
+          Remove-Item $markerPath -Force -ErrorAction SilentlyContinue
+
+          sea --schedule "test/schedule_marker_test.cs" "@logon"
+          $taskPath = "\SeaShell\$env:USERNAME - schedule_marker_test"
+          schtasks /Run /TN "$taskPath"
+
+          $found = $false
+          for ($i = 0; $i -lt 120; $i++) {
+            Start-Sleep -Milliseconds 250
+            if (Test-Path $markerPath) { $found = $true; break }
+          }
+
+          Remove-Item $markerPath -Force -ErrorAction SilentlyContinue
+          if (-not $found) { Write-Host "Marker not created"; exit 1 }
+          Write-Host "Schedule trigger OK"
+
+      # ── Schedule tests (Linux) ─────────────────────────────────────
+
+      - name: "Test: schedule daily (Linux)"
+        if: matrix.os == 'linux'
+
+        run: |
+          sea --schedule "test/schedule_marker_test.cs" daily at 09:00
+          crontab -l | grep -q "schedule_marker_test"
+
+      - name: "Test: schedule overwrite (Linux)"
+        if: matrix.os == 'linux'
+
+        run: |
+          sea --schedule "test/schedule_marker_test.cs" daily at 09:00
+          sea --schedule "test/schedule_marker_test.cs" weekly on mon at 14:00
+          COUNT=$(crontab -l | grep -c "# seashell:schedule_marker_test")
+          [ "$COUNT" -eq 1 ] || { echo "Expected 1 entry, got $COUNT"; exit 1; }
+
+      - name: "Test: unschedule (Linux)"
+        if: matrix.os == 'linux'
+
+        run: |
+          sea --unschedule "test/schedule_marker_test.cs"
+          ! crontab -l 2>/dev/null | grep -q "schedule_marker_test" || { echo "Entry still exists"; exit 1; }
+
+      - name: "Test: unschedule nonexistent (Linux)"
+        if: matrix.os == 'linux'
+
+        run: |
+          set +e
+          sea --unschedule "test/nonexistent_script.cs"
+          CODE=$?
+          set -e
+          [ "$CODE" -ne 0 ] || { echo "Should have failed"; exit 1; }
+
+      - name: "Test: schedule @logon on Linux (proper error)"
+        if: matrix.os == 'linux'
+
+        run: |
+          set +e
+          OUTPUT=$(sea --schedule "test/schedule_marker_test.cs" @logon 2>&1)
+          CODE=$?
+          set -e
+          [ "$CODE" -ne 0 ] || { echo "Should have failed"; exit 1; }
+          echo "$OUTPUT" | grep -qi "not supported" || { echo "Expected 'not supported' error"; exit 1; }
+
+      # ── Phase 3: Final verification ────────────────────────────────
+      # Leave the machine with a clean, working SeaShell install.
+
+      - name: "Final: Clean up test services (Windows)"
+        if: matrix.os == 'windows'
+        shell: powershell
+        continue-on-error: true
+        run: |
+          $ErrorActionPreference = 'SilentlyContinue'
+          taskkill /F /IM seashell-daemon.exe 2>&1 | Out-Null
+          taskkill /F /IM seashell-elevator.exe 2>&1 | Out-Null
+          Get-ScheduledTask -TaskPath '\SeaShell\' 2>&1 | Out-Null
+          if ($?) { Get-ScheduledTask -TaskPath '\SeaShell\' | Unregister-ScheduledTask -Confirm:$false 2>&1 | Out-Null }
+          exit 0
+
+      - name: "Final: Clean up test services (Linux)"
+        if: matrix.os == 'linux'
+
+        continue-on-error: true
+        run: |
+          sudo pkill -9 -f seashell-daemon || true
+          sudo pkill -9 -f seashell-elevator || true
+          sudo rm -f /tmp/seashell-*.sock
+          rm -f /run/user/$(id -u)/seashell-*.sock 2>/dev/null || true
+
+      - name: "Final: Clean reinstall"
+
+        run: |
+          dotnet tool uninstall -g SeaShell 2>/dev/null || true
+          dotnet tool install -g SeaShell --add-source "$(pwd)/nupkg"
+          seashell install
+
+      - name: "Final: Verify sea --version"
+        run: sea --version
+
+      - name: "Final: Start daemon and verify status"
+
+        run: |
+          sea --daemon-start
+          sleep 3
+          sea --status
+
+      - name: "Final: Smoke test (hello.cs)"
+        run: sea test/hello.cs

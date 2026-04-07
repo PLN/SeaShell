@@ -1,15 +1,25 @@
 //sea_console
-// seaw.exe with //sea_console — console should be allocated.
-// Writes results to a marker file for verification.
+// seaw.exe with //sea_console — console should be allocated even in Task Scheduler.
+// Expected to run from Task Scheduler (the real deployment context for seaw).
+// Writes diagnostics + result to a marker file.
 
 var marker = args.Length > 0 ? args[0] : Path.Combine(Path.GetTempPath(), "seaw_console_test.txt");
 var lines = new List<string>();
 lines.Add($"pid={Environment.ProcessId}");
+lines.Add($"sessionId={System.Diagnostics.Process.GetCurrentProcess().SessionId}");
+lines.Add($"user={Environment.UserName}");
 lines.Add($"IsWindowMode={Sea.IsWindowMode}");
 lines.Add($"HasConsole={HasConsole()}");
-// seaw.exe always sets IsWindowMode=true (it's the binary type, not console state).
+lines.Add($"processPath={Environment.ProcessPath}");
+lines.Add($"cwd={Environment.CurrentDirectory}");
+
+// seaw.exe always sets IsWindowMode=true (binary type, not console state).
 // With //sea_console, a console IS allocated, so HasConsole should be true.
-lines.Add(Sea.IsWindowMode && HasConsole() ? "PASS" : "FAIL");
+var pass = Sea.IsWindowMode && HasConsole();
+lines.Add(pass ? "PASS" : "FAIL");
+if (!pass)
+	lines.Add($"reason: IsWindowMode={Sea.IsWindowMode} HasConsole={HasConsole()} (expected true/true)");
+
 File.WriteAllLines(marker, lines);
 return 0;
 

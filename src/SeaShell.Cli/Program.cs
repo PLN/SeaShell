@@ -13,6 +13,15 @@ using SeaShell.Cli;
 // is present in the script, or if running a non-script command (--help etc).
 var isWindowMode = IsSeawExe();
 var consoleAllocated = false;
+
+// Log window mode detection to Event Log (seaw runs without console, so
+// stderr/stdout may be invisible). This helps diagnose CI test failures.
+if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+{
+	var diag = $"ProcessPath={Environment.ProcessPath}, IsWindowMode={isWindowMode}";
+	if (isWindowMode)
+		WriteToEventLog($"[seaw startup] {diag}", EventLogEntryType.Information);
+}
 if (isWindowMode && args.Length > 0 && !args[0].StartsWith("-"))
 {
 	// Script invocation — only allocate console if //sea_console directive present
@@ -112,14 +121,24 @@ switch (args[0])
 				: $"idle {FormatDuration(status.IdleSeconds)}";
 			Console.WriteLine($"  daemon:   v{status.Version}, up {FormatDuration(status.UptimeSeconds)}, {idleStr}, {status.ActiveScripts} active");
 			if (status.ElevatorConnected)
-				Console.WriteLine($"  elevator: v{status.ElevatorVersion ?? "?"}, connected");
+			{
+				var elevIdleStr = $"idle {FormatDuration(status.ElevatorIdleSeconds)}";
+				Console.WriteLine($"  elevator: v{status.ElevatorVersion ?? "?"}, up {FormatDuration(status.ElevatorUptimeSeconds)}, {elevIdleStr}");
+			}
 			else
 				Console.WriteLine($"  elevator: not connected");
 			ExitDelayIfNeeded();
 			return 0;
 		}
-		Console.WriteLine("  daemon:   not running");
-		Console.WriteLine("  elevator: not running");
+		var daemonTaskState = ScheduledTasks.QueryDaemonTaskState();
+		Console.WriteLine(daemonTaskState != null
+			? $"  daemon:   not running (task: {daemonTaskState.ToLowerInvariant()})"
+			: "  daemon:   not running");
+
+		var elevatorTaskState = ScheduledTasks.QueryElevatorTaskState();
+		Console.WriteLine(elevatorTaskState != null
+			? $"  elevator: task {elevatorTaskState.ToLowerInvariant()}"
+			: "  elevator: not running");
 		ExitDelayIfNeeded();
 		return 1;
 
@@ -145,6 +164,16 @@ switch (args[0])
 		return ScheduledTasks.UninstallDaemon(log);
 	case "--uninstall-elevator":
 		return ScheduledTasks.UninstallElevator(log);
+
+	// ── Script scheduling (via Invoker) ───────────────────────────
+	case "--schedule":
+		if (args.Length < 3) { Console.Error.WriteLine("Usage: sea --schedule <script.cs> <timing...>"); return 1; }
+		return ScriptScheduler.Schedule(Path.GetFullPath(args[1]), args[2..], log);
+	case "--unschedule":
+		if (args.Length < 2) { Console.Error.WriteLine("Usage: sea --unschedule <script.cs>"); return 1; }
+		return ScriptScheduler.Unschedule(Path.GetFullPath(args[1]), log);
+	case "--schedule-list":
+		return ScriptScheduler.List(log);
 
 	// ── File association (CLI-only) ────────────────────────────────
 	case "--associate":
@@ -190,10 +219,10 @@ void LogError(string message)
 }
 
 [System.Runtime.Versioning.SupportedOSPlatform("windows")]
-static void WriteToEventLog(string message)
+static void WriteToEventLog(string message, EventLogEntryType type = EventLogEntryType.Error)
 {
-	try { EventLog.WriteEntry("SeaShell", message, EventLogEntryType.Error); }
-	catch { try { EventLog.WriteEntry("Application", $"[SeaShell] {message}", EventLogEntryType.Error); } catch { } }
+	try { EventLog.WriteEntry("SeaShell", message, type); }
+	catch { try { EventLog.WriteEntry("Application", $"[SeaShell] {message}", type); } catch { } }
 }
 
 static string FormatDuration(int totalSeconds)

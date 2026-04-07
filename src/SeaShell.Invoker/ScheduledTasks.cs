@@ -332,6 +332,20 @@ public static class ScheduledTasks
 		return proc.ExitCode == 0;
 	}
 
+	/// <summary>Query the state of the daemon task. Returns null if not found.</summary>
+	public static string? QueryDaemonTaskState()
+	{
+		if (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows)) return null;
+		return QueryTaskState(TaskFolder + DaemonTaskName);
+	}
+
+	/// <summary>Query the state of the elevator task. Returns null if not found.</summary>
+	public static string? QueryElevatorTaskState()
+	{
+		if (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows)) return null;
+		return QueryTaskState(TaskFolder + ElevatorTaskName);
+	}
+
 	private static string? QueryTaskState(string fullName)
 	{
 		var psi = new ProcessStartInfo

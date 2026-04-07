@@ -214,7 +214,9 @@ public sealed record PingResponse(
 	string? DaemonHash = null,
 	int IdleSeconds = 0,
 	int IdleTimeoutSeconds = 0,
-	string? ElevatorVersion = null
+	string? ElevatorVersion = null,
+	int ElevatorUptimeSeconds = 0,
+	int ElevatorIdleSeconds = 0
 );
 
 public sealed record StopRequest();

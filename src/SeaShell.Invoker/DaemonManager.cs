@@ -40,7 +40,8 @@ public static class DaemonManager
 			return new DaemonStatus(
 				ping.Version, ping.UptimeSeconds, ping.ActiveScripts,
 				ping.ElevatorConnected, ping.Pid, ping.DaemonHash,
-				ping.IdleSeconds, ping.IdleTimeoutSeconds, ping.ElevatorVersion);
+				ping.IdleSeconds, ping.IdleTimeoutSeconds, ping.ElevatorVersion,
+				ping.ElevatorUptimeSeconds, ping.ElevatorIdleSeconds);
 		}
 		catch
 		{
@@ -180,7 +181,7 @@ public static class DaemonManager
 	/// Copy a daemon or elevator binary and its dependencies to a stable data directory.
 	/// Returns (stagedDir, hash). Reuses existing staging if hash matches.
 	/// </summary>
-	public static (string stagedDir, string hash) StageBinary(string sourceDir, string binaryName)
+	public static (string stagedDir, string hash) StageBinary(string sourceDir, string binaryName, Action<string>? log = null)
 	{
 		var hash = ComputeDirHash(sourceDir);
 		var stageDir = Path.Combine(SeaShellPaths.DataDir, binaryName, hash);
@@ -189,7 +190,7 @@ public static class DaemonManager
 			return (stageDir, hash);
 
 		Directory.CreateDirectory(stageDir);
-		CopyDirectory(sourceDir, stageDir);
+		CopyDirectory(sourceDir, stageDir, log);
 
 		// Generate .runtimeconfig.dev.json with NuGet probing path
 		var nugetCache = Path.Combine(
@@ -216,18 +217,19 @@ public static class DaemonManager
 		return (stageDir, hash);
 	}
 
-	private static void CopyDirectory(string source, string destination)
+	private static void CopyDirectory(string source, string destination, Action<string>? log = null)
 	{
 		foreach (var file in Directory.GetFiles(source))
 		{
 			var dest = Path.Combine(destination, Path.GetFileName(file));
-			try { File.Copy(file, dest); } catch { } // TODO: log when log callback available
+			try { File.Copy(file, dest); }
+			catch (Exception ex) { log?.Invoke($"copy failed: {Path.GetFileName(file)}: {ex.Message}"); }
 		}
 		foreach (var dir in Directory.GetDirectories(source))
 		{
 			var destDir = Path.Combine(destination, Path.GetFileName(dir));
 			Directory.CreateDirectory(destDir);
-			CopyDirectory(dir, destDir);
+			CopyDirectory(dir, destDir, log);
 		}
 	}
 
@@ -329,7 +331,8 @@ public sealed record DaemonStatus(
 	string Version, int UptimeSeconds, int ActiveScripts,
 	bool ElevatorConnected, int Pid, string? DaemonHash,
 	int IdleSeconds = 0, int IdleTimeoutSeconds = 0,
-	string? ElevatorVersion = null);
+	string? ElevatorVersion = null,
+	int ElevatorUptimeSeconds = 0, int ElevatorIdleSeconds = 0);
 
 /// <summary>
 /// Temporarily clears the HANDLE_FLAG_INHERIT bit on the process's standard handles
