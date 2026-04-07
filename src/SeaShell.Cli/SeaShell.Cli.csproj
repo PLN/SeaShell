@@ -1,0 +1,22 @@
+<Project Sdk="Microsoft.NET.Sdk">
+	<PropertyGroup>
+		<OutputType>Exe</OutputType>
+		<AssemblyName>sea</AssemblyName>
+		<PackageId>SeaShell</PackageId>
+		<PackAsTool>true</PackAsTool>
+		<ToolCommandName>sea</ToolCommandName>
+		<Description>C# and VB.NET scripting engine with persistent daemon, NuGet support, hot-swap, REPL, and elevation.</Description>
+		<PackageTags>scripting;seashell;csharp;vb;roslyn;repl;cli</PackageTags>
+		<PackageReadmeFile>README.md</PackageReadmeFile>
+	</PropertyGroup>
+	<ItemGroup>
+		<None Include="..\..\README.md" Pack="true" PackagePath="/" />
+	</ItemGroup>
+	<ItemGroup>
+		<ProjectReference Include="..\SeaShell.Protocol\SeaShell.Protocol.csproj" />
+		<!-- Daemon and Elevator are bundled so the tool package is self-contained.
+		     The CLI finds them next to itself via AppContext.BaseDirectory. -->
+		<ProjectReference Include="..\SeaShell.Daemon\SeaShell.Daemon.csproj" />
+		<ProjectReference Include="..\SeaShell.Elevator\SeaShell.Elevator.csproj" />
+	</ItemGroup>
+</Project>
