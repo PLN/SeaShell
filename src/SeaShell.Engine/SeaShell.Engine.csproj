@@ -4,7 +4,11 @@
 		<PackageTags>scripting;seashell;roslyn;compiler;nuget;engine</PackageTags>
 		<GenerateDocumentationFile>true</GenerateDocumentationFile>
 		<NoWarn>CS1591</NoWarn>
+		<PackageReadmeFile>README.md</PackageReadmeFile>
 	</PropertyGroup>
+	<ItemGroup>
+		<None Include="README.md" Pack="true" PackagePath="/" />
+	</ItemGroup>
 	<ItemGroup>
 		<PackageReference Include="Microsoft.CodeAnalysis.CSharp" Version="5.3.0" />
 		<PackageReference Include="Microsoft.CodeAnalysis.VisualBasic" Version="5.3.0" />

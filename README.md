@@ -1,4 +1,6 @@
-# SeaShell
+# {~} SeaShell
+
+[![CI](https://github.com/PLN/SeaShell/actions/workflows/ci.yml/badge.svg)](https://github.com/PLN/SeaShell/actions/workflows/ci.yml)
 
 A C# and VB.NET scripting engine with a persistent daemon, NuGet support, hot-swap, REPL, and an embeddable host library. Built on Roslyn.
 
@@ -15,6 +17,7 @@ sea                             Interactive REPL
 sea script.cs                   Run a C# script
 sea script.vb                   Run a VB.NET script
 sea -i Humanizer.Core           REPL with NuGet packages preloaded
+sea --associate .cs             Associate .cs files with SeaShell
 ```
 
 NuGet packages are resolved automatically — including transitive dependencies and runtime-specific DLLs. Missing packages are downloaded on first use.
@@ -111,6 +114,12 @@ Sea.SetReloadState(bytes)       // Pass state to next instance
 Sea.SetReloadState(string)      // String convenience overload
 Sea.GetReloadState()            // Retrieve state from previous instance
 Sea.GetReloadStateString()      // String convenience overload
+
+// Host↔Script messaging (when running via ScriptHost)
+Sea.MessageReceived             // Event: Host sent a message (byte[] payload, string? topic)
+Sea.SendMessage(bytes, topic)   // Send binary message to Host
+Sea.SendMessage(string, topic)  // Send string message to Host (UTF-8)
+Sea.SendMessageAsync(...)       // Async variants
 ```
 
 ## Hot-Swap Example
@@ -160,6 +169,28 @@ await updater.CheckForUpdatesAsync();
 
 `Sea.IsConsoleEphemeral` is always `false` when running via Host. `Sea.ExitDelay` has no effect — the Host does not perform exit delays.
 
+### Host↔Script Messaging
+
+The Host and script can exchange binary messages during execution over the existing pipe:
+
+```csharp
+var conn = new ScriptHost.ScriptConnection();
+conn.MessageReceived += (payload, topic) =>
+    Console.WriteLine($"Script [{topic}]: {Encoding.UTF8.GetString(payload)}");
+
+var result = await host.RunAsync("script.cs", connection: conn);
+```
+
+Script side:
+```csharp
+Sea.MessageReceived += (payload, topic) =>
+    Sea.SendMessage("acknowledged", "reply");
+
+Sea.SendMessage("{\"status\":\"ready\"}", "status");
+```
+
+Messages are binary (`byte[]`) with an optional `string` topic for routing. String convenience overloads encode as UTF-8.
+
 ## Task Scheduler (Windows)
 
 Register the daemon and optionally the elevator for automatic startup. Each is a separate, explicit registration:
@@ -179,14 +210,32 @@ The daemon starts automatically on first `sea` invocation even without Task Sche
 ## Project Structure
 
 ```
-SeaShell.Engine    Roslyn compiler, NuGet resolver, include system, file watcher, updater
-SeaShell.Script    Sea runtime context (loaded into every script process)
-SeaShell.Protocol  IPC messages + cross-platform transport (named pipes / UDS)
+SeaShell.Cli       CLI (sea.exe) — argument parsing, script execution, exit delay
 SeaShell.Daemon    Persistent compilation server, REPL host, file watcher
 SeaShell.Elevator  Pre-elevated worker (connects to daemon, no public pipe)
-SeaShell.Cli       CLI (sea.exe)
+SeaShell.Engine    Roslyn compiler, NuGet resolver, include system, .deps.json writer
+SeaShell.Script    Sea runtime context (loaded into every script process)
+SeaShell.Ipc       Binary IPC: MessageChannel (MessagePack over System.IO.Pipelines)
+SeaShell.Protocol  Daemon/Elevator protocol messages + transport (named pipes / UDS)
 SeaShell.Host      Embeddable library for other applications
 ```
+
+See [doc/ARCHITECTURE.md](doc/ARCHITECTURE.md) for the full architecture,
+[doc/SECURITY.md](doc/SECURITY.md) for the security model, and
+[doc/HISTORY.md](doc/HISTORY.md) for the changelog.
+
+## File Association (Windows)
+
+Register `.cs` files to open with SeaShell when double-clicked:
+
+```
+sea --associate              Associate .cs (default)
+sea --associate .vb          Associate .vb
+sea --unassociate .cs        Remove association
+```
+
+Per-user registration via HKCU — no elevation needed. The SeaShell icon appears on
+associated files in Explorer.
 
 ## Building
 
@@ -277,6 +326,12 @@ The Engine uses Serilog with `Log.ForContext<T>()` per class. The daemon configu
 - **Dev mode**: Console sink (Debug+) — enabled with `--console` flag or `SEASHELL_CONSOLE_LOG=1`
 
 The Host inherits Serilog from the Engine. The caller configures `Log.Logger` before creating `ScriptHost`. If unconfigured, all log output is silently dropped.
+
+## Documentation
+
+- [ARCHITECTURE.md](doc/ARCHITECTURE.md) — Component diagram, IPC layers, compilation pipeline, execution paths
+- [SECURITY.md](doc/SECURITY.md) — Threat model, IPC access control, elevation security
+- [HISTORY.md](doc/HISTORY.md) — Changelog
 
 ## License
 

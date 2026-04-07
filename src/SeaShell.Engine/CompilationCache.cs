@@ -19,8 +19,8 @@ static class CompilationCache
 
 	private static string ComputeEngineFingerprint()
 	{
-		// Include both Engine and Script assembly timestamps.
-		// Either one changing should invalidate all cached compilations.
+		// Include Engine, Script, and Ipc assembly timestamps.
+		// Any one changing should invalidate all cached compilations.
 		var ticks = 0L;
 		try
 		{
@@ -28,11 +28,12 @@ static class CompilationCache
 			if (!string.IsNullOrEmpty(engineDll) && File.Exists(engineDll))
 				ticks += File.GetLastWriteTimeUtc(engineDll).Ticks;
 
-			// SeaShell.Script.dll — lives next to the engine in daemon mode,
-			// or in the same output dir for Host
-			var scriptDll = Path.Combine(AppContext.BaseDirectory, "SeaShell.Script.dll");
-			if (File.Exists(scriptDll))
-				ticks += File.GetLastWriteTimeUtc(scriptDll).Ticks;
+			foreach (var name in new[] { "SeaShell.Script.dll", "SeaShell.Ipc.dll", "MessagePack.dll" })
+			{
+				var path = Path.Combine(AppContext.BaseDirectory, name);
+				if (File.Exists(path))
+					ticks += File.GetLastWriteTimeUtc(path).Ticks;
+			}
 		}
 		catch { }
 		return ticks.ToString();

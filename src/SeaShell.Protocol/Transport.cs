@@ -1,5 +1,4 @@
 using System;
-using System.Buffers.Binary;
 using System.IO;
 using System.IO.Pipes;
 using System.Net.Sockets;
@@ -9,6 +8,8 @@ using System.Security.Principal;
 using System.Threading;
 using System.Threading.Tasks;
 
+using SeaShell.Ipc;
+
 namespace SeaShell.Protocol;
 
 // ── Abstract transport ──────────────────────────────────────────────────
@@ -16,60 +17,24 @@ namespace SeaShell.Protocol;
 /// <summary>
 /// A connected bidirectional stream between CLI and daemon.
 /// Wraps either a NamedPipeStream (Windows) or a UnixDomainSocket (Linux).
+/// Exposes a <see cref="MessageChannel"/> for binary message framing.
 /// </summary>
 public sealed class TransportStream : IAsyncDisposable
 {
-	private readonly Stream _stream;
 	private readonly IDisposable? _owner; // socket or pipe that owns the stream
+
+	/// <summary>Binary message channel over this transport.</summary>
+	public MessageChannel Channel { get; }
 
 	internal TransportStream(Stream stream, IDisposable? owner = null)
 	{
-		_stream = stream;
 		_owner = owner;
-	}
-
-	/// <summary>Send a length-prefixed message.</summary>
-	public async Task SendAsync(byte[] data, CancellationToken ct = default)
-	{
-		var header = new byte[4];
-		BinaryPrimitives.WriteUInt32LittleEndian(header, (uint)data.Length);
-		await _stream.WriteAsync(header, ct);
-		await _stream.WriteAsync(data, ct);
-		await _stream.FlushAsync(ct);
-	}
-
-	/// <summary>Receive a length-prefixed message. Returns null on clean disconnect.</summary>
-	public async Task<byte[]?> ReceiveAsync(CancellationToken ct = default)
-	{
-		var header = new byte[4];
-		var read = await ReadExactAsync(header, ct);
-		if (read == 0) return null; // peer disconnected
-
-		var length = BinaryPrimitives.ReadUInt32LittleEndian(header);
-		if (length == 0) return Array.Empty<byte>();
-		if (length > 4 * 1024 * 1024) // 4 MB sanity limit
-			throw new InvalidOperationException($"Message too large: {length} bytes");
-
-		var body = new byte[length];
-		await ReadExactAsync(body, ct);
-		return body;
-	}
-
-	private async Task<int> ReadExactAsync(byte[] buffer, CancellationToken ct)
-	{
-		int offset = 0;
-		while (offset < buffer.Length)
-		{
-			var n = await _stream.ReadAsync(buffer.AsMemory(offset), ct);
-			if (n == 0) return offset; // EOF
-			offset += n;
-		}
-		return offset;
+		Channel = new MessageChannel(stream, leaveOpen: false);
 	}
 
 	public async ValueTask DisposeAsync()
 	{
-		await _stream.DisposeAsync();
+		await Channel.DisposeAsync();
 		_owner?.Dispose();
 	}
 }
@@ -248,9 +213,8 @@ public static class TransportClient
 		try
 		{
 			await using var conn = await ConnectAsync(address, timeoutMs: 1000, ct);
-			var ping = Envelope.Wrap(new PingRequest()).ToBytes();
-			await conn.SendAsync(ping, ct);
-			var reply = await conn.ReceiveAsync(ct);
+			await conn.Channel.SendAsync(new PingRequest(), ct);
+			var reply = await conn.Channel.ReceiveAsync(ct);
 			return reply != null;
 		}
 		catch

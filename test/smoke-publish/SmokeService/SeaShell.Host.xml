@@ -1,0 +1,89 @@
+<?xml version="1.0"?>
+<doc>
+    <assembly>
+        <name>SeaShell.Host</name>
+    </assembly>
+    <members>
+        <member name="T:SeaShell.Host.ScriptHost">
+             <summary>
+             Embeddable C# scripting host. Compiles and runs scripts without requiring
+             the SeaShell daemon. Use this to add scripting to your application.
+            
+             Usage:
+               var host = new ScriptHost();
+               var result = await host.RunAsync("path/to/script.cs");
+               Console.WriteLine($"Exit: {result.ExitCode}, Output: {result.StandardOutput}");
+            
+             Or compile and inspect without running:
+               var compiled = host.Compile("path/to/script.cs");
+               // compiled.AssemblyPath, compiled.DepsJsonPath, etc.
+            
+             Or run a code snippet directly:
+               var result = await host.RunSnippetAsync("Console.WriteLine(42);");
+             </summary>
+        </member>
+        <member name="M:SeaShell.Host.ScriptHost.Compile(System.String,System.String[])">
+            <summary>
+            Compile a script file. Returns the compiled artifacts (DLL, runtimeconfig, deps.json, manifest).
+            Does not run the script.
+            </summary>
+        </member>
+        <member name="M:SeaShell.Host.ScriptHost.RunAsync(System.String,System.String[],System.String,System.Collections.Generic.Dictionary{System.String,System.String},SeaShell.Host.ScriptHost.ScriptConnection,System.Threading.CancellationToken)">
+            <summary>
+            Compile and run a script file. Captures stdout/stderr.
+            </summary>
+        </member>
+        <member name="M:SeaShell.Host.ScriptHost.RunSnippetAsync(System.String,System.String[],System.String,System.Collections.Generic.Dictionary{System.String,System.String},SeaShell.Host.ScriptHost.ScriptConnection,System.Threading.CancellationToken)">
+            <summary>
+            Compile and run a code snippet. Wraps it in a minimal script file.
+            </summary>
+        </member>
+        <member name="M:SeaShell.Host.ScriptHost.ExecuteAsync(SeaShell.Engine.ScriptCompiler.CompileResult,System.String[],System.String,System.Collections.Generic.Dictionary{System.String,System.String},SeaShell.Host.ScriptHost.ScriptConnection,System.Threading.CancellationToken)">
+            <summary>
+            Run an already-compiled script. Use this when you want to compile once
+            and run multiple times, or when you need to inspect the compilation result.
+            Supports script-initiated reload and watch mode (file-change hot-swap).
+            </summary>
+        </member>
+        <member name="M:SeaShell.Host.ScriptHost.RunOneInstanceAsync(SeaShell.Engine.ScriptCompiler.CompileResult,System.String[],System.String,System.Collections.Generic.Dictionary{System.String,System.String},SeaShell.Host.ScriptHost.ScriptConnection,System.Int32,System.String,System.Boolean,System.Threading.CancellationToken)">
+            <summary>Run a single instance, returning when it exits or requests reload.</summary>
+        </member>
+        <member name="P:SeaShell.Host.ScriptHost.NuGet">
+            <summary>Access the NuGet resolver for pre-downloading packages.</summary>
+        </member>
+        <member name="M:SeaShell.Host.ScriptHost.CreateUpdater">
+             <summary>
+             Check all cached NuGet packages for updates and download new versions.
+             Call this on whatever timer suits your application (e.g., every 8 hours).
+            
+             Usage:
+               var updater = host.CreateUpdater();
+               updater.Log += msg => logger.Info(msg);
+               var result = await updater.CheckForUpdatesAsync();
+             </summary>
+        </member>
+        <member name="T:SeaShell.Host.ScriptHost.ScriptConnection">
+            <summary>
+            Bidirectional application messaging between Host and Script.
+            Create an instance, subscribe to MessageReceived, and pass it to
+            ExecuteAsync/RunAsync/RunSnippetAsync.
+            </summary>
+        </member>
+        <member name="E:SeaShell.Host.ScriptHost.ScriptConnection.MessageReceived">
+            <summary>
+            Fires when the script sends an application message.
+            Parameters: payload (raw bytes), topic (optional routing key).
+            Called on the channel-drain thread.
+            </summary>
+        </member>
+        <member name="M:SeaShell.Host.ScriptHost.ScriptConnection.SendAsync(System.Byte[],System.String,System.Threading.CancellationToken)">
+            <summary>Send a binary message to the running script.</summary>
+        </member>
+        <member name="M:SeaShell.Host.ScriptHost.ScriptConnection.SendAsync(System.String,System.String,System.Threading.CancellationToken)">
+            <summary>Send a string message (UTF-8) to the running script.</summary>
+        </member>
+        <member name="M:SeaShell.Host.ScriptHost.ScriptConnection.StopAsync(System.Threading.CancellationToken)">
+            <summary>Send a ScriptStop message to gracefully shut down the script.</summary>
+        </member>
+    </members>
+</doc>

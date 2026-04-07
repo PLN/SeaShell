@@ -26,10 +26,33 @@ public static class DepsJsonWriter
 		// Build targets entries
 		var targets = new Dictionary<string, object>();
 
-		// SeaShell.Script runtime library — listed as a project dep so dotnet exec
-		// finds it in the app directory (next to the compiled script DLL)
+		// SeaShell runtime libraries — listed as project deps so dotnet exec
+		// finds them in the app directory (next to the compiled script DLL)
+		targets["MessagePack/1.0.0"] = new
+		{
+			runtime = new Dictionary<string, object>
+			{
+				["MessagePack.dll"] = new { },
+				["MessagePack.Annotations.dll"] = new { }
+			}
+		};
+		targets["SeaShell.Ipc/1.0.0"] = new
+		{
+			dependencies = new Dictionary<string, string>
+			{
+				["MessagePack"] = "1.0.0"
+			},
+			runtime = new Dictionary<string, object>
+			{
+				["SeaShell.Ipc.dll"] = new { }
+			}
+		};
 		targets["SeaShell.Script/1.0.0"] = new
 		{
+			dependencies = new Dictionary<string, string>
+			{
+				["SeaShell.Ipc"] = "1.0.0"
+			},
 			runtime = new Dictionary<string, object>
 			{
 				["SeaShell.Script.dll"] = new { }
@@ -62,6 +85,20 @@ public static class DepsJsonWriter
 
 		// Build libraries entries
 		var libraries = new Dictionary<string, object>();
+
+		libraries["MessagePack/1.0.0"] = new
+		{
+			type = "project",
+			serviceable = false,
+			sha512 = ""
+		};
+
+		libraries["SeaShell.Ipc/1.0.0"] = new
+		{
+			type = "project",
+			serviceable = false,
+			sha512 = ""
+		};
 
 		libraries["SeaShell.Script/1.0.0"] = new
 		{

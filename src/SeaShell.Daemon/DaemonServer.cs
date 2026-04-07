@@ -3,6 +3,7 @@ using System.IO;
 using System.Threading;
 using System.Threading.Tasks;
 using Serilog;
+using SeaShell.Ipc;
 using SeaShell.Protocol;
 using SeaShell.Engine;
 
@@ -67,35 +68,34 @@ public sealed class DaemonServer : IAsyncDisposable
 	{
 		try
 		{
-			var bytes = await conn.ReceiveAsync(ct);
-			if (bytes == null) { await conn.DisposeAsync(); return; }
+			var result = await conn.Channel.ReceiveAsync(ct);
+			if (result == null) { await conn.DisposeAsync(); return; }
 
-			var envelope = Envelope.FromBytes(bytes);
+			var (type, message) = result.Value;
 
 			// Elevator registration — hold this connection, don't dispose it
-			if (envelope.Type == nameof(ElevatorHello))
+			if (type == MessageType.ElevatorHello)
 			{
-				await HandleElevatorHello(conn, envelope.Unwrap<ElevatorHello>(), ct);
+				await HandleElevatorHello(conn, (ElevatorHello)message, ct);
 				return; // connection stays open
 			}
 
 			// REPL session — hold this connection for the session lifetime
-			if (envelope.Type == nameof(ReplStartRequest))
+			if (type == MessageType.ReplStartReq)
 			{
-				await HandleReplSession(conn, envelope.Unwrap<ReplStartRequest>(), ct);
+				await HandleReplSession(conn, (ReplStartRequest)message, ct);
 				return; // connection stays open until REPL ends
 			}
 
 			// Run request — may become a persistent watch connection
-			if (envelope.Type == nameof(RunRequest))
+			if (type == MessageType.RunRequest)
 			{
-				var runReq = envelope.Unwrap<RunRequest>();
-				var response = await HandleRunAsync(runReq);
-				await conn.SendAsync(response.ToBytes(), ct);
+				var runReq = (RunRequest)message;
+				var response = HandleRun(runReq);
+				await conn.Channel.SendAsync(response, ct);
 
 				// If watch mode, keep connection open and push HotSwapNotify on changes
-				var runResp = response.Unwrap<RunResponse>();
-				if (runResp.Success && runResp.Watch)
+				if (response.Success && response.Watch)
 				{
 					await HandleWatchMode(conn, runReq, ct);
 					return; // connection stays open
@@ -108,25 +108,30 @@ public sealed class DaemonServer : IAsyncDisposable
 			// Simple request-response — dispose connection when done
 			await using (conn)
 			{
-				Envelope response;
-				if (envelope.Type == nameof(SpawnRequest))
+				switch (type)
 				{
-					// CLI asking us to forward to the Elevator
-					var spawnResp = await SpawnElevatedAsync(envelope.Unwrap<SpawnRequest>(), ct);
-					response = Envelope.Wrap(spawnResp);
-				}
-				else
-				{
-					response = envelope.Type switch
-					{
-						nameof(PingRequest) => HandlePing(),
-						nameof(StopRequest) => HandleStop(),
-						_ => Envelope.Wrap(new RunResponse(false, false, false, null, null, null, null, 0,
-							$"Unknown message type: {envelope.Type}"))
-					};
-				}
+					case MessageType.SpawnRequest:
+						var spawnResp = await SpawnElevatedAsync((SpawnRequest)message, ct);
+						await conn.Channel.SendAsync(spawnResp, ct);
+						break;
 
-				await conn.SendAsync(response.ToBytes(), ct);
+					case MessageType.PingRequest:
+						await conn.Channel.SendAsync(MakePingResponse(), ct);
+						break;
+
+					case MessageType.StopRequest:
+						_log.Information("Stop requested");
+						Environment.SetEnvironmentVariable("SEASHELL_STOP", "1");
+						await conn.Channel.SendAsync(MakePingResponse(), ct);
+						break;
+
+					default:
+						_log.Warning("Unknown message type: {Type}", type);
+						await conn.Channel.SendAsync(
+							new RunResponse(false, false, false, null, null, null, null, 0,
+								$"Unknown message type: {type}"), ct);
+						break;
+				}
 			}
 		}
 		catch (Exception ex)
@@ -159,8 +164,7 @@ public sealed class DaemonServer : IAsyncDisposable
 
 		_log.Information("Elevator connected (elevated={IsElevated})", hello.IsElevated);
 
-		var ack = Envelope.Wrap(new ElevatorAck(true, null));
-		await conn.SendAsync(ack.ToBytes(), ct);
+		await conn.Channel.SendAsync(new ElevatorAck(true, null), ct);
 
 		// The connection stays open. The Elevator sits in a receive loop
 		// on its end, waiting for SpawnRequests from us.
@@ -251,7 +255,7 @@ public sealed class DaemonServer : IAsyncDisposable
 
 				try
 				{
-					await conn.SendAsync(Envelope.Wrap(notify).ToBytes(), ct);
+					await conn.Channel.SendAsync(notify, ct);
 					_log.Debug("Hot-swap notify sent");
 				}
 				catch
@@ -274,22 +278,21 @@ public sealed class DaemonServer : IAsyncDisposable
 		var session = new ReplSession(_compiler.NuGetResolver, request.NuGetPackages);
 
 		// Send ready response
-		await conn.SendAsync(Envelope.Wrap(new ReplStartResponse(true, null)).ToBytes(), ct);
+		await conn.Channel.SendAsync(new ReplStartResponse(true, null), ct);
 
 		// Eval loop — read requests, evaluate, send responses
 		await using (conn)
 		{
 			while (!ct.IsCancellationRequested)
 			{
-				var bytes = await conn.ReceiveAsync(ct);
-				if (bytes == null) break; // client disconnected
+				var msg = await conn.Channel.ReceiveAsync(ct);
+				if (msg == null) break; // client disconnected
 
-				var envelope = Envelope.FromBytes(bytes);
-				if (envelope.Type == nameof(ReplEvalRequest))
+				if (msg.Value.Type == MessageType.ReplEvalReq)
 				{
-					var evalReq = envelope.Unwrap<ReplEvalRequest>();
-					var result = await session.EvalAsync(evalReq.Code);
-					await conn.SendAsync(Envelope.Wrap(result).ToBytes(), ct);
+					var evalReq = (ReplEvalRequest)msg.Value.Message;
+					var evalResult = await session.EvalAsync(evalReq.Code);
+					await conn.Channel.SendAsync(evalResult, ct);
 				}
 				else
 				{
@@ -303,31 +306,27 @@ public sealed class DaemonServer : IAsyncDisposable
 
 	// ── Request handlers ────────────────────────────────────────────────
 
-	private Envelope HandlePing()
+	private PingResponse MakePingResponse()
 	{
 		var uptime = (int)(DateTime.UtcNow - _startTime).TotalSeconds;
-		return Envelope.Wrap(new PingResponse(Version, false, _elevator != null, uptime, 0));
+		return new PingResponse(Version, false, _elevator != null, uptime, 0);
 	}
 
-	private async Task<Envelope> HandleRunAsync(RunRequest request)
+	private RunResponse HandleRun(RunRequest request)
 	{
 		_log.Information("Run request: {ScriptPath}", request.ScriptPath);
 
 		var result = _compiler.Compile(request.ScriptPath, request.Args);
 		if (!result.Success)
-			return Envelope.Wrap(new RunResponse(false, false, false, null, null, null, null, 0, result.Error));
+			return new RunResponse(false, false, false, null, null, null, null, 0, result.Error);
 
-		// If the script needs elevation, forward to the Elevator
-		// Always return artifacts — CLI decides how to spawn.
-		// If //sea_elevate, Elevated flag is set so CLI can handle it
-		// (spawn directly if already elevated, use Elevator if available, or error).
-		return Envelope.Wrap(new RunResponse(
+		return new RunResponse(
 			true, result.Elevate, result.Watch,
 			result.AssemblyPath,
 			result.DepsJsonPath,
 			result.RuntimeConfigPath,
 			result.ManifestPath,
-			0, null));
+			0, null);
 	}
 
 	/// <summary>
@@ -352,15 +351,15 @@ public sealed class DaemonServer : IAsyncDisposable
 
 		try
 		{
-			await elevator.SendAsync(Envelope.Wrap(request).ToBytes(), ct);
-			var replyBytes = await elevator.ReceiveAsync(ct);
-			if (replyBytes == null)
+			await elevator.Channel.SendAsync(request, ct);
+			var reply = await elevator.Channel.ReceiveAsync(ct);
+			if (reply == null)
 			{
 				// Elevator disconnected
 				await DetachElevator();
 				return new SpawnResponse(false, 0, "Elevator disconnected during spawn");
 			}
-			return Envelope.FromBytes(replyBytes).Unwrap<SpawnResponse>();
+			return (SpawnResponse)reply.Value.Message;
 		}
 		catch (Exception ex)
 		{
@@ -385,13 +384,6 @@ public sealed class DaemonServer : IAsyncDisposable
 		{
 			_elevatorLock.Release();
 		}
-	}
-
-	private Envelope HandleStop()
-	{
-		_log.Information("Stop requested");
-		Environment.SetEnvironmentVariable("SEASHELL_STOP", "1");
-		return Envelope.Wrap(new PingResponse(Version, false, _elevator != null, 0, 0));
 	}
 
 	public async ValueTask DisposeAsync()

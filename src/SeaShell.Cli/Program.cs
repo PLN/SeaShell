@@ -1,5 +1,6 @@
 using System;
 using System.IO;
+using SeaShell.Ipc;
 using SeaShell.Protocol;
 using SeaShell.Cli;
 
@@ -7,6 +8,10 @@ using SeaShell.Cli;
 
 if (args.Length > 0 && args[0] is "--help" or "-h")
 {
+	var version = typeof(Program).Assembly.GetName().Version?.ToString(3) ?? "0.1.0";
+	Console.WriteLine($"{{~}} SeaShell v{version}");
+	Console.WriteLine("Copyright (c) PLN. MIT License.");
+	Console.WriteLine();
 	Console.WriteLine("Usage: sea                      Interactive REPL");
 	Console.WriteLine("       sea <script.cs> [args...] Run a script");
 	Console.WriteLine("       sea -i [packages...]      REPL with NuGet packages");
@@ -20,6 +25,10 @@ if (args.Length > 0 && args[0] is "--help" or "-h")
 	Console.WriteLine("  --uninstall-elevator  Remove elevator task");
 	Console.WriteLine("  --start               Start registered tasks");
 	Console.WriteLine("  --stop                Stop registered tasks");
+	Console.WriteLine();
+	Console.WriteLine("  File association (Windows):");
+	Console.WriteLine("  --associate [.ext]    Associate extension with sea (default: .cs)");
+	Console.WriteLine("  --unassociate [.ext]  Remove association");
 	Console.WriteLine();
 	Console.WriteLine("  Dev/debug:");
 	Console.WriteLine("  --daemon-start        Start daemon directly");
@@ -36,8 +45,8 @@ if (args.Length == 0)
 switch (args[0])
 {
 	case "--version" or "-v":
-		var ver = typeof(Envelope).Assembly.GetName().Version;
-		Console.WriteLine($"SeaShell {ver?.ToString(3) ?? "0.1.0"}");
+		var ver = typeof(Program).Assembly.GetName().Version?.ToString(3) ?? "0.1.0";
+		Console.WriteLine($"{{~}} SeaShell v{ver}");
 		return 0;
 	case "-i" or "--repl":
 		var replPackages = args.Length > 1 ? args[1..] : Array.Empty<string>();
@@ -60,6 +69,12 @@ switch (args[0])
 		return ScheduledTasks.UninstallDaemon();
 	case "--uninstall-elevator":
 		return ScheduledTasks.UninstallElevator();
+	case "--associate":
+		var ext = args.Length > 1 ? args[1] : ".cs";
+		return FileAssoc.Associate(ext);
+	case "--unassociate":
+		var uext = args.Length > 1 ? args[1] : ".cs";
+		return FileAssoc.Unassociate(uext);
 }
 
 // ── Run script ──────────────────────────────────────────────────────────

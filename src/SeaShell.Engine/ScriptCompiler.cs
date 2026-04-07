@@ -140,6 +140,13 @@ public sealed class ScriptCompiler
 				global using System.Threading.Tasks;
 				global using SeaShell;
 				[assembly: System.Reflection.AssemblyDescription(@"{{scriptPath.Replace("\"", "\"\"")}}")]
+				// Force Sea initialization — the script assembly is always loaded first,
+				// so this module initializer is guaranteed to run before Main.
+				static class _SeaShellBoot
+				{
+					[System.Runtime.CompilerServices.ModuleInitializer]
+					internal static void Init() => Sea.EnsureInitialized();
+				}
 				""";
 			trees.Add(CSharpSyntaxTree.ParseText(metaSource, parseOpts, path: "_SeaShellMeta.cs"));
 		}
@@ -151,9 +158,17 @@ public sealed class ScriptCompiler
 			foreach (var (path, source) in resolved.Sources)
 				trees.Add(VB.VisualBasicSyntaxTree.ParseText(source, parseOpts, path: path));
 
-			// AssemblyDescription for Mother.cs compat
+			// AssemblyDescription for Mother.cs compat + boot initializer
 			var escapedPath = scriptPath.Replace("\"", "\"\"");
-			var metaSource = "<Assembly: System.Reflection.AssemblyDescription(\"" + escapedPath + "\")>";
+			var metaSource = $"""
+				<Assembly: System.Reflection.AssemblyDescription("{escapedPath}")>
+				Friend Module _SeaShellBoot
+					<System.Runtime.CompilerServices.ModuleInitializer>
+					Friend Sub Init()
+						Sea.EnsureInitialized()
+					End Sub
+				End Module
+				""";
 			trees.Add(VB.VisualBasicSyntaxTree.ParseText(metaSource, parseOpts, path: "_SeaShellMeta.vb"));
 		}
 
@@ -220,19 +235,28 @@ public sealed class ScriptCompiler
 		_log.Information("Compiled {ScriptName} ({Size} bytes)", scriptName, ms.Length);
 
 		// ── Write artifacts ─────────────────────────────────────────────
+		// In watch mode, a previous compilation's output dir may still be in use
+		// by the running script process. Skip files that already exist (hash
+		// guarantees they're identical) or are locked.
 		Directory.CreateDirectory(outputDir);
 
-		File.WriteAllBytes(dllPath, ms.ToArray());
-		ArtifactWriter.WriteRuntimeConfig(runtimeConfigPath, resolved.Directives.WebApp);
+		WriteIfMissing(dllPath, ms.ToArray());
 
-		// Write .deps.json — always include SeaShell.Script, plus NuGet packages
+		if (!File.Exists(runtimeConfigPath))
+			ArtifactWriter.WriteRuntimeConfig(runtimeConfigPath, resolved.Directives.WebApp);
+
 		var depsPath = Path.Combine(outputDir, $"{scriptName}.deps.json");
-		DepsJsonWriter.Write(depsPath, assemblyName, resolvedPackages);
+		if (!File.Exists(depsPath))
+			DepsJsonWriter.Write(depsPath, assemblyName, resolvedPackages);
 
-		// Copy SeaShell.Script.dll to output dir (for runtime loading)
-		var scriptDllDest = Path.Combine(outputDir, "SeaShell.Script.dll");
-		if (File.Exists(_scriptAssemblyPath) && !File.Exists(scriptDllDest))
-			File.Copy(_scriptAssemblyPath, scriptDllDest);
+		// Copy SeaShell runtime DLLs to output dir (for runtime loading)
+		foreach (var dllName in new[] { "SeaShell.Script.dll", "SeaShell.Ipc.dll", "MessagePack.dll", "MessagePack.Annotations.dll" })
+		{
+			var src = Path.Combine(AppContext.BaseDirectory, dllName);
+			var dest = Path.Combine(outputDir, dllName);
+			if (File.Exists(src) && !File.Exists(dest))
+				File.Copy(src, dest);
+		}
 
 		// Write manifest — all the metadata the Sea class needs at runtime
 		var manifestPath = Path.Combine(outputDir, $"{scriptName}.sea.json");
@@ -248,6 +272,13 @@ public sealed class ScriptCompiler
 			DepsJsonPath = depsPath,
 			ManifestPath = manifestPath,
 		};
+	}
+
+	private static void WriteIfMissing(string path, byte[] data)
+	{
+		if (File.Exists(path)) return; // hash guarantees identical content
+		try { File.WriteAllBytes(path, data); }
+		catch (IOException) { } // file may be locked by a running script process
 	}
 
 	// ── References ──────────────────────────────────────────────────────
@@ -311,11 +342,19 @@ public sealed class ScriptCompiler
 			}
 		}
 
-		// SeaShell.Script runtime library — provides the Sea static class
-		if (File.Exists(scriptAssemblyPath))
+		// SeaShell runtime libraries — Sea static class + IPC messaging + MessagePack
+		foreach (var name in new[] {
+			scriptAssemblyPath,
+			Path.Combine(AppContext.BaseDirectory, "SeaShell.Ipc.dll"),
+			Path.Combine(AppContext.BaseDirectory, "MessagePack.dll"),
+			Path.Combine(AppContext.BaseDirectory, "MessagePack.Annotations.dll"),
+		})
 		{
-			var bytes = File.ReadAllBytes(scriptAssemblyPath);
-			refs.Add(MetadataReference.CreateFromImage(bytes, filePath: scriptAssemblyPath));
+			if (File.Exists(name))
+			{
+				var bytes = File.ReadAllBytes(name);
+				refs.Add(MetadataReference.CreateFromImage(bytes, filePath: name));
+			}
 		}
 
 		return refs;
