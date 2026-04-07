@@ -17,6 +17,8 @@ var artifacts = Environment.GetEnvironmentVariable("PIPELINE_ARTIFACTS") ?? "";
 var logs = Environment.GetEnvironmentVariable("PIPELINE_LOGS") ?? "";
 var commonDir = Environment.GetEnvironmentVariable("PIPELINE_COMMON") ?? "";
 var host = Environment.GetEnvironmentVariable("PIPELINE_HOST") ?? "win-x64";
+var runCounter = Environment.GetEnvironmentVariable("PIPELINE_RUN") ?? "0";
+var versionArg = $"-p:BuildNumber={runCounter}";
 
 Console.WriteLine($"[package] ENV PIPELINE_SRC={src}");
 Console.WriteLine($"[package] ENV PIPELINE_ARTIFACTS={artifacts}");
@@ -50,7 +52,7 @@ Console.WriteLine($"[package] Linux artifacts: {Directory.GetFiles(linuxArtifact
 
 // ── Pack ──────────────────────────────────────────────────────────────
 
-var packCode = DiagnosticsExt.RunProcess("dotnet", $"pack -c Release -o \"{nupkgDir}\"", src,
+var packCode = DiagnosticsExt.RunProcess("dotnet", $"pack -c Release -o \"{nupkgDir}\" {versionArg}", src,
 	logFile: Path.Combine(logs, "pack.log"), prefix: "package");
 if (packCode != 0)
 {

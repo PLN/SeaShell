@@ -1,5 +1,63 @@
 # History
 
+## v0.1.12 (2026-03-24)
+
+**Bundled DLL resolution fix, engine dir probing, unit test suite.**
+
+- **Engine dir in probing paths** — `ArtifactWriter.WriteRuntimeConfig` now includes
+  the engine binary directory in `additionalProbingPaths`. Script subprocesses can find
+  bundled DLLs (MessagePack, SeaShell.Ipc, SeaShell.Script) via the host's directory as
+  a fallback when the copy to the output dir is skipped or fails. Fixes assembly
+  resolution failures in host-embedded scenarios (e.g., csasvc bridge scripts).
+- **Dynamic bundled DLL versions** — `DepsJsonWriter` reads actual assembly versions from
+  the bundled DLLs via `AssemblyName.GetAssemblyName()` instead of hardcoding `"1.0.0"`.
+  The old hardcoded versions caused the .NET host to fail resolving MessagePack from the
+  NuGet cache.
+- **DirectiveParser unit tests** — 42 tests covering whitespace, comments containing
+  directives (the CS-Script bug), scanning boundaries, NuGet variants, VB support.
+- **DepsJsonWriter + ArtifactWriter unit tests** — Verify bundled entries use correct
+  versions, runtimeconfig includes engine dir and NuGet cache in probing paths.
+- **Host-resolution integration test** — End-to-end test in the pipeline: ScriptHost
+  compiles and runs a script that verifies MessagePack.dll and SeaShell.Script.dll
+  resolve correctly. Catches the exact class of bug that hit CSA.
+- **Build attestation** — CI workflow attests all `.nupkg` files with
+  `actions/attest-build-provenance` (Sigstore + SLSA provenance). Consumers verify with
+  `gh attestation verify <file> --repo PLN/SeaShell`.
+- **Conditional NuGet push** — Prerelease tags (e.g., `v0.1.12-rc1`) run the full CI
+  pipeline but skip the nuget.org push. Clean version tags push as before.
+- **InternalsVisibleTo** — Engine exposes internals to the EngineTest project.
+
+## v0.1.10 (2026-03-23)
+
+**Engine self-contained DLL resolution, Host packaging fixes, local CI/CD pipeline.**
+
+- **Self-contained DLL resolution** — Engine locates bundled DLLs from its own assembly
+  directory (`typeof(ScriptCompiler).Assembly.Location`), correct for both daemon and
+  NuGet-hosted ScriptHost scenarios. Falls back to `AppContext.BaseDirectory`.
+- **Host NuGet packaging** — `build/` and `buildTransitive/` directories in the Host
+  package carry `.targets` files that inject SeaShell.Script as a compile-time reference
+  and copy MessagePack/Ipc DLLs to consumers' output directories.
+- **SeaShell.Script removed as standalone NuGet** — Script is now bundled as a binary
+  inside Engine, Host, and the CLI tool packages. No standalone `SeaShell.Script` NuGet
+  package. This eliminates version conflicts when multiple packages reference different
+  Script versions.
+- **Host-in-Host regression test** — Pipeline test that runs ScriptHost from inside a
+  Host consumer. Catches CS1704 (duplicate assembly) regressions.
+- **NuGet transitive dedup** — Engine deduplicates compile-time references when a script's
+  NuGet dependencies transitively include assemblies already bundled by the Engine.
+- **Local CI/CD pipeline** — Build, package, and test on both Windows and Linux build hosts
+  via SSH. MooseFS shared storage with unison sync. Convention-based directory layout with
+  timestamp correlation IDs.
+
+## v0.1.7 (2026-03-22)
+
+**Daemon hash fix.**
+
+- **Daemon hash mismatch on Task Scheduler** — Fixed: Task Scheduler launches used the
+  tool store path directly, bypassing the staged daemon directory. The CLI's hash check
+  always saw a mismatch and restarted the daemon on every script run. Now consistently
+  launches from the staged directory.
+
 ## v0.1.6 (2026-03-22)
 
 **Binary running, script-initiated reload, cross-platform service hosting, and daemon staging.**

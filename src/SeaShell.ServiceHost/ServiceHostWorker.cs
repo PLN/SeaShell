@@ -40,6 +40,8 @@ internal sealed class ServiceHostWorker : BackgroundService
 				var result = await _host.RunAsync(
 					_options.TargetPath,
 					_options.Args,
+					workingDirectory: _options.WorkingDirectory,
+					environmentVars: _options.EnvironmentVars,
 					connection: _connection,
 					ct: stoppingToken);
 

@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.IO;
 using System.Runtime.InteropServices;
 using System.Threading.Tasks;
@@ -27,6 +28,8 @@ public sealed class ServiceHostBuilder
 	private string? _assemblyPath;
 	private string[]? _scriptArgs;
 	private TimeSpan? _updateInterval;
+	private string? _workingDirectory;
+	private Dictionary<string, string>? _environmentVars;
 
 	/// <summary>Set the service name (used for registration with the init system).</summary>
 	public ServiceHostBuilder ServiceName(string name) { _serviceName = name; return this; }
@@ -62,6 +65,30 @@ public sealed class ServiceHostBuilder
 		return this;
 	}
 
+	/// <summary>Set the working directory for the script process. Defaults to the exe's directory.</summary>
+	public ServiceHostBuilder WorkingDirectory(string dir)
+	{
+		_workingDirectory = dir;
+		return this;
+	}
+
+	/// <summary>Set an environment variable for the script process.</summary>
+	public ServiceHostBuilder EnvironmentVariable(string key, string value)
+	{
+		_environmentVars ??= new Dictionary<string, string>();
+		_environmentVars[key] = value;
+		return this;
+	}
+
+	/// <summary>Set multiple environment variables for the script process.</summary>
+	public ServiceHostBuilder EnvironmentVariables(IDictionary<string, string> vars)
+	{
+		_environmentVars ??= new Dictionary<string, string>();
+		foreach (var kv in vars)
+			_environmentVars[kv.Key] = kv.Value;
+		return this;
+	}
+
 	/// <summary>
 	/// Build the host and run. Handles both service mode (foreground) and
 	/// management commands (install, uninstall, start, stop, status).
@@ -70,6 +97,15 @@ public sealed class ServiceHostBuilder
 	{
 		var targetPath = _scriptPath ?? _assemblyPath
 			?? throw new InvalidOperationException("No script or assembly specified. Call RunScript() or RunAssembly().");
+
+		// Resolve relative script/assembly paths against the exe's directory, not CWD.
+		// When SCM/systemd starts a service, CWD is system32 or / — relative paths
+		// must resolve against where the binary actually lives.
+		var exeDir = Path.GetDirectoryName(Environment.ProcessPath) ?? Environment.CurrentDirectory;
+		if (!Path.IsPathRooted(targetPath))
+			targetPath = Path.GetFullPath(Path.Combine(exeDir, targetPath));
+
+		var workingDirectory = _workingDirectory ?? exeDir;
 
 		// Management commands
 		if (args.Length > 0)
@@ -91,7 +127,8 @@ public sealed class ServiceHostBuilder
 
 		// Register our worker
 		builder.Services.AddSingleton(new ServiceHostOptions(
-			targetPath, _scriptArgs ?? Array.Empty<string>(), _updateInterval));
+			targetPath, _scriptArgs ?? Array.Empty<string>(), _updateInterval,
+			workingDirectory, _environmentVars));
 		builder.Services.AddHostedService<ServiceHostWorker>();
 
 		var host = builder.Build();
@@ -141,4 +178,6 @@ public sealed class ServiceHostBuilder
 internal sealed record ServiceHostOptions(
 	string TargetPath,
 	string[] Args,
-	TimeSpan? UpdateInterval);
+	TimeSpan? UpdateInterval,
+	string WorkingDirectory,
+	Dictionary<string, string>? EnvironmentVars);
