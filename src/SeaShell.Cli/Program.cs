@@ -1,14 +1,51 @@
 using System;
+using System.Diagnostics;
 using System.IO;
+using System.Runtime.InteropServices;
 using SeaShell.Protocol;
 using SeaShell.Invoker;
 using SeaShell.Cli;
 
+// ── seaw.exe console handling ───────────────────────────────────────────
+
+// Detect if running as seaw.exe (Windows subsystem — no console by default).
+// seaw.exe defaults to windowless. Only allocate a console if //sea_console
+// is present in the script, or if running a non-script command (--help etc).
+var isWindowMode = IsSeawExe();
+var consoleAllocated = false;
+if (isWindowMode && args.Length > 0 && !args[0].StartsWith("-"))
+{
+	// Script invocation — only allocate console if //sea_console directive present
+	var scriptFile = Path.GetFullPath(args[0]);
+	if (File.Exists(scriptFile))
+	{
+		var scan = DirectiveScanner.Scan(scriptFile);
+		if (scan.Console)
+		{
+			AllocateConsole();
+			consoleAllocated = true;
+		}
+	}
+}
+else if (isWindowMode)
+{
+	// Non-script invocation (--help, --status, no args, etc.) — need a console
+	AllocateConsole();
+	consoleAllocated = true;
+}
+
 // ── Parse args ──────────────────────────────────────────────────────────
+
+var verbose = Environment.GetEnvironmentVariable("SEA_VERBOSE") is "1" or "true";
+if (args.Length > 0 && args[0] is "--verbose" or "-V")
+{
+	verbose = true;
+	args = args[1..];
+}
 
 if (args.Length > 0 && args[0] is "--help" or "-h")
 {
-	var version = typeof(Program).Assembly.GetName().Version?.ToString(3) ?? "0.1.0";
+	var version = typeof(Program).Assembly.GetName().Version?.ToString(4) ?? "0.1.0";
 	Console.WriteLine($"{{~}} SeaShell v{version}");
 	Console.WriteLine("Copyright (c) PLN. MIT License.");
 	Console.WriteLine();
@@ -31,8 +68,10 @@ if (args.Length > 0 && args[0] is "--help" or "-h")
 	Console.WriteLine("  --unassociate [.ext]  Remove association");
 	Console.WriteLine();
 	Console.WriteLine("  Dev/debug:");
+	Console.WriteLine("  -V, --verbose         Show daemon lifecycle messages");
 	Console.WriteLine("  --daemon-start        Start daemon directly");
 	Console.WriteLine("  --daemon-stop         Stop daemon via pipe");
+	ExitDelayIfNeeded();
 	return 0;
 }
 
@@ -40,15 +79,24 @@ var daemonAddress = TransportEndpoint.GetDaemonAddress(TransportEndpoint.Current
 Action<string> log = msg => Console.WriteLine($"  {msg}");
 Action<string> logErr = msg => Console.Error.WriteLine($"  {msg}");
 
-// No arguments → REPL
+// No arguments → REPL (console mode) or error (window mode)
 if (args.Length == 0)
+{
+	if (isWindowMode)
+	{
+		LogError("seaw: no script specified. Usage: seaw <script.cs> [args...]");
+		ExitDelayIfNeeded();
+		return 1;
+	}
 	return await ReplClient.ReplAsync(daemonAddress, Array.Empty<string>());
+}
 
 switch (args[0])
 {
 	case "--version" or "-v":
-		var ver = typeof(Program).Assembly.GetName().Version?.ToString(3) ?? "0.1.0";
+		var ver = typeof(Program).Assembly.GetName().Version?.ToString(4) ?? "0.1.0";
 		Console.WriteLine($"{{~}} SeaShell v{ver}");
+		ExitDelayIfNeeded();
 		return 0;
 	case "-i" or "--repl":
 		var replPackages = args.Length > 1 ? args[1..] : Array.Empty<string>();
@@ -59,21 +107,30 @@ switch (args[0])
 		var status = await DaemonManager.StatusAsync(daemonAddress);
 		if (status != null)
 		{
-			Console.WriteLine($"  daemon:   v{status.Version}, uptime {status.UptimeSeconds}s, {status.ActiveScripts} active");
-			Console.WriteLine($"  elevator: {(status.ElevatorConnected ? "connected" : "not connected")}");
+			var idleStr = status.IdleTimeoutSeconds > 0
+				? $"idle {FormatDuration(status.IdleSeconds)} ({FormatDuration(status.IdleTimeoutSeconds)})"
+				: $"idle {FormatDuration(status.IdleSeconds)}";
+			Console.WriteLine($"  daemon:   v{status.Version}, up {FormatDuration(status.UptimeSeconds)}, {idleStr}, {status.ActiveScripts} active");
+			if (status.ElevatorConnected)
+				Console.WriteLine($"  elevator: v{status.ElevatorVersion ?? "?"}, connected");
+			else
+				Console.WriteLine($"  elevator: not connected");
+			ExitDelayIfNeeded();
 			return 0;
 		}
 		Console.WriteLine("  daemon:   not running");
-		Console.WriteLine("  elevator: unknown (daemon not running)");
+		Console.WriteLine("  elevator: not running");
+		ExitDelayIfNeeded();
 		return 1;
 
 	case "--daemon-stop":
 		var stopped = await DaemonManager.DaemonStopAsync(daemonAddress);
 		Console.WriteLine(stopped ? "daemon: stop requested" : "daemon: not running");
+		ExitDelayIfNeeded();
 		return stopped ? 0 : 1;
 
 	case "--daemon-start":
-		return DaemonManager.StartDaemon(logErr);
+		return DaemonManager.StartDaemon(logErr, logErr);
 
 	// ── Task management (via Invoker) ──────────────────────────────
 	case "--start":
@@ -103,12 +160,77 @@ switch (args[0])
 var scriptPath = Path.GetFullPath(args[0]);
 if (!File.Exists(scriptPath))
 {
-	Console.Error.WriteLine($"sea: script not found: {scriptPath}");
+	LogError($"sea: script not found: {scriptPath}");
+	ExitDelayIfNeeded();
 	return 1;
 }
 
 var isConsoleEphemeral = ConsoleHelper.IsConsoleEphemeral();
 var scriptArgs = args.Length > 1 ? args[1..] : Array.Empty<string>();
-var exitCode = await ScriptRunner.RunScriptAsync(scriptPath, scriptArgs, daemonAddress, isConsoleEphemeral);
+var exitCode = await ScriptRunner.RunScriptAsync(scriptPath, scriptArgs, daemonAddress, isConsoleEphemeral, isWindowMode, verbose);
 ConsoleHelper.ExitDelay(isConsoleEphemeral);
 return exitCode;
+
+// ── seaw.exe helpers ────────────────────────────────────────────────────
+
+void ExitDelayIfNeeded()
+{
+	if (!consoleAllocated) return;
+	if (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows)) return;
+	if (!ConsoleHelper.IsConsoleEphemeral()) return;
+	ConsoleDelayer.Delay(3);
+}
+
+void LogError(string message)
+{
+	Console.Error.WriteLine(message);
+	// In window mode without console, also write to Event Log
+	if (isWindowMode && !consoleAllocated && RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+		WriteToEventLog(message);
+}
+
+[System.Runtime.Versioning.SupportedOSPlatform("windows")]
+static void WriteToEventLog(string message)
+{
+	try { EventLog.WriteEntry("SeaShell", message, EventLogEntryType.Error); }
+	catch { try { EventLog.WriteEntry("Application", $"[SeaShell] {message}", EventLogEntryType.Error); } catch { } }
+}
+
+static string FormatDuration(int totalSeconds)
+{
+	if (totalSeconds < 60) return $"{totalSeconds}s";
+	if (totalSeconds < 3600) return $"{totalSeconds / 60}m {totalSeconds % 60}s";
+	var h = totalSeconds / 3600;
+	var m = (totalSeconds % 3600) / 60;
+	return $"{h}h {m}m";
+}
+
+static bool IsSeawExe()
+{
+	var exePath = Environment.ProcessPath;
+	if (exePath == null) return false;
+	var exeName = Path.GetFileNameWithoutExtension(exePath);
+	return exeName.Equals("seaw", StringComparison.OrdinalIgnoreCase);
+}
+
+static void AllocateConsole()
+{
+	if (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows)) return;
+
+	// Try to attach to parent's console first (covers: seaw.exe run from a terminal)
+	if (!AttachConsole(unchecked((uint)-1))) // ATTACH_PARENT_PROCESS
+		AllocConsoleWin();
+
+	// .NET's Console.Out/Error are initialized at startup. For a WinExe, that's
+	// before any console exists, so they point to null streams. After attaching
+	// or allocating a console, reinitialize them to the real handles.
+	Console.SetOut(new StreamWriter(Console.OpenStandardOutput()) { AutoFlush = true });
+	Console.SetError(new StreamWriter(Console.OpenStandardError()) { AutoFlush = true });
+	Console.SetIn(new StreamReader(Console.OpenStandardInput()));
+}
+
+[DllImport("kernel32.dll", SetLastError = true)]
+static extern bool AttachConsole(uint dwProcessId);
+
+[DllImport("kernel32.dll", SetLastError = true, EntryPoint = "AllocConsole")]
+static extern bool AllocConsoleWin();

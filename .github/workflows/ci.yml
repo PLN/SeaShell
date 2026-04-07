@@ -5,7 +5,8 @@ on:
     tags: ['v*']
 
 # ── Job 1: Build ────────────────────────────────────────────────────────
-# Compile on both platforms, produce platform-specific binaries.
+# Compile on all platforms, produce platform-specific binaries.
+# sea and seaw are published separately to avoid csproj output conflicts.
 
 jobs:
   build:
@@ -34,11 +35,28 @@ jobs:
       - name: Build
         run: dotnet build -c Release
 
-      - name: Publish CLI + Daemon + Elevator
+      - name: Publish Daemon + Elevator
         run: |
-          dotnet publish src/SeaShell.Cli/SeaShell.Cli.csproj -c Release -r ${{ matrix.rid }} --self-contained false -o ./publish/${{ matrix.rid }}
           dotnet publish src/SeaShell.Daemon/SeaShell.Daemon.csproj -c Release -r ${{ matrix.rid }} --self-contained false -o ./publish/${{ matrix.rid }}
           dotnet publish src/SeaShell.Elevator/SeaShell.Elevator.csproj -c Release -r ${{ matrix.rid }} --self-contained false -o ./publish/${{ matrix.rid }}
+
+      - name: Publish CLI (sea)
+        run: |
+          dotnet publish src/SeaShell.Cli/SeaShell.Cli.csproj -c Release -r ${{ matrix.rid }} --self-contained false -o ./publish/cli-tmp
+        # Merge into main publish dir (sea.* files)
+      - name: Merge CLI into publish
+        shell: sh
+        run: cp -f publish/cli-tmp/* publish/${{ matrix.rid }}/ && rm -rf publish/cli-tmp
+
+      - name: Publish seaw (Windows only)
+        if: matrix.rid == 'win-x64'
+        run: |
+          dotnet publish src/SeaShell.Cli/SeaShell.Cli.csproj -c Release -r win-x64 --self-contained false -p:WindowMode=true -o ./publish/seaw-tmp
+        # Merge seaw.* into main publish dir
+      - name: Merge seaw into publish
+        if: matrix.rid == 'win-x64'
+        shell: sh
+        run: cp -f publish/seaw-tmp/seaw.* publish/win-x64/ && rm -rf publish/seaw-tmp
 
       - name: Upload binaries
         uses: actions/upload-artifact@v4
@@ -47,15 +65,15 @@ jobs:
           path: publish/${{ matrix.rid }}/
 
   # ── Job 2: Release ───────────────────────────────────────────────────
-  # Pack, validate, publish to nuget.org, create GitHub Release.
+  # Create archives, embed in bootstrapper, pack, publish, release.
 
   release:
     needs: build
     runs-on: windows-latest
     permissions:
-      contents: write       # create GitHub releases
-      id-token: write       # OIDC token for Sigstore signing
-      attestations: write   # upload attestation to GitHub API
+      contents: write
+      id-token: write
+      attestations: write
 
     steps:
       - uses: actions/checkout@v4
@@ -83,73 +101,48 @@ jobs:
           name: binaries-linux-musl-x64
           path: publish/linux-musl-x64/
 
-      # Build Daemon separately — nothing in the packable projects references it,
-      # but we need its bin/Release output for the Service package's shared DLLs.
-      - name: Build Daemon (for shared DLLs)
-        run: dotnet build src/SeaShell.Daemon/SeaShell.Daemon.csproj -c Release
-
-      - name: Pack CLI + Host
-        run: dotnet pack -c Release -o ./nupkg
-
-      # Service package: platform binaries from build jobs + shared DLLs from Daemon build.
-      # PublishDir and BuildDir default to paths relative to pkg/SeaShell.Binaries.csproj
-      # that match our download layout (publish/{rid}/) and build output.
-      - name: Pack Service
-        run: dotnet pack pkg/SeaShell.Binaries.csproj -c Release -o ./nupkg
-
-      # Inject SeaShell.Service dependency into CLI and Host nuspecs post-pack.
-      # Can't be a .csproj dependency (chicken-and-egg: Service is built from same repo).
-      - name: Inject Service dependency
+      # Read version from Directory.Build.props
+      - name: Get version
+        id: version
         shell: pwsh
         run: |
-          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $props = [xml](Get-Content Directory.Build.props)
+          $ver = $props.Project.PropertyGroup.Version
+          Write-Host "Version: $ver"
+          "VERSION=$ver" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
 
-          $serviceVersion = (Get-ChildItem nupkg/SeaShell.Service.*.nupkg).BaseName -replace '^SeaShell\.Service\.',''
-          Write-Host "Service version: $serviceVersion"
+      # Create per-RID zip archives (excluding PDBs and XML docs)
+      - name: Create archives
+        shell: pwsh
+        run: |
+          $version = "${{ steps.version.outputs.VERSION }}"
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          New-Item -ItemType Directory -Force -Path src/SeaShell.Bootstrapper/archives | Out-Null
 
-          foreach ($pattern in @('SeaShell.0.*.nupkg', 'SeaShell.Host.*.nupkg')) {
-            $pkg = (Get-ChildItem "nupkg/$pattern" -ErrorAction SilentlyContinue).FullName
-            if (-not $pkg) { continue }
-            Write-Host "Injecting into $(Split-Path $pkg -Leaf)"
+          foreach ($rid in @('win-x64', 'linux-x64', 'linux-musl-x64')) {
+            $src = "publish/$rid"
+            if (-not (Test-Path $src)) { Write-Host "Skipping $rid"; continue }
 
-            $zip = [System.IO.Compression.ZipFile]::Open($pkg, 'Update')
-            try {
-              $nuspec = $zip.Entries | Where-Object { $_.FullName -like '*.nuspec' } | Select-Object -First 1
-              $reader = [System.IO.StreamReader]::new($nuspec.Open())
-              $xml = [xml]$reader.ReadToEnd()
-              $reader.Close()
+            # Filter out PDBs and XML docs
+            $files = Get-ChildItem $src -File | Where-Object { $_.Extension -notin '.pdb','.xml' }
 
-              $ns = $xml.DocumentElement.NamespaceURI
-              $deps = $xml.SelectSingleNode('//*[local-name()="dependencies"]')
-              if (-not $deps) {
-                $deps = $xml.CreateElement('dependencies', $ns)
-                $xml.SelectSingleNode('//*[local-name()="metadata"]').AppendChild($deps) | Out-Null
-              }
+            # RID-only archive for embedding in bootstrapper
+            $embedZip = "src/SeaShell.Bootstrapper/archives/$rid.zip"
+            Compress-Archive -Path $files.FullName -DestinationPath $embedZip -Force
+            Write-Host "Embedded: $rid.zip ($($files.Count) files)"
 
-              $group = $deps.SelectSingleNode('*[local-name()="group" and contains(@targetFramework,"net10.0")]')
-              if (-not $group) {
-                $group = $xml.CreateElement('group', $ns)
-                $group.SetAttribute('targetFramework', 'net10.0')
-                $deps.AppendChild($group) | Out-Null
-              }
-
-              $dep = $xml.CreateElement('dependency', $ns)
-              $dep.SetAttribute('id', 'SeaShell.Service')
-              $dep.SetAttribute('version', "[$serviceVersion]")
-              $dep.SetAttribute('exclude', 'Build,Analyzers')
-              $group.AppendChild($dep) | Out-Null
-
-              $nuspec.Delete()
-              $newEntry = $zip.CreateEntry($nuspec.FullName)
-              $writer = [System.IO.StreamWriter]::new($newEntry.Open())
-              $xml.Save($writer)
-              $writer.Close()
-              Write-Host "  OK: SeaShell.Service [$serviceVersion]"
-            }
-            finally { $zip.Dispose() }
+            # Versioned archive for GitHub release
+            $releaseZip = "dist/seashell-$version-$rid.zip"
+            Copy-Item $embedZip $releaseZip
+            Write-Host "Release:  seashell-$version-$rid.zip"
           }
 
-      - name: Validate package contents
+      # Pack Bootstrapper (dotnet tool) + Host (library)
+      - name: Pack
+        run: dotnet pack -c Release -o ./nupkg
+
+      # Validate packages
+      - name: Validate packages
         shell: pwsh
         run: |
           Add-Type -AssemblyName System.IO.Compression.FileSystem
@@ -160,75 +153,46 @@ jobs:
             $entries = $zip.Entries | ForEach-Object { $_.FullName }
             $zip.Dispose()
             foreach ($e in $expected) {
-              if ($entries -contains $e) {
-                Write-Host "  OK: $e"
-              } else {
-                Write-Host "  MISSING: $e" -ForegroundColor Red
-                $script:failed = $true
-              }
+              if ($entries -contains $e) { Write-Host "  OK: $e" }
+              else { Write-Host "  MISSING: $e" -ForegroundColor Red; $script:failed = $true }
             }
           }
 
-          function Assert-NuspecHas($nupkg, $text) {
-            $zip = [System.IO.Compression.ZipFile]::OpenRead($nupkg)
-            $nuspec = $zip.Entries | Where-Object { $_.FullName -like '*.nuspec' } | Select-Object -First 1
-            $reader = [System.IO.StreamReader]::new($nuspec.Open())
-            $content = $reader.ReadToEnd()
-            $reader.Close()
-            $zip.Dispose()
-            if ($content -match $text) { Write-Host "  OK: $text dependency" }
-            else { Write-Host "  MISSING: $text dependency" -ForegroundColor Red; $script:failed = $true }
-          }
-
-          Write-Host "=== SeaShell (tool) ==="
+          Write-Host "=== SeaShell (bootstrapper) ==="
           $pkg = (Get-ChildItem nupkg/SeaShell.0.*.nupkg).FullName
-          Assert-Contains $pkg @(
-            'tools/net10.0/any/sea.dll',
-            'tools/net10.0/any/SeaShell.Invoker.dll',
-            'tools/net10.0/any/SeaShell.Protocol.dll',
-            'tools/net10.0/any/SeaShell.Common.dll',
-            'tools/net10.0/any/MessagePack.dll'
-          )
-          Assert-NuspecHas $pkg 'SeaShell.Service'
+          Assert-Contains $pkg @('tools/net10.0/any/seashell.dll')
+
+          # Check embedded archives (compiled into seashell.dll as EmbeddedResource)
+          $tmp = New-TemporaryFile
+          $zip = [System.IO.Compression.ZipFile]::OpenRead($pkg)
+          $dllEntry = $zip.Entries | Where-Object { $_.FullName -like '*/seashell.dll' } | Select-Object -First 1
+          [System.IO.Compression.ZipFileExtensions]::ExtractToFile($dllEntry, $tmp.FullName, $true)
+          $zip.Dispose()
+          $bytes = [System.IO.File]::ReadAllBytes($tmp.FullName)
+          Remove-Item $tmp.FullName -Force
+          $asm = [System.Reflection.Assembly]::Load($bytes)
+          $archives = ($asm.GetManifestResourceNames() | Where-Object { $_ -like '*.zip' }).Count
+          Write-Host "  Embedded archives: $archives"
+          if ($archives -lt 3) { Write-Host "  Expected 3 archives" -ForegroundColor Red; $failed = $true }
 
           Write-Host "`n=== SeaShell.Host ==="
           $pkg = (Get-ChildItem nupkg/SeaShell.Host.*.nupkg).FullName
           Assert-Contains $pkg @(
             'lib/net10.0/SeaShell.Host.dll',
             'build/net10.0/SeaShell.Host.targets',
-            'build/net10.0/SeaShell.Script.dll',
-            'build/net10.0/SeaShell.Common.dll',
-            'build/net10.0/MessagePack.dll',
             'buildTransitive/net10.0/SeaShell.Host.targets'
           )
-          Assert-NuspecHas $pkg 'SeaShell.Service'
 
-          Write-Host "`n=== SeaShell.Service ==="
-          $pkg = (Get-ChildItem nupkg/SeaShell.Service.*.nupkg).FullName
-          Assert-Contains $pkg @(
-            'runtimes/win-x64/seashell-daemon.exe',
-            'runtimes/win-x64/seashell-elevator.exe',
-            'runtimes/linux-x64/seashell-daemon',
-            'runtimes/linux-x64/seashell-elevator',
-            'runtimes/linux-musl-x64/seashell-daemon',
-            'runtimes/linux-musl-x64/seashell-elevator',
-            'runtimes/any/SeaShell.Engine.dll',
-            'runtimes/any/SeaShell.Common.dll'
-          )
+          # Verify no unexpected packages
+          foreach ($pattern in @('SeaShell.Service.*', 'SeaShell.Engine.*', 'SeaShell.Cli.*', 'SeaShell.Invoker.*')) {
+            $found = Get-ChildItem "nupkg/$pattern.nupkg" -ErrorAction SilentlyContinue
+            if ($found) { Write-Host "UNEXPECTED: $($found.Name)" -ForegroundColor Red; $failed = $true }
+          }
 
-          # Verify exactly 3 packages (no stale Engine/Common/ServiceHost/Ipc packages)
           $count = (Get-ChildItem nupkg/*.nupkg).Count
-          if ($count -ne 3) {
-            Write-Host "Expected 3 packages, found $count" -ForegroundColor Red
-            Get-ChildItem nupkg/*.nupkg | ForEach-Object { Write-Host "  $_" }
-            $failed = $true
-          }
-
-          if ($failed) {
-            Write-Host "`nPackage validation FAILED" -ForegroundColor Red
-            exit 1
-          }
-          Write-Host "`nAll packages validated OK ($count packages)" -ForegroundColor Green
+          Write-Host "`nTotal packages: $count"
+          if ($failed) { Write-Host "VALIDATION FAILED" -ForegroundColor Red; exit 1 }
+          Write-Host "All packages validated OK" -ForegroundColor Green
 
       - name: Attest NuGet packages
         uses: actions/attest-build-provenance@v2
@@ -256,4 +220,5 @@ jobs:
           gh release create "$TAG" \
             --title "$TAG" \
             --generate-notes \
-            nupkg/*.nupkg
+            nupkg/*.nupkg \
+            dist/seashell-*.zip

@@ -9,7 +9,8 @@
 	<PropertyGroup>
 		<TargetFramework>net10.0</TargetFramework>
 		<PackageId>SeaShell.Service</PackageId>
-		<Description>SeaShell daemon and elevator binaries. Required runtime dependency for SeaShell.Host and SeaShell CLI.</Description>
+		<IsPackable>false</IsPackable>
+		<Description>SeaShell daemon and elevator binaries. Superseded by archive-based distribution.</Description>
 		<PackageTags>seashell;daemon;elevator;service;runtime</PackageTags>
 		<IncludeBuildOutput>false</IncludeBuildOutput>
 		<NoBuild>true</NoBuild>
@@ -27,6 +28,7 @@
 	<ItemGroup>
 		<Content Include="$(PublishDir)win-x64\seashell-daemon*" PackagePath="runtimes/win-x64/" />
 		<Content Include="$(PublishDir)win-x64\seashell-elevator*" PackagePath="runtimes/win-x64/" />
+		<Content Include="$(PublishDir)win-x64\seaw*" PackagePath="runtimes/win-x64/" />
 		<Content Include="$(PublishDir)linux-x64\seashell-daemon*" PackagePath="runtimes/linux-x64/" />
 		<Content Include="$(PublishDir)linux-x64\seashell-elevator*" PackagePath="runtimes/linux-x64/" />
 		<Content Include="$(PublishDir)linux-musl-x64\seashell-daemon*" PackagePath="runtimes/linux-musl-x64/" />
@@ -36,7 +38,8 @@
 	<!-- Shared DLLs (pure IL from dotnet build, NOT from R2R dotnet publish).
 	     Include all dependencies so the daemon can run without a NuGet cache
 	     (e.g. SYSTEM/root service accounts with minimal package state).
-	     Excludes System.* DLLs — those are framework components resolved by the runtime. -->
+	     Note: System.Diagnostics.EventLog is an OOB NuGet package, not in BuildDir.
+	     Distribution archives (from dotnet publish) include it; this NuGet package doesn't. -->
 	<ItemGroup>
 		<Content Include="$(BuildDir)SeaShell.Engine.dll" PackagePath="runtimes/any/" />
 		<Content Include="$(BuildDir)SeaShell.Script.dll" PackagePath="runtimes/any/" />

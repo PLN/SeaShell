@@ -78,9 +78,11 @@ public static class TransportEndpoint
 	public static string CurrentUserIdentity =>
 		Environment.UserName.ToLowerInvariant();
 
-	/// <summary>3-part version of the Protocol assembly, used as the side-by-side key.</summary>
+	/// <summary>4-part version of the Protocol assembly, used as the side-by-side key.
+	/// Includes the build number so each pipeline build gets its own daemon instance —
+	/// prevents silent version mismatches between CLI and daemon.</summary>
 	public static string CurrentVersion =>
-		typeof(TransportEndpoint).Assembly.GetName().Version?.ToString(3) ?? "0.0.0";
+		typeof(TransportEndpoint).Assembly.GetName().Version?.ToString(4) ?? "0.0.0";
 }
 
 // ── Server (daemon side) ────────────────────────────────────────────────

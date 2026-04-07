@@ -1,18 +1,13 @@
 <Project Sdk="Microsoft.NET.Sdk">
 	<PropertyGroup>
-		<OutputType>Exe</OutputType>
-		<AssemblyName>sea</AssemblyName>
+		<OutputType Condition="'$(WindowMode)' != 'true'">Exe</OutputType>
+		<OutputType Condition="'$(WindowMode)' == 'true'">WinExe</OutputType>
+		<AssemblyName Condition="'$(WindowMode)' != 'true'">sea</AssemblyName>
+		<AssemblyName Condition="'$(WindowMode)' == 'true'">seaw</AssemblyName>
 		<ApplicationIcon>..\..\content\icon\seashell-dark.ico</ApplicationIcon>
-		<PackageId>SeaShell</PackageId>
-		<PackAsTool>true</PackAsTool>
-		<ToolCommandName>sea</ToolCommandName>
+		<IsPackable>false</IsPackable>
 		<Description>C# and VB.NET scripting engine with persistent daemon, NuGet support, hot-swap, REPL, and elevation.</Description>
-		<PackageTags>scripting;seashell;csharp;vb;roslyn;repl;cli</PackageTags>
-		<PackageReadmeFile>README.md</PackageReadmeFile>
 	</PropertyGroup>
-	<ItemGroup>
-		<None Include="..\..\README.md" Pack="true" PackagePath="/" />
-	</ItemGroup>
 	<ItemGroup>
 		<ProjectReference Include="..\SeaShell.Protocol\SeaShell.Protocol.csproj" />
 		<ProjectReference Include="..\SeaShell.Invoker\SeaShell.Invoker.csproj" />

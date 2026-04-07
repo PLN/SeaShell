@@ -64,7 +64,8 @@ public sealed class ScriptHost
 		return await _invoker.RunAsync(
 			scriptPath, args ?? Array.Empty<string>(), _daemonAddress,
 			OutputMode.Capture, connection,
-			workingDirectory, environmentVars, ct);
+			workingDirectory, environmentVars,
+			windowMode: false, ct: ct);
 	}
 
 	/// <summary>
@@ -107,6 +108,7 @@ public sealed class ScriptHost
 			compiled, args ?? Array.Empty<string>(),
 			_daemonAddress, null,
 			OutputMode.Capture, connection,
-			workingDirectory, environmentVars, ct);
+			workingDirectory, environmentVars,
+			windowMode: false, ct: ct);
 	}
 }

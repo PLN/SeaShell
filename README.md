@@ -1,25 +1,28 @@
 # {~} SeaShell
 
-[![Release](https://github.com/PLN/SeaShell/actions/workflows/ci.yml/badge.svg?event=push)](https://github.com/PLN/SeaShell/actions/workflows/ci.yml)
-
 A C# and VB.NET scripting engine with a persistent daemon, NuGet support, hot-swap, REPL, and an embeddable host library. Built on Roslyn.
 
 ## Install
 
-**Windows** (PowerShell):
-```powershell
-iex (irm https://raw.githubusercontent.com/PLN/SeaShell/main/install.ps1)
-```
+Requires .NET 10 SDK.
 
-**Linux**:
-```bash
-curl -fsSL https://raw.githubusercontent.com/PLN/SeaShell/main/install.sh | sh
-```
-
-**Manual**:
 ```
 dotnet tool install -g SeaShell
+seashell install
 ```
+
+On Windows, run elevated (`gsudo seashell install`) to also register the
+elevator task for UAC-free `//sea_elevate` scripts and the Windows Event Log
+source. Without elevation the daemon is registered but the elevator is skipped.
+
+Run `seashell` with no arguments to see a dashboard with version, platform,
+daemon/elevator state, and idle time. Use `seashell start` / `seashell stop`
+to manage daemon lifecycle.
+
+**Alternative** — standalone scripts (no dotnet tool):
+
+Windows: `iex (irm https://raw.githubusercontent.com/PLN/SeaShell/main/install.ps1)`
+Linux: `curl -fsSL https://raw.githubusercontent.com/PLN/SeaShell/main/install.sh | sh`
 
 ## Quick Start
 
@@ -31,6 +34,8 @@ sea myapp.dll                   Run a pre-compiled .NET assembly
 sea myapp.exe                   Run a single-file .exe
 sea -i Humanizer.Core           REPL with NuGet packages preloaded
 sea --associate .cs             Associate .cs files with SeaShell
+seaw script.csw                 Run a window-mode script (no console)
+seaw script.cs                  Run any script without a console window
 ```
 
 NuGet packages are resolved automatically — including transitive dependencies and runtime-specific DLLs. Missing packages are downloaded on first use.
@@ -48,7 +53,7 @@ SeaShell is inspired by and grateful to [CS-Script](https://github.com/oleg-shil
 - **Elevation** — `//sea_elevate` scripts run elevated via a pre-registered Task Scheduler worker. No UAC prompts. Falls back to `gsudo sea script.cs` if the elevator isn't running. Ignored on Linux.
 - **Binary running** — Run pre-compiled `.dll` and `.exe` files with full Sea context. Single-file executables, apphosts, and plain DLLs all supported. Companion `.sea.json` enables directives for binaries.
 - **Script-initiated reload** — `Sea.RequestReload()` triggers recompilation and hot-swap from within a script. Optional `clearCache` for forced fresh builds. Works in both direct and watch mode.
-- **Service hosting** — `SeaShell.ServiceHost` runs scripts as system services. Windows Service, systemd, runit, OpenRC, sysvinit — auto-detected. Zero-locking automatic updates via NuGet.
+- **Service hosting** — `SeaShell.Host` includes service hosting (namespace `SeaShell.ServiceHost`). Runs scripts as system services. Windows Service, systemd, runit, OpenRC, sysvinit — auto-detected. Zero-locking automatic updates via NuGet.
 - **Embeddable** — `SeaShell.Host` lets you compile and run scripts from your own application. No daemon required. Supports reload and watch mode internally.
 - **VB.NET support** — `.vb` files compile through the same pipeline with VB-native directives (`'sea_nuget`).
 - **CS-Script compatible** — `//css_inc`, `//css_nuget` directives are recognized. Existing `.cscs` scripts work with zero changes.
@@ -68,6 +73,11 @@ SeaShell is inspired by and grateful to [CS-Script](https://github.com/oleg-shil
 | `//sea_webapp` | Enable ASP.NET Core shared framework |
 | `//sea_elevate` | Run elevated (via Elevator or gsudo; ignored on Linux) |
 | `//sea_watch` | Hot-swap: recompile and restart on source file changes |
+| `//sea_restart` | Auto-restart on exit (with crash backoff) |
+| `//sea_mutex` | Single instance (system scope). `//sea_mutex session` or `user` for narrower scope |
+| `//sea_mutex_attach` | Blocked callers attach to the running instance instead of exiting |
+| `//sea_window` | Window-mode flag (for seaw.exe file association) |
+| `//sea_console` | Allocate a console window (for seaw.exe scripts that need stdout) |
 
 VB.NET uses the `'sea_` prefix: `'sea_nuget Serilog`
 
@@ -126,6 +136,17 @@ Sea.ShutdownToken       // CancellationToken — cancelled on reload/stop
 Sea.Reloading           // Event: script is about to be replaced
 Sea.Stopping            // Event: clean stop requested (Ctrl+C)
 
+// Restart
+Sea.IsRestartMode       // True when running with //sea_restart
+Sea.Restart             // Controls restart (default true, set false to stop)
+Sea.RestartCount        // Number of restarts so far
+
+// Mutex & Attach
+Sea.MutexScope          // 0=None, 1=Session, 2=User, 3=System
+Sea.MutexAttach         // True when //sea_mutex_attach is active
+Sea.Attached            // Event: blocked caller attached (AttachContext)
+Sea.IsWindowMode        // True when running as seaw.exe without console
+
 // Script-initiated reload
 Sea.RequestReload()                     // Trigger recompile + hot-swap
 Sea.RequestReload(clearCache: true)     // Force fresh build (clear cache first)
@@ -162,6 +183,90 @@ while (!Sea.IsShuttingDown)
 ```
 
 Edit and save the file — the counter picks up where it left off.
+
+## Restart
+
+`//sea_restart` scripts automatically restart when they exit:
+
+```csharp
+//sea_restart
+
+Console.WriteLine($"Run #{Sea.RestartCount}");
+await Task.Delay(10_000, Sea.ShutdownToken);
+```
+
+If the script exits within 5 seconds, crash backoff kicks in: 2s, 4s, 8s, 8s...
+A successful run (longer than 5s) resets the backoff. Set `Sea.Restart = false` within
+a script to prevent restart for that particular run.
+
+## Script Mutex
+
+`//sea_mutex` enforces single-instance execution. A second invocation exits immediately
+with code 200 if another instance is already running.
+
+```csharp
+//sea_mutex
+Console.WriteLine("Only one of me can run at a time");
+await Task.Delay(60_000, Sea.ShutdownToken);
+```
+
+Three scopes control the mutex boundary:
+
+| Directive | Scope |
+|---|---|
+| `//sea_mutex` | System-wide (default). One instance across all users and sessions. |
+| `//sea_mutex user` | Per-user. Different users can each run one instance. |
+| `//sea_mutex session` | Per-session. Same user can run one per login session. |
+
+On Windows, scopes map to named kernel mutexes (`Global\`, default, `Local\`).
+On Linux, file locks in scope-appropriate directories.
+
+### Attach
+
+`//sea_mutex_attach` extends the mutex: instead of exiting, blocked callers connect
+to the running instance and exchange messages.
+
+```csharp
+//sea_mutex
+//sea_mutex_attach
+
+Sea.Attached += ctx =>
+{
+    Console.WriteLine($"Client attached from {ctx.WorkingDirectory}");
+    Console.WriteLine($"Args: {string.Join(" ", ctx.Args)}");
+    ctx.Send(Encoding.UTF8.GetBytes("hello from server"));
+    ctx.Close(0);
+};
+
+Console.WriteLine("Listening for attach clients...");
+await Task.Delay(Timeout.Infinite, Sea.ShutdownToken);
+```
+
+The `AttachContext` provides: `Args` (caller's arguments), `WorkingDirectory`
+(caller's CWD), `Send(byte[])`, `Receive()`, and `Close(exitCode)`.
+
+## seaw.exe (Window Mode)
+
+`seaw.exe` is a WinExe-subsystem binary — no console window by default. Use it for
+scripts that run in the background or show their own UI.
+
+```
+seaw background-task.csw        Run without a console window
+seaw ui-app.cs                  Same — any script, not just .csw
+```
+
+Scripts that need stdout can request a console with `//sea_console`:
+
+```csharp
+//sea_console
+Console.WriteLine("I have a console window");
+```
+
+When seaw.exe encounters an error without a console, it writes to the Windows Event
+Log (SeaShell source) so errors aren't silently lost.
+
+The `.csw` extension is a convention for window-mode scripts. Associate it with
+seaw.exe via `seaw --associate .csw`.
 
 ## Embedding (SeaShell.Host)
 
@@ -213,7 +318,7 @@ Sea.SendMessage("{\"status\":\"ready\"}", "status");
 
 Messages are binary (`byte[]`) with an optional `string` topic for routing. String convenience overloads encode as UTF-8.
 
-## Service Hosting (SeaShell.ServiceHost)
+## Service Hosting
 
 Run any script or binary as a system service with automatic updates:
 
@@ -264,18 +369,37 @@ The daemon starts automatically on first `sea` invocation even without Task Sche
 
 The elevator is optional — without it, elevated scripts fall back to `gsudo sea script.cs`. When the elevator task is registered but not running, `sea` auto-starts it on demand when an `//sea_elevate` script is run.
 
+## Bootstrapper Commands
+
+The `seashell` command (installed via `dotnet tool install -g SeaShell`) manages the
+SeaShell installation:
+
+```
+seashell                        Dashboard: version, platform, daemon/elevator state
+seashell install                Extract archives, register daemon, update PATH
+seashell uninstall              Remove binaries, daemon task, file associations
+seashell start                  Start daemon (and elevator if registered)
+seashell stop                   Stop daemon and elevator
+seashell status                 Show running state and versions
+```
+
+`seashell install` and `seashell update` are identical — both extract the latest
+archives and re-register tasks. On Windows, run elevated (`gsudo seashell install`)
+to also register the elevator and Event Log source.
+
 ## Project Structure
 
 ```
-SeaShell.Cli       CLI (sea.exe) — argument parsing, script execution, exit delay
-SeaShell.Daemon    Persistent compilation server, REPL host, file watcher
-SeaShell.Elevator  Pre-elevated worker (connects to daemon, no public pipe)
-SeaShell.Engine    Roslyn compiler, NuGet resolver, include system, .deps.json writer
-SeaShell.Script    Sea runtime context (loaded into every script process)
-SeaShell.Ipc       Binary IPC: MessageChannel (MessagePack over System.IO.Pipelines)
-SeaShell.Protocol     Daemon/Elevator protocol messages + transport (named pipes / UDS)
-SeaShell.Host         Embeddable library for other applications
-SeaShell.ServiceHost  Cross-platform service hosting (Windows Service, systemd, runit, OpenRC, sysvinit)
+SeaShell.Bootstrapper  Dotnet tool (seashell command) — install, uninstall, start, stop, status
+SeaShell.Cli           CLI (sea.exe / seaw.exe) — argument parsing, script execution, exit delay
+SeaShell.Invoker       Shared execution engine — compilation, mutex, restart, attach, daemon lifecycle
+SeaShell.Daemon        Persistent compilation server, REPL host, file watcher
+SeaShell.Elevator      Pre-elevated worker (connects to daemon, no public pipe)
+SeaShell.Engine        Roslyn compiler, NuGet resolver, include system, .deps.json writer
+SeaShell.Script        Sea runtime context (loaded into every script process)
+SeaShell.Common        Shared message types, MessageChannel (MessagePack over System.IO.Pipelines)
+SeaShell.Protocol      Daemon/Elevator protocol messages + transport (named pipes / UDS)
+SeaShell.Host          Embeddable library + cross-platform service hosting (Windows Service, systemd, runit, OpenRC)
 ```
 
 See [doc/ARCHITECTURE.md](doc/ARCHITECTURE.md) for the full architecture,
@@ -356,7 +480,9 @@ When `sea.exe` detects it was launched from an ephemeral console (e.g., double-c
 - Non-ephemeral consoles (terminals, IDE, CI) never delay
 - The Host library never delays — `Sea.IsConsoleEphemeral` is always `false`
 
-Detection uses `GetConsoleProcessList`: a .NET app in an ephemeral console has exactly 2 processes (apphost + runtime), while a terminal adds its shell process (3+).
+Detection uses parent process identification via `NtQueryInformationProcess`: if the
+parent is a known shell or terminal (cmd, powershell, bash, Windows Terminal, etc.)
+the console is persistent; otherwise it's ephemeral (e.g., double-clicked from Explorer).
 
 ### Webapp Hot-Swap
 

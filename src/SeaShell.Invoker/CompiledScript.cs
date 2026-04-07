@@ -14,7 +14,10 @@ public sealed record CompiledScript(
 	string? StartupHookPath,
 	bool DirectExe,
 	bool Elevated,
-	bool Watch)
+	bool Watch,
+	bool Restart,
+	byte MutexScope = 0,
+	bool MutexAttach = false)
 {
 	/// <summary>Create from a daemon RunResponse.</summary>
 	public static CompiledScript? FromRunResponse(RunResponse response)
@@ -30,6 +33,9 @@ public sealed record CompiledScript(
 			response.StartupHookPath,
 			response.DirectExe,
 			response.Elevated,
-			response.Watch);
+			response.Watch,
+			response.Restart,
+			response.MutexScope,
+			response.MutexAttach);
 	}
 }

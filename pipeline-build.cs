@@ -1,5 +1,6 @@
 //css_inc Mother.cs
 //css_inc System.Diagnostics.Ext.cs
+//css_inc pipeline-tasks.cs
 using System;
 using System.Diagnostics;
 using System.IO;
@@ -14,67 +15,101 @@ var artifacts = Environment.GetEnvironmentVariable("PIPELINE_ARTIFACTS")!;
 var logs = Environment.GetEnvironmentVariable("PIPELINE_LOGS")!;
 var rid = Environment.GetEnvironmentVariable("PIPELINE_RID")!;
 var commonDir = Environment.GetEnvironmentVariable("PIPELINE_COMMON")!;
-var runCounter = Environment.GetEnvironmentVariable("PIPELINE_RUN") ?? "0";
-
-// Pass BuildNumber so NuGet packages get unique versions per pipeline run (e.g., 0.1.12.4).
-// Avoids stale NuGet cache collisions when the same semver is rebuilt with different code.
-var versionArg = $"-p:BuildNumber={runCounter}";
+var host = Environment.GetEnvironmentVariable("PIPELINE_HOST") ?? rid;
+var pipelineRoot = System.Runtime.InteropServices.RuntimeInformation.IsOSPlatform(
+	System.Runtime.InteropServices.OSPlatform.Windows) ? @"C:\pipeline" : "/pipeline";
 
 Console.WriteLine($"[build] Source:    {src}");
 Console.WriteLine($"[build] Artifacts: {artifacts}");
 Console.WriteLine($"[build] RID:       {rid}");
-Console.WriteLine($"[build] Run:       {runCounter}");
 
 Directory.CreateDirectory(artifacts);
 Directory.CreateDirectory(logs);
 
+var tasks = new TaskTracker("build", host, "seashell", pipelineRoot);
+
 // ── Build ────────────────────────────────────────────────────────────
 
-var buildCode = DiagnosticsExt.RunProcess("dotnet", $"build -c Release {versionArg}", src,
-	logFile: Path.Combine(logs, "build.log"), prefix: "build");
-if (buildCode != 0)
-{
-	Console.Error.WriteLine("[build] dotnet build FAILED");
-	return buildCode;
-}
+tasks.Run("dotnet-build", () =>
+	DiagnosticsExt.RunProcess("dotnet", $"build -c Release ", src,
+		logFile: Path.Combine(logs, "build.log"), prefix: "build"));
 
-// ── Publish CLI + Daemon + Elevator ──────────────────────────────────
+// ── Publish Daemon + Elevator ────────────────────────────────────────
 
 var publishDir = Path.Combine(artifacts, "publish");
 
-foreach (var project in new[] { "SeaShell.Cli", "SeaShell.Daemon", "SeaShell.Elevator" })
+foreach (var project in new[] { "SeaShell.Daemon", "SeaShell.Elevator" })
 {
-	var csproj = Path.Combine(src, "src", project, $"{project}.csproj");
-	var code = DiagnosticsExt.RunProcess("dotnet",
-		$"publish \"{csproj}\" -c Release -r {rid} --self-contained false -o \"{publishDir}\" {versionArg}",
-		src, logFile: Path.Combine(logs, $"publish-{project}.log"), prefix: "build");
-	if (code != 0)
+	tasks.Run($"publish-{project}", () =>
 	{
-		Console.Error.WriteLine($"[build] publish {project} FAILED");
-		return code;
-	}
+		var csproj = Path.Combine(src, "src", project, $"{project}.csproj");
+		return DiagnosticsExt.RunProcess("dotnet",
+			$"publish \"{csproj}\" -c Release -r {rid} --self-contained false -o \"{publishDir}\" ",
+			src, logFile: Path.Combine(logs, $"publish-{project}.log"), prefix: "build");
+	});
+}
+
+// ── Publish CLI (sea + seaw) ────────────────────────────────────────
+// sea and seaw are the same csproj with different OutputType/AssemblyName.
+// dotnet publish removes the previous project output, so we publish each
+// to a temp dir and merge into the shared publishDir.
+
+tasks.Run("publish-SeaShell.Cli", () =>
+{
+	var csproj = Path.Combine(src, "src", "SeaShell.Cli", "SeaShell.Cli.csproj");
+	var cliTmp = Path.Combine(artifacts, "publish-cli-tmp");
+	var rc = DiagnosticsExt.RunProcess("dotnet",
+		$"publish \"{csproj}\" -c Release -r {rid} --self-contained false -o \"{cliTmp}\" ",
+		src, logFile: Path.Combine(logs, "publish-SeaShell.Cli.log"), prefix: "build");
+	if (rc != 0) return rc;
+
+	// Copy sea.* files into shared publish dir
+	foreach (var file in Directory.GetFiles(cliTmp))
+		File.Copy(file, Path.Combine(publishDir, Path.GetFileName(file)), overwrite: true);
+	Directory.Delete(cliTmp, true);
+	return 0;
+});
+
+if (rid == "win-x64")
+{
+	tasks.Run("publish-seaw", () =>
+	{
+		var csproj = Path.Combine(src, "src", "SeaShell.Cli", "SeaShell.Cli.csproj");
+		var seawTmp = Path.Combine(artifacts, "publish-seaw-tmp");
+		var rc = DiagnosticsExt.RunProcess("dotnet",
+			$"publish \"{csproj}\" -c Release -r {rid} --self-contained false -o \"{seawTmp}\" -p:WindowMode=true ",
+			src, logFile: Path.Combine(logs, "publish-seaw.log"), prefix: "build");
+		if (rc != 0) return rc;
+
+		// Copy seaw.* files into shared publish dir (shared DLLs already present)
+		foreach (var file in Directory.GetFiles(seawTmp, "seaw.*"))
+			File.Copy(file, Path.Combine(publishDir, Path.GetFileName(file)), overwrite: true);
+		Directory.Delete(seawTmp, true);
+		return 0;
+	});
 }
 
 Console.WriteLine($"[build] Publish complete → {publishDir}");
 
 // ── Push artifacts to common ─────────────────────────────────────────
 
-var commonArtifactDir = Path.Combine(commonDir, "artifacts", rid);
-Console.WriteLine($"[build] Pushing artifacts → {commonArtifactDir}");
-Directory.CreateDirectory(commonArtifactDir);
-
-foreach (var file in Directory.GetFiles(publishDir))
+tasks.Run("push-artifacts", () =>
 {
-	File.Copy(file, Path.Combine(commonArtifactDir, Path.GetFileName(file)), overwrite: true);
-}
+	var commonArtifactDir = Path.Combine(commonDir, "artifacts", rid);
+	Console.WriteLine($"[build] Pushing artifacts → {commonArtifactDir}");
+	Directory.CreateDirectory(commonArtifactDir);
 
-Console.WriteLine($"[build] Pushed {Directory.GetFiles(commonArtifactDir).Length} files to common");
+	foreach (var file in Directory.GetFiles(publishDir))
+		File.Copy(file, Path.Combine(commonArtifactDir, Path.GetFileName(file)), overwrite: true);
+
+	Console.WriteLine($"[build] Pushed {Directory.GetFiles(commonArtifactDir).Length} files to common");
+	return 0;
+});
 
 // ── Copy build log to common ─────────────────────────────────────────
 
-var host = Environment.GetEnvironmentVariable("PIPELINE_HOST") ?? rid;
 var commonLogDir = Path.Combine(commonDir, "logs");
 Directory.CreateDirectory(commonLogDir);
 File.Copy(Path.Combine(logs, "build.log"), Path.Combine(commonLogDir, $"build-{host}.log"), overwrite: true);
 
-return 0;
+return tasks.Finish(logs);

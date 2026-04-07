@@ -34,6 +34,11 @@ public enum MessageType : byte
 	ReplEvalResp    = 29,
 	RecompileRequest = 30,
 
+	// Attach protocol (blocked caller ↔ running script)
+	AttachHello     = 50,
+	AttachMessage   = 51,
+	AttachClose     = 52,
+
 	// Elevator protocol (daemon ↔ elevator)
 	ElevatorHello   = 40,
 	ElevatorAck     = 41,
@@ -69,6 +74,9 @@ public static class MessageTypeMap
 		[typeof(ReplEvalRequest)]   = MessageType.ReplEvalReq,
 		[typeof(ReplEvalResponse)]  = MessageType.ReplEvalResp,
 		[typeof(RecompileRequest)]  = MessageType.RecompileRequest,
+		[typeof(AttachHello)]     = MessageType.AttachHello,
+		[typeof(AttachMessage)]   = MessageType.AttachMessage,
+		[typeof(AttachClose)]     = MessageType.AttachClose,
 		[typeof(ElevatorHello)]   = MessageType.ElevatorHello,
 		[typeof(ElevatorAck)]     = MessageType.ElevatorAck,
 		[typeof(SpawnRequest)]    = MessageType.SpawnRequest,
@@ -116,7 +124,12 @@ public sealed record ScriptInit(
 	int LauncherPid,
 	int ReloadCount,
 	string? State,
-	bool Watch
+	bool Watch,
+	bool Restart = false,
+	int RestartCount = 0,
+	byte MutexScope = 0,
+	bool MutexAttach = false,
+	bool WindowMode = false
 );
 
 /// <summary>Launcher → Script: hot-swap — save state and shut down.</summary>
@@ -126,7 +139,7 @@ public sealed record ScriptReload();
 public sealed record ScriptStop();
 
 /// <summary>Script → Launcher: process is exiting.</summary>
-public sealed record ScriptExit(int ExitCode, int ExitDelay);
+public sealed record ScriptExit(int ExitCode, int ExitDelay, bool Restart = true);
 
 /// <summary>Script → Launcher: reload state (response to ScriptReload).</summary>
 public sealed record ScriptState(string? Data);
@@ -168,7 +181,10 @@ public sealed record RunResponse(
 	int ProcessId,
 	string? Error,
 	string? StartupHookPath = null,
-	bool DirectExe = false
+	bool DirectExe = false,
+	bool Restart = false,
+	byte MutexScope = 0,
+	bool MutexAttach = false
 );
 
 /// <summary>
@@ -182,7 +198,8 @@ public sealed record HotSwapNotify(
 	string? ManifestPath,
 	string Reason,
 	string? StartupHookPath = null,
-	bool DirectExe = false
+	bool DirectExe = false,
+	bool Restart = false
 );
 
 public sealed record PingRequest();
@@ -194,7 +211,10 @@ public sealed record PingResponse(
 	int UptimeSeconds,
 	int ActiveScripts,
 	int Pid = 0,
-	string? DaemonHash = null
+	string? DaemonHash = null,
+	int IdleSeconds = 0,
+	int IdleTimeoutSeconds = 0,
+	string? ElevatorVersion = null
 );
 
 public sealed record StopRequest();
@@ -228,13 +248,24 @@ public sealed record ReplEvalResponse(
 	bool IsComplete
 );
 
+// ── Attach protocol (blocked caller ↔ running script) ──────────────────
+
+/// <summary>Client → Server: initial handshake with caller's args and CWD.</summary>
+public sealed record AttachHello(string[] Args, string WorkingDirectory);
+
+/// <summary>Bidirectional: application-level message between attach client and server.</summary>
+public sealed record AttachMessage(byte[] Payload);
+
+/// <summary>Either side: close the attach connection.</summary>
+public sealed record AttachClose(int ExitCode = 0);
+
 // ── Elevator → Daemon (worker registration) ─────────────────────────────
 
 /// <summary>
 /// Elevator connects to Daemon and sends this as its first message.
 /// The Daemon holds this connection and sends SpawnRequests over it.
 /// </summary>
-public sealed record ElevatorHello(bool IsElevated);
+public sealed record ElevatorHello(bool IsElevated, string? Version = null);
 
 /// <summary>Daemon acknowledges the Elevator registration.</summary>
 public sealed record ElevatorAck(bool Accepted, string? Reason);

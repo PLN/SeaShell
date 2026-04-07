@@ -154,6 +154,11 @@ public sealed class IncludeResolver
 		if (directives.WebApp) aggregated.WebApp = true;
 		if (directives.Elevate) aggregated.Elevate = true;
 		if (directives.Watch) aggregated.Watch = true;
+		if (directives.Restart) aggregated.Restart = true;
+		if (directives.MutexScope > aggregated.MutexScope) aggregated.MutexScope = directives.MutexScope;
+		if (directives.MutexAttach) aggregated.MutexAttach = true;
+		if (directives.Window) aggregated.Window = true;
+		if (directives.Console) aggregated.Console = true;
 	}
 
 	/// <summary>

@@ -21,8 +21,8 @@ public static class DaemonManager
 		&& (RuntimeInformation.RuntimeIdentifier.Contains("musl", StringComparison.OrdinalIgnoreCase)
 			|| File.Exists("/etc/alpine-release"));
 
-	private static readonly string Version =
-		typeof(DaemonManager).Assembly.GetName().Version?.ToString(3) ?? "0.0.0";
+	internal static readonly string Version =
+		typeof(DaemonManager).Assembly.GetName().Version?.ToString(4) ?? "0.0.0";
 
 	// ── Status ─────────────────────────────────────────────────────────
 
@@ -39,7 +39,8 @@ public static class DaemonManager
 			var ping = (PingResponse)reply.Value.Message;
 			return new DaemonStatus(
 				ping.Version, ping.UptimeSeconds, ping.ActiveScripts,
-				ping.ElevatorConnected, ping.Pid, ping.DaemonHash);
+				ping.ElevatorConnected, ping.Pid, ping.DaemonHash,
+				ping.IdleSeconds, ping.IdleTimeoutSeconds, ping.ElevatorVersion);
 		}
 		catch
 		{
@@ -68,17 +69,17 @@ public static class DaemonManager
 	// ── Start ───────────────────────────────────────────────────────────
 
 	/// <summary>Start the daemon process. Stages binary via manifest to avoid DLL locks.</summary>
-	public static int StartDaemon(Action<string>? log = null)
+	public static int StartDaemon(Action<string>? log = null, Action<string>? verboseLog = null)
 	{
 		// Prefer Task Scheduler if the daemon is registered as a task
 		if (ScheduledTasks.TryRunDaemonTask())
 		{
-			log?.Invoke("daemon starting (task)");
+			verboseLog?.Invoke("daemon starting (task)");
 			return 0;
 		}
 
 		// Find daemon via manifest (stages if needed)
-		var stagedDir = ServiceManifest.GetOrStageDaemon(Version, log);
+		var stagedDir = ServiceManifest.GetOrStageDaemon(Version, verboseLog);
 		if (stagedDir == null)
 		{
 			log?.Invoke("daemon not found");
@@ -99,9 +100,15 @@ public static class DaemonManager
 			{
 				FileName = stagedExe,
 				UseShellExecute = false,
+				CreateNoWindow = true,
+				// Redirect stdin/stdout/stderr so the daemon gets new pipes instead
+				// of inheriting the caller's handles. Streams are closed immediately
+				// after Start (see below). This prevents the daemon from holding open
+				// the caller's stdout — which would block SSH sessions, pipe readers,
+				// and test harnesses from detecting EOF.
 				RedirectStandardOutput = true,
 				RedirectStandardError = true,
-				CreateNoWindow = true,
+				RedirectStandardInput = true,
 			};
 		}
 		else if (File.Exists(stagedDll))
@@ -111,9 +118,10 @@ public static class DaemonManager
 			{
 				FileName = "dotnet",
 				UseShellExecute = false,
+				CreateNoWindow = true,
 				RedirectStandardOutput = true,
 				RedirectStandardError = true,
-				CreateNoWindow = true,
+				RedirectStandardInput = true,
 			};
 			psi.ArgumentList.Add("exec");
 			if (File.Exists(depsJson))
@@ -133,13 +141,30 @@ public static class DaemonManager
 
 		try
 		{
+			// Two layers of protection against handle inheritance:
+			//
+			// 1. Redirect+Close (cross-platform): The daemon's stdin/stdout/stderr are
+			//    redirected to new pipes which we close immediately. The daemon gets
+			//    broken pipes instead of the caller's handles. Works on both Windows
+			//    and Linux.
+			//
+			// 2. StdHandleInheritGuard (Windows-only): Temporarily clears the
+			//    HANDLE_FLAG_INHERIT bit on the caller's std handles before CreateProcess.
+			//    This prevents the daemon from inheriting ANY of the caller's handles
+			//    (not just stdio). Without this, CreateProcess(bInheritHandles=TRUE)
+			//    leaks every inheritable handle to the daemon — including pipes from
+			//    SSH sessions, test harnesses, and redirected output.
+			using var guard = StdHandleInheritGuard.Suppress();
 			var proc = Process.Start(psi);
 			if (proc == null || proc.HasExited)
 			{
 				log?.Invoke("failed to start daemon");
 				return 1;
 			}
-			log?.Invoke($"daemon started (pid {proc.Id})");
+			proc.StandardOutput.Close();
+			proc.StandardError.Close();
+			proc.StandardInput.Close();
+			verboseLog?.Invoke($"daemon started (pid {proc.Id})");
 			return 0;
 		}
 		catch (Exception ex)
@@ -206,7 +231,7 @@ public static class DaemonManager
 		}
 	}
 
-	internal static string ComputeDirHash(string dir)
+	public static string ComputeDirHash(string dir)
 	{
 		var sb = new System.Text.StringBuilder();
 		try
@@ -302,4 +327,79 @@ public static class DaemonManager
 /// <summary>Structured daemon status returned by <see cref="DaemonManager.StatusAsync"/>.</summary>
 public sealed record DaemonStatus(
 	string Version, int UptimeSeconds, int ActiveScripts,
-	bool ElevatorConnected, int Pid, string? DaemonHash);
+	bool ElevatorConnected, int Pid, string? DaemonHash,
+	int IdleSeconds = 0, int IdleTimeoutSeconds = 0,
+	string? ElevatorVersion = null);
+
+/// <summary>
+/// Temporarily clears the HANDLE_FLAG_INHERIT bit on the process's standard handles
+/// (stdin, stdout, stderr) so that a child process created via CreateProcess does not
+/// inherit them. Restores the original flags on Dispose.
+///
+/// This prevents long-lived children (daemon) from holding open the caller's stdio
+/// handles — which would block SSH sessions, pipe readers, and test harnesses from
+/// detecting EOF.
+///
+/// No-op on Linux (fork+exec handles fd inheritance differently).
+/// </summary>
+internal sealed class StdHandleInheritGuard : IDisposable
+{
+	private readonly (IntPtr handle, bool wasInheritable)[]? _saved;
+
+	private StdHandleInheritGuard((IntPtr, bool)[]? saved) => _saved = saved;
+
+	public static StdHandleInheritGuard Suppress()
+	{
+		if (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+			return new StdHandleInheritGuard(null);
+
+		var handles = new[]
+		{
+			GetStdHandle(STD_INPUT_HANDLE),
+			GetStdHandle(STD_OUTPUT_HANDLE),
+			GetStdHandle(STD_ERROR_HANDLE),
+		};
+
+		var saved = new (IntPtr handle, bool wasInheritable)[handles.Length];
+		for (int i = 0; i < handles.Length; i++)
+		{
+			var h = handles[i];
+			saved[i] = (h, false);
+			if (h == IntPtr.Zero || h == INVALID_HANDLE_VALUE) continue;
+
+			if (GetHandleInformation(h, out var flags))
+			{
+				saved[i] = (h, (flags & HANDLE_FLAG_INHERIT) != 0);
+				if ((flags & HANDLE_FLAG_INHERIT) != 0)
+					SetHandleInformation(h, HANDLE_FLAG_INHERIT, 0);
+			}
+		}
+
+		return new StdHandleInheritGuard(saved);
+	}
+
+	public void Dispose()
+	{
+		if (_saved == null) return;
+		foreach (var (handle, wasInheritable) in _saved)
+		{
+			if (wasInheritable && handle != IntPtr.Zero && handle != INVALID_HANDLE_VALUE)
+				SetHandleInformation(handle, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT);
+		}
+	}
+
+	private static readonly IntPtr INVALID_HANDLE_VALUE = new(-1);
+	private const uint HANDLE_FLAG_INHERIT = 0x00000001;
+	private const int STD_INPUT_HANDLE = -10;
+	private const int STD_OUTPUT_HANDLE = -11;
+	private const int STD_ERROR_HANDLE = -12;
+
+	[DllImport("kernel32.dll", SetLastError = true)]
+	private static extern IntPtr GetStdHandle(int nStdHandle);
+
+	[DllImport("kernel32.dll", SetLastError = true)]
+	private static extern bool SetHandleInformation(IntPtr hObject, uint dwMask, uint dwFlags);
+
+	[DllImport("kernel32.dll", SetLastError = true)]
+	private static extern bool GetHandleInformation(IntPtr hObject, out uint lpdwFlags);
+}

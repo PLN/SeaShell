@@ -24,10 +24,12 @@ namespace SeaShell.Invoker;
 public sealed class ScriptInvoker
 {
 	private readonly Action<string>? _log;
+	private readonly Action<string>? _verboseLog;
 
-	public ScriptInvoker(Action<string>? log = null)
+	public ScriptInvoker(Action<string>? log = null, Action<string>? verboseLog = null)
 	{
 		_log = log;
+		_verboseLog = verboseLog;
 	}
 
 	// ── Compile ─────────────────────────────────────────────────────────
@@ -60,16 +62,51 @@ public sealed class ScriptInvoker
 
 	// ── Run ─────────────────────────────────────────────────────────────
 
-	/// <summary>Compile and run a script. Handles elevation, watch mode, and reload.</summary>
+	/// <summary>Compile and run a script. Handles elevation, watch mode, mutex, and reload.</summary>
 	public async Task<ScriptResult> RunAsync(
 		string scriptPath, string[] args, string daemonAddress,
 		OutputMode output, ScriptConnection? connection = null,
 		string? workingDirectory = null,
 		Dictionary<string, string>? environmentVars = null,
+		bool windowMode = false,
 		CancellationToken ct = default)
 	{
+		// Pre-compilation mutex check — instant exit for blocked callers
+		ScriptMutex? mutex = null;
+		var scan = DirectiveScanner.Scan(scriptPath);
+		if (scan.Mutex != DirectiveScanner.MutexScope.None)
+		{
+			var identity = DirectiveScanner.ComputeIdentity(scriptPath);
+			mutex = ScriptMutex.TryAcquire(identity, scan.Mutex, _log);
+			if (mutex == null)
+			{
+				// Blocked — check if attach mode is enabled
+				if (scan.MutexAttach)
+					return await AttachToRunningInstanceAsync(identity, args, _log, ct);
+
+				_log?.Invoke($"another instance is already running (mutex: {scan.Mutex.ToString().ToLowerInvariant()})");
+				return new ScriptResult(200, "", $"Another instance is already running (mutex: {scan.Mutex.ToString().ToLowerInvariant()})");
+			}
+		}
+
+		try
+		{
+		return await RunAsyncCore(scriptPath, args, daemonAddress, output, connection, workingDirectory, environmentVars, windowMode, ct);
+		}
+		finally
+		{
+			mutex?.Dispose();
+		}
+	}
+
+	private async Task<ScriptResult> RunAsyncCore(
+		string scriptPath, string[] args, string daemonAddress,
+		OutputMode output, ScriptConnection? connection,
+		string? workingDirectory, Dictionary<string, string>? environmentVars,
+		bool windowMode, CancellationToken ct)
+	{
 		// Ensure daemon is running
-		if (!await DaemonLauncher.EnsureRunningAsync(daemonAddress, _log, ct))
+		if (!await DaemonLauncher.EnsureRunningAsync(daemonAddress, _log, _verboseLog, ct))
 			return new ScriptResult(1, "", "Daemon failed to start");
 
 		// Compile via daemon — keep connection open for watch mode
@@ -103,7 +140,7 @@ public sealed class ScriptInvoker
 			await conn.DisposeAsync();
 
 			if (IsCurrentProcessElevated())
-				return await ExecuteDirectAsync(compiled, args, daemonAddress, scriptPath, output, connection, workingDirectory, environmentVars, ct);
+				return await ExecuteDirectAsync(compiled, args, daemonAddress, scriptPath, output, connection, workingDirectory, environmentVars, windowMode, ct);
 
 			return await ExecuteElevatedAsync(compiled, args, daemonAddress, output, ct);
 		}
@@ -111,11 +148,11 @@ public sealed class ScriptInvoker
 		if (compiled.Watch)
 		{
 			// Watch mode keeps the daemon connection open for HotSwapNotify
-			return await ExecuteWatchAsync(conn, compiled, args, output, connection, workingDirectory, environmentVars, ct);
+			return await ExecuteWatchAsync(conn, compiled, args, output, connection, workingDirectory, environmentVars, windowMode, ct);
 		}
 
 		await conn.DisposeAsync();
-		return await ExecuteDirectAsync(compiled, args, daemonAddress, scriptPath, output, connection, workingDirectory, environmentVars, ct);
+		return await ExecuteDirectAsync(compiled, args, daemonAddress, scriptPath, output, connection, workingDirectory, environmentVars, windowMode, ct);
 	}
 
 	/// <summary>Execute an already-compiled script.</summary>
@@ -125,9 +162,10 @@ public sealed class ScriptInvoker
 		OutputMode output, ScriptConnection? connection = null,
 		string? workingDirectory = null,
 		Dictionary<string, string>? environmentVars = null,
+		bool windowMode = false,
 		CancellationToken ct = default)
 	{
-		return ExecuteDirectAsync(compiled, args, daemonAddress, scriptPath, output, connection, workingDirectory, environmentVars, ct);
+		return ExecuteDirectAsync(compiled, args, daemonAddress, scriptPath, output, connection, workingDirectory, environmentVars, windowMode, ct);
 	}
 
 	// ── Direct execution ────────────────────────────────────────────────
@@ -137,21 +175,57 @@ public sealed class ScriptInvoker
 		string? daemonAddress, string? scriptPath,
 		OutputMode output, ScriptConnection? connection,
 		string? workingDirectory, Dictionary<string, string>? environmentVars,
-		CancellationToken ct)
+		bool windowMode, CancellationToken ct)
 	{
 		var reloadCount = 0;
+		var restartCount = 0;
 		var currentCompiled = compiled;
 		string? stateBase64 = null;
+		var consecutiveFastExits = 0;
+
+		if (compiled.Restart)
+			_verboseLog?.Invoke("restart mode active");
 
 		while (true)
 		{
+			var sw = Stopwatch.StartNew();
+
 			var result = await RunOneInstanceAsync(
 				currentCompiled, args, output, connection,
 				reloadCount, stateBase64, watch: false,
-				workingDirectory, environmentVars, ct);
+				workingDirectory, environmentVars,
+				restart: compiled.Restart, restartCount: restartCount,
+				windowMode: windowMode, ct: ct);
 
 			if (!result.ReloadRequested)
+			{
+				// Check restart: directive must be active, script must not have opted out,
+				// and we must not have been cancelled (Ctrl+C)
+				if (compiled.Restart && result.Restart && !ct.IsCancellationRequested)
+				{
+					restartCount++;
+					sw.Stop();
+
+					// Crash backoff: if the process lived less than 5 seconds, delay
+					if (sw.Elapsed.TotalSeconds < 5)
+					{
+						consecutiveFastExits++;
+						var delaySec = Math.Min(1 << consecutiveFastExits, 8); // 2, 4, 8, 8...
+						_log?.Invoke($"restarting in {delaySec}s (fast exit #{consecutiveFastExits})...");
+						try { await Task.Delay(delaySec * 1000, ct); }
+						catch (OperationCanceledException) { return new ScriptResult(result.ExitCode, result.Stdout, result.Stderr, result.ExitDelay); }
+					}
+					else
+					{
+						consecutiveFastExits = 0;
+						_log?.Invoke("restarting...");
+					}
+
+					continue;
+				}
+
 				return new ScriptResult(result.ExitCode, result.Stdout, result.Stderr, result.ExitDelay);
+			}
 
 			// Script requested reload — recompile via daemon
 			if (daemonAddress == null || scriptPath == null)
@@ -194,58 +268,91 @@ public sealed class ScriptInvoker
 		string daemonAddress, OutputMode output,
 		CancellationToken ct)
 	{
-		var pipeName = $"seashell-{Guid.NewGuid():N}";
+		var restartCount = 0;
+		var consecutiveFastExits = 0;
 
-		var envVars = new List<string>
+		while (true)
 		{
-			$"SEASHELL_PIPE={pipeName}",
-			$"SEASHELL_CLI_PID={Environment.ProcessId}",
-		};
+			var sw = Stopwatch.StartNew();
+			var pipeName = $"seashell-{Guid.NewGuid():N}";
 
-		var spawnReq = new SpawnRequest(
-			compiled.AssemblyPath,
-			compiled.DepsJsonPath,
-			compiled.RuntimeConfigPath,
-			args,
-			Environment.CurrentDirectory,
-			envVars.ToArray(),
-			Environment.ProcessId);
-
-		var spawnResult = await DaemonManager.RequestElevatedSpawnAsync(daemonAddress, spawnReq);
-
-		// Elevator not connected — try starting it, then retry with wait
-		if (!spawnResult.Success)
-		{
-			if (TryStartElevator())
+			var envVars = new List<string>
 			{
-				_log?.Invoke("starting elevator...");
-				var retryReq = spawnReq with { AwaitElevatorMs = 15_000 };
-				spawnResult = await DaemonManager.RequestElevatedSpawnAsync(daemonAddress, retryReq);
+				$"SEASHELL_PIPE={pipeName}",
+				$"SEASHELL_CLI_PID={Environment.ProcessId}",
+			};
+
+			var spawnReq = new SpawnRequest(
+				compiled.AssemblyPath,
+				compiled.DepsJsonPath,
+				compiled.RuntimeConfigPath,
+				args,
+				Environment.CurrentDirectory,
+				envVars.ToArray(),
+				Environment.ProcessId);
+
+			var spawnResult = await DaemonManager.RequestElevatedSpawnAsync(daemonAddress, spawnReq);
+
+			// Elevator not connected — try starting it, then retry with wait
+			if (!spawnResult.Success)
+			{
+				if (TryStartElevator())
+				{
+					_log?.Invoke("starting elevator...");
+					var retryReq = spawnReq with { AwaitElevatorMs = 15_000 };
+					spawnResult = await DaemonManager.RequestElevatedSpawnAsync(daemonAddress, retryReq);
+				}
 			}
-		}
 
-		if (!spawnResult.Success)
-		{
-			_log?.Invoke("script requires elevation (//sea_elevate)");
-			_log?.Invoke($"elevator: {spawnResult.Error}");
-			return new ScriptResult(1, "", $"Elevation failed: {spawnResult.Error}");
-		}
+			if (!spawnResult.Success)
+			{
+				_log?.Invoke("script requires elevation (//sea_elevate)");
+				_log?.Invoke($"elevator: {spawnResult.Error}");
+				return new ScriptResult(1, "", $"Elevation failed: {spawnResult.Error}");
+			}
 
-		try
-		{
-			var pipe = new NamedPipeClientStream(".", pipeName, PipeDirection.InOut, PipeOptions.Asynchronous);
-			pipe.Connect(10_000);
+			try
+			{
+				var pipe = new NamedPipeClientStream(".", pipeName, PipeDirection.InOut, PipeOptions.Asynchronous);
+				pipe.Connect(10_000);
 
-			await using var channel = new MessageChannel(pipe);
-			await channel.SendAsync(BuildScriptInit(compiled, args,
-				reloadCount: 0, launcherPid: Environment.ProcessId), ct);
+				await using var channel = new MessageChannel(pipe);
+				await channel.SendAsync(BuildScriptInit(compiled, args,
+					reloadCount: 0, launcherPid: Environment.ProcessId,
+					restart: compiled.Restart, restartCount: restartCount,
+					mutexScope: compiled.MutexScope, mutexAttach: compiled.MutexAttach), ct);
 
-			var (exitCode, _, exitDelay) = await ReceiveUntilExitAsync(channel, ct);
-			return new ScriptResult(exitCode, "", "", exitDelay);
-		}
-		catch (Exception ex)
-		{
-			return new ScriptResult(1, "", $"Elevated script communication failed: {ex.Message}");
+				var (exitCode, _, exitDelay, scriptRestart) = await ReceiveUntilExitAsync(channel, ct);
+
+				// Check restart
+				if (compiled.Restart && scriptRestart && !ct.IsCancellationRequested)
+				{
+					restartCount++;
+					sw.Stop();
+
+					if (sw.Elapsed.TotalSeconds < 5)
+					{
+						consecutiveFastExits++;
+						var delaySec = Math.Min(1 << consecutiveFastExits, 8);
+						_log?.Invoke($"restarting elevated in {delaySec}s (fast exit #{consecutiveFastExits})...");
+						try { await Task.Delay(delaySec * 1000, ct); }
+						catch (OperationCanceledException) { return new ScriptResult(exitCode, "", "", exitDelay); }
+					}
+					else
+					{
+						consecutiveFastExits = 0;
+						_log?.Invoke("restarting elevated...");
+					}
+
+					continue;
+				}
+
+				return new ScriptResult(exitCode, "", "", exitDelay);
+			}
+			catch (Exception ex)
+			{
+				return new ScriptResult(1, "", $"Elevated script communication failed: {ex.Message}");
+			}
 		}
 	}
 
@@ -258,9 +365,11 @@ public sealed class ScriptInvoker
 		TransportStream daemonConn, CompiledScript initial, string[] args,
 		OutputMode output, ScriptConnection? connection,
 		string? workingDirectory, Dictionary<string, string>? environmentVars,
-		CancellationToken ct)
+		bool windowMode, CancellationToken ct)
 	{
 		var reloadCount = 0;
+		var restartCount = 0;
+		var consecutiveFastExits = 0;
 		var currentCompiled = initial;
 		string? stateBase64 = null;
 
@@ -268,8 +377,9 @@ public sealed class ScriptInvoker
 		{
 			while (!ct.IsCancellationRequested)
 			{
+				var sw = Stopwatch.StartNew();
 				var pipeName = $"seashell-{Guid.NewGuid():N}";
-				var psi = BuildProcessStartInfo(currentCompiled, args, output, workingDirectory, environmentVars);
+				var psi = BuildProcessStartInfo(currentCompiled, args, output, workingDirectory, environmentVars, windowMode);
 				psi.Environment["SEASHELL_PIPE"] = pipeName;
 
 				using var proc = Process.Start(psi)!;
@@ -284,7 +394,9 @@ public sealed class ScriptInvoker
 				if (connection != null) connection.Channel = scriptChannel;
 
 				await scriptChannel.SendAsync(BuildScriptInit(currentCompiled, args,
-					reloadCount: reloadCount, stateBase64: stateBase64, watch: true), ct);
+					reloadCount: reloadCount, stateBase64: stateBase64, watch: true,
+					restart: initial.Restart, restartCount: restartCount,
+					mutexScope: initial.MutexScope, mutexAttach: initial.MutexAttach), ct);
 
 				// Channel reader with reload request signaling
 				var reloadRequests = Channel.CreateUnbounded<(string? reason, bool clearCache)>();
@@ -301,7 +413,36 @@ public sealed class ScriptInvoker
 
 					if (completed == channelTask)
 					{
-						var (exitCode, _, exitDelay) = await channelTask;
+						var (exitCode, _, exitDelay, scriptRestart) = await channelTask;
+
+						// Check restart in watch mode
+						if (initial.Restart && scriptRestart && !ct.IsCancellationRequested)
+						{
+							restartCount++;
+							var elapsed = sw.Elapsed;
+
+							if (connection != null) connection.Channel = null;
+							await scriptChannel.DisposeAsync();
+							if (!proc.WaitForExit(3000))
+								try { proc.Kill(entireProcessTree: false); } catch { }
+
+							if (elapsed.TotalSeconds < 5)
+							{
+								consecutiveFastExits++;
+								var delaySec = Math.Min(1 << consecutiveFastExits, 8);
+								_log?.Invoke($"restarting in {delaySec}s (fast exit #{consecutiveFastExits})...");
+								try { await Task.Delay(delaySec * 1000, ct); }
+								catch (OperationCanceledException) { break; }
+							}
+							else
+							{
+								consecutiveFastExits = 0;
+								_log?.Invoke("restarting...");
+							}
+
+							break; // break inner loop, outer while creates new process
+						}
+
 						if (output == OutputMode.Capture)
 						{
 							var so = await proc.StandardOutput.ReadToEndAsync();
@@ -360,7 +501,7 @@ public sealed class ScriptInvoker
 				try
 				{
 					using var cts = new CancellationTokenSource(5000);
-					var (_, state, _) = await channelTask.WaitAsync(cts.Token);
+					var (_, state, _, _) = await channelTask.WaitAsync(cts.Token);
 					stateBase64 = state;
 				}
 				catch { }
@@ -379,7 +520,8 @@ public sealed class ScriptInvoker
 					swapNotify.ManifestPath,
 					swapNotify.StartupHookPath,
 					swapNotify.DirectExe,
-					false, true);
+					false, true,
+					swapNotify.Restart);
 
 				}
 				finally
@@ -401,17 +543,19 @@ public sealed class ScriptInvoker
 
 	private sealed record InstanceResult(
 		int ExitCode, string Stdout, string Stderr, int ExitDelay,
-		bool ReloadRequested, bool ClearCache, string? ReloadReason, string? State);
+		bool ReloadRequested, bool ClearCache, string? ReloadReason, string? State,
+		bool Restart = true);
 
 	private async Task<InstanceResult> RunOneInstanceAsync(
 		CompiledScript compiled, string[] args,
 		OutputMode output, ScriptConnection? connection,
 		int reloadCount, string? stateBase64, bool watch,
 		string? workingDirectory, Dictionary<string, string>? environmentVars,
-		CancellationToken ct)
+		bool restart = false, int restartCount = 0,
+		bool windowMode = false, CancellationToken ct = default)
 	{
 		var pipeName = $"seashell-{Guid.NewGuid():N}";
-		var psi = BuildProcessStartInfo(compiled, args, output, workingDirectory, environmentVars);
+		var psi = BuildProcessStartInfo(compiled, args, output, workingDirectory, environmentVars, windowMode);
 		psi.Environment["SEASHELL_PIPE"] = pipeName;
 
 		using var proc = Process.Start(psi)!;
@@ -427,7 +571,16 @@ public sealed class ScriptInvoker
 		}
 		catch
 		{
-			// Pipe connect failed — run without Sea context
+			// Pipe connect failed — directives that require IPC cannot function
+			if (restart)
+			{
+				_log?.Invoke("IPC pipe failed — //sea_restart requires IPC, aborting");
+				if (!proc.WaitForExit(3000))
+					try { proc.Kill(entireProcessTree: false); } catch { }
+				return new InstanceResult(1, "", "IPC pipe failed — //sea_restart requires IPC", 0, false, false, null, null, false);
+			}
+
+			// No directives need IPC — run without Sea context
 			if (output == OutputMode.Capture)
 			{
 				var o = await proc.StandardOutput.ReadToEndAsync();
@@ -443,7 +596,9 @@ public sealed class ScriptInvoker
 		if (connection != null) connection.Channel = channel;
 
 		await channel.SendAsync(BuildScriptInit(compiled, args,
-			reloadCount: reloadCount, stateBase64: stateBase64, watch: watch), ct);
+			reloadCount: reloadCount, stateBase64: stateBase64, watch: watch,
+			restart: restart, restartCount: restartCount,
+			mutexScope: compiled.MutexScope, mutexAttach: compiled.MutexAttach), ct);
 
 		// Drain channel with reload awareness
 		var reloadRequests = Channel.CreateUnbounded<(string?, bool)>();
@@ -468,9 +623,9 @@ public sealed class ScriptInvoker
 		{
 			var stdout = stdoutTask != null ? await stdoutTask : "";
 			var stderr = stderrTask != null ? await stderrTask : "";
-			var (_, _, exitDelay) = await channelTask;
+			var (_, _, exitDelay, scriptRestart) = await channelTask;
 			if (connection != null) connection.Channel = null;
-			return new InstanceResult(proc.ExitCode, stdout, stderr, exitDelay, false, false, null, null);
+			return new InstanceResult(proc.ExitCode, stdout, stderr, exitDelay, false, false, null, null, scriptRestart);
 		}
 
 		if (completed == cancelTcs.Task)
@@ -495,7 +650,7 @@ public sealed class ScriptInvoker
 		try
 		{
 			using var cts = new CancellationTokenSource(5000);
-			var (_, s, _) = await channelTask.WaitAsync(cts.Token);
+			var (_, s, _, _) = await channelTask.WaitAsync(cts.Token);
 			state = s;
 		}
 		catch { }
@@ -516,12 +671,77 @@ public sealed class ScriptInvoker
 		}
 	}
 
+	// ── Attach client ───────────────────────────────────────────────────
+
+	/// <summary>
+	/// Connect to an already-running instance's attach pipe, send args + CWD,
+	/// relay any messages, and wait for close. No compilation, no script process.
+	/// </summary>
+	private static async Task<ScriptResult> AttachToRunningInstanceAsync(
+		string identity, string[] args, Action<string>? log, CancellationToken ct)
+	{
+		var pipeName = ScriptMutex.GetAttachPipeName(identity);
+		log?.Invoke("attaching to running instance...");
+
+		try
+		{
+			var pipe = new NamedPipeClientStream(".", pipeName, PipeDirection.InOut, PipeOptions.Asynchronous);
+			pipe.Connect(5000);
+
+			await using var channel = new MessageChannel(pipe);
+
+			// Send handshake
+			await channel.SendAsync(new AttachHello(args, Environment.CurrentDirectory), ct);
+
+			// Relay messages until close or timeout
+			using var cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+			cts.CancelAfter(30_000);
+
+			while (!cts.IsCancellationRequested)
+			{
+				var result = await channel.ReceiveAsync(cts.Token);
+				if (result == null) break;
+
+				switch (result.Value.Type)
+				{
+					case MessageType.AttachClose:
+						var close = (AttachClose)result.Value.Message;
+						return new ScriptResult(close.ExitCode, "", "");
+
+					case MessageType.AttachMessage:
+						var msg = (AttachMessage)result.Value.Message;
+						// Relay payload to stdout
+						var text = System.Text.Encoding.UTF8.GetString(msg.Payload);
+						System.Console.Write(text);
+						break;
+				}
+			}
+
+			return new ScriptResult(0, "", "");
+		}
+		catch (TimeoutException)
+		{
+			log?.Invoke("attach pipe not available (running instance may not support //sea_mutex_attach)");
+			return new ScriptResult(200, "", "Attach pipe not available");
+		}
+		catch (OperationCanceledException)
+		{
+			return new ScriptResult(0, "", "");
+		}
+		catch (Exception ex)
+		{
+			log?.Invoke($"attach failed: {ex.Message}");
+			return new ScriptResult(200, "", $"Attach failed: {ex.Message}");
+		}
+	}
+
 	// ── Helpers ─────────────────────────────────────────────────────────
 
 	internal static ProcessStartInfo BuildProcessStartInfo(
 		CompiledScript compiled, string[] args, OutputMode output,
 		string? workingDirectory = null,
-		Dictionary<string, string>? environmentVars = null)
+		Dictionary<string, string>? environmentVars = null,
+		bool windowMode = false)
 	{
 		var cwd = workingDirectory ?? Environment.CurrentDirectory;
 		ProcessStartInfo psi;
@@ -562,6 +782,14 @@ public sealed class ScriptInvoker
 			psi.RedirectStandardError = true;
 			psi.CreateNoWindow = true;
 		}
+		else if (windowMode)
+		{
+			// Window mode (seaw.exe): suppress console window on the child process.
+			// Output is still inherited (not redirected) — it just goes nowhere since
+			// the parent has no console.
+			psi.UseShellExecute = false;
+			psi.CreateNoWindow = true;
+		}
 
 		if (compiled.StartupHookPath != null)
 			psi.Environment["DOTNET_STARTUP_HOOKS"] = compiled.StartupHookPath;
@@ -582,7 +810,10 @@ public sealed class ScriptInvoker
 		CompiledScript compiled, string[] args,
 		int reloadCount = 0, int launcherPid = 0,
 		string? stateBase64 = null, bool watch = false,
-		bool isConsoleEphemeral = false)
+		bool isConsoleEphemeral = false,
+		bool restart = false, int restartCount = 0,
+		byte mutexScope = 0, bool mutexAttach = false,
+		bool windowMode = false)
 	{
 		string? scriptPath = null;
 		string[]? sources = null;
@@ -616,10 +847,15 @@ public sealed class ScriptInvoker
 			launcherPid,
 			reloadCount,
 			stateBase64,
-			watch);
+			watch,
+			restart,
+			restartCount,
+			mutexScope,
+			mutexAttach,
+			windowMode);
 	}
 
-	private static async Task<(int exitCode, string? state, int exitDelay)> ReceiveUntilExitOrStateAsync(
+	private static async Task<(int exitCode, string? state, int exitDelay, bool restart)> ReceiveUntilExitOrStateAsync(
 		MessageChannel channel, ScriptConnection? connection,
 		ChannelWriter<(string?, bool)>? reloadWriter, CancellationToken ct)
 	{
@@ -630,13 +866,13 @@ public sealed class ScriptInvoker
 			while (true)
 			{
 				var msg = await channel.ReceiveAsync(ct);
-				if (msg == null) return (1, state, exitDelay);
+				if (msg == null) return (1, state, exitDelay, true);
 
 				switch (msg.Value.Type)
 				{
 					case MessageType.ScriptExit:
 						var exit = (ScriptExit)msg.Value.Message;
-						return (exit.ExitCode, state, exit.ExitDelay);
+						return (exit.ExitCode, state, exit.ExitDelay, exit.Restart);
 
 					case MessageType.ScriptState:
 						var s = (ScriptState)msg.Value.Message;
@@ -658,15 +894,15 @@ public sealed class ScriptInvoker
 		}
 		catch (OperationCanceledException)
 		{
-			return (1, state, exitDelay);
+			return (1, state, exitDelay, true);
 		}
 		catch
 		{
-			return (1, state, exitDelay);
+			return (1, state, exitDelay, true);
 		}
 	}
 
-	private static async Task<(int exitCode, string? state, int exitDelay)> ReceiveUntilExitAsync(
+	private static async Task<(int exitCode, string? state, int exitDelay, bool restart)> ReceiveUntilExitAsync(
 		MessageChannel channel, CancellationToken ct)
 	{
 		return await ReceiveUntilExitOrStateAsync(channel, null, null, ct);

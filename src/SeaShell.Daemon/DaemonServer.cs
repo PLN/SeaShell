@@ -25,11 +25,12 @@ public sealed class DaemonServer : IAsyncDisposable
 	// The Elevator's persistent connection — null if no elevator is connected.
 	private TransportStream? _elevator;
 	private bool _elevatorIsElevated;
+	private string? _elevatorVersion;
 	private readonly SemaphoreSlim _elevatorLock = new(1, 1);
 	private TaskCompletionSource<bool>? _elevatorArrived;
 
 	private static readonly TimeSpan UpdateInterval = TimeSpan.FromHours(8);
-	private static readonly string Version = typeof(DaemonServer).Assembly.GetName().Version?.ToString(3) ?? "0.1.0";
+	private static readonly string Version = typeof(DaemonServer).Assembly.GetName().Version?.ToString(4) ?? "0.1.0";
 
 	// Idle timeout — 0 means stay active (default).
 	private long _lastActivityTicks;
@@ -216,6 +217,7 @@ public sealed class DaemonServer : IAsyncDisposable
 
 			_elevator = conn;
 			_elevatorIsElevated = hello.IsElevated;
+			_elevatorVersion = hello.Version;
 		}
 		finally
 		{
@@ -361,7 +363,8 @@ public sealed class DaemonServer : IAsyncDisposable
 					recompile.ManifestPath,
 					reason,
 					recompile.StartupHookPath,
-					recompile.DirectExe);
+					recompile.DirectExe,
+					recompile.Restart);
 
 				try
 				{
@@ -420,21 +423,29 @@ public sealed class DaemonServer : IAsyncDisposable
 
 	private PingResponse MakePingResponse()
 	{
-		var uptime = (int)(DateTime.UtcNow - _startTime).TotalSeconds;
-		return new PingResponse(Version, false, _elevator != null, uptime, 0,
-			Environment.ProcessId, _daemonHash);
+		var now = DateTime.UtcNow;
+		var uptime = (int)(now - _startTime).TotalSeconds;
+		var idle = (int)((now.Ticks - Interlocked.Read(ref _lastActivityTicks)) / TimeSpan.TicksPerSecond);
+		var timeout = (int)IdleTimeout.TotalSeconds;
+		return new PingResponse(Version, false, _elevator != null, uptime, _activeConnections,
+			Environment.ProcessId, _daemonHash, idle, timeout, _elevatorVersion);
 	}
 
-	/// <summary>Compute hash of our own directory — matches DaemonManager.StageBinary's hash.</summary>
+	/// <summary>Compute hash of our own directory — must match DaemonManager.ComputeDirHash.</summary>
 	private static string? ComputeSelfHash()
 	{
 		try
 		{
-			var ticks = 0L;
+			var sb = new System.Text.StringBuilder();
 			foreach (var f in System.Linq.Enumerable.OrderBy(
-				Directory.GetFiles(AppContext.BaseDirectory, "*.dll"), f => f))
-				ticks += File.GetLastWriteTimeUtc(f).Ticks;
-			return ticks.ToString("x");
+				Directory.GetFiles(AppContext.BaseDirectory, "*.dll", SearchOption.AllDirectories), f => f))
+			{
+				var name = System.Reflection.AssemblyName.GetAssemblyName(f);
+				sb.Append(name.FullName);
+			}
+			var bytes = System.Security.Cryptography.SHA256.HashData(
+				System.Text.Encoding.UTF8.GetBytes(sb.ToString()));
+			return Convert.ToHexString(bytes)[..16].ToLowerInvariant();
 		}
 		catch { return null; }
 	}
@@ -456,6 +467,9 @@ public sealed class DaemonServer : IAsyncDisposable
 		if (!result.Success)
 			return new RunResponse(false, false, false, null, null, null, null, 0, result.Error);
 
+		_log.Debug("Compile: Restart={Restart} Watch={Watch} Elevate={Elevate} Mutex={Mutex}",
+			result.Restart, result.Watch, result.Elevate, result.MutexScope);
+
 		return new RunResponse(
 			true, result.Elevate, result.Watch,
 			result.AssemblyPath,
@@ -464,7 +478,10 @@ public sealed class DaemonServer : IAsyncDisposable
 			result.ManifestPath,
 			0, null,
 			result.StartupHookPath,
-			result.DirectExe);
+			result.DirectExe,
+			result.Restart,
+			result.MutexScope,
+			result.MutexAttach);
 	}
 
 	/// <summary>

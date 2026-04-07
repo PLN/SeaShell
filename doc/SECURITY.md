@@ -79,11 +79,32 @@ Elevated scripts call `AttachConsole(cliPid)` to share the CLI's console. This
 requires the CLI process to be running and accessible. The CLI PID is passed via
 environment variable, not over any public channel.
 
+## Mutex & Attach
+
+### Script mutex
+
+`//sea_mutex` uses OS-level synchronization primitives:
+
+- **Windows**: Named kernel mutexes. System scope uses `Global\` prefix, session scope
+  uses `Local\` prefix, user scope uses default namespace with username suffix. Same
+  trust boundary as daemon pipes — only the creating user can interact.
+- **Linux**: File locks (flock) in scope-appropriate directories. System scope uses
+  `/tmp/`, user scope uses `~/.local/share/seashell/`, session scope uses
+  `$XDG_RUNTIME_DIR/`. Directory permissions control access.
+
+### Attach pipe
+
+`//sea_mutex_attach` creates a named pipe (`seashell-attach-{identity}`) with the same
+per-user ACL/permissions as the script pipe (see above). Only the same user can connect.
+The identity is a deterministic hash of the script path — not secret, but the ACL
+prevents unauthorized connections.
+
 ## File System
 
 ### Compilation cache
 
-Compiled artifacts are written to `%TEMP%/seashell/cache/` (per-user temp directory).
+Compiled artifacts are written to `{DataDir}/cache/` (per-user data directory —
+`%LOCALAPPDATA%\seashell\` on Windows, `~/.local/share/seashell/` on Linux).
 Other users cannot read or tamper with cached compilations.
 
 ### NuGet packages
