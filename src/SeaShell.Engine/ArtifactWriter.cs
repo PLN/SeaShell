@@ -13,7 +13,7 @@ namespace SeaShell.Engine;
 /// </summary>
 static class ArtifactWriter
 {
-	public static void WriteRuntimeConfig(string path, bool webApp)
+	public static void WriteRuntimeConfig(string path, bool webApp, string engineDir)
 	{
 		var tfm = GetCurrentTfm();
 		var version = Environment.Version.ToString(3); // e.g., "10.0.0"
@@ -25,7 +25,9 @@ static class ArtifactWriter
 		if (webApp)
 			frameworks.Add(new { name = "Microsoft.AspNetCore.App", version });
 
-		// Point the host at the NuGet cache so it can find package DLLs
+		// Probing paths for runtime assembly resolution:
+		// 1. Engine dir — bundled DLLs (SeaShell.Script, Ipc, MessagePack) live here
+		// 2. NuGet cache — user's NuGet packages resolved from //sea_nuget directives
 		var nugetCache = Path.Combine(
 			Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
 			".nuget", "packages");
@@ -36,7 +38,7 @@ static class ArtifactWriter
 			{
 				tfm,
 				frameworks,
-				additionalProbingPaths = new[] { nugetCache },
+				additionalProbingPaths = new[] { engineDir, nugetCache },
 				configProperties = new Dictionary<string, object>
 				{
 					["System.Runtime.Serialization.EnableUnsafeBinaryFormatterSerialization"] = false,

@@ -33,8 +33,12 @@ public static class DepsJsonWriter
 		// Build targets entries
 		var targets = new Dictionary<string, object>();
 
-		// SeaShell runtime libraries — listed as project deps so dotnet exec
-		// finds them in the app directory (next to the compiled script DLL)
+		// SeaShell runtime libraries — listed as project deps so the .NET host
+		// includes them in the TPA (Trusted Platform Assemblies) list. Without
+		// these entries, the startup hook (SeaShell.Script) can't load and the
+		// script pipe connection fails.
+		// The DLLs are physically copied to the output dir by ScriptCompiler;
+		// the engine dir is also in additionalProbingPaths as a fallback.
 		targets[$"MessagePack/{msgpackVer}"] = new
 		{
 			runtime = new Dictionary<string, object>

@@ -258,7 +258,7 @@ public sealed class ScriptCompiler
 		WriteIfMissing(dllPath, ms.ToArray());
 
 		if (!File.Exists(runtimeConfigPath))
-			ArtifactWriter.WriteRuntimeConfig(runtimeConfigPath, resolved.Directives.WebApp);
+			ArtifactWriter.WriteRuntimeConfig(runtimeConfigPath, resolved.Directives.WebApp, _engineDir);
 
 		var depsPath = Path.Combine(outputDir, $"{scriptName}.deps.json");
 		if (!File.Exists(depsPath))
@@ -543,7 +543,7 @@ public sealed class ScriptCompiler
 		if (File.Exists(companionRtc))
 			WriteIfMissing(stagedRtc, File.ReadAllBytes(companionRtc));
 		else
-			ArtifactWriter.WriteRuntimeConfig(stagedRtc, info!.HasAspNetRef);
+			ArtifactWriter.WriteRuntimeConfig(stagedRtc, info!.HasAspNetRef, _engineDir);
 
 		var stagedDeps = Path.Combine(outputDir, $"{name}.deps.json");
 		var companionDeps = Path.Combine(binDir, $"{name}.deps.json");

@@ -108,6 +108,9 @@ RunTest("nuget-transitive (CS1704 dedup)", () =>
 RunTest("host-in-host (ScriptHost compilation)", () =>
 	DiagnosticsExt.RunProcess("sea", Path.Combine(testDir, "host-in-host", "host-in-host.cs"), src, prefix: "test"));
 
+RunTest("host-resolution (bundled DLL probing)", () =>
+	DiagnosticsExt.RunProcess("sea", Path.Combine(testDir, "host-resolution", "host-resolution.cs"), src, prefix: "test"));
+
 // ── Lifecycle tests ──────────────────────────────────────────────────
 
 Console.WriteLine("\n[test] === Lifecycle tests ===");
