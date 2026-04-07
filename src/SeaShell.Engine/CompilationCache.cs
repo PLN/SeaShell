@@ -43,9 +43,7 @@ public static class CompilationCache
 		return ticks.ToString();
 	}
 
-	public static string ComputeHash(
-		List<(string Path, string Source)> sources,
-		List<NuGetResolver.ResolvedPackage> packages)
+	public static string ComputeHash(List<(string Path, string Source)> sources)
 	{
 		using var sha = SHA256.Create();
 
@@ -53,18 +51,14 @@ public static class CompilationCache
 		var fp = Encoding.UTF8.GetBytes(_engineFingerprint);
 		sha.TransformBlock(fp, 0, fp.Length, null, 0);
 
-		// Source files
+		// Source files — the only input that changes between runs.
+		// NuGet packages are immutable by convention (same id+version = same content),
+		// so their versions don't need to be in the hash. The output dir is self-contained
+		// (all DLLs copied there at compile time), so NuGet cache state doesn't matter.
 		foreach (var (path, source) in sources.OrderBy(s => s.Path, StringComparer.OrdinalIgnoreCase))
 		{
 			sha.TransformBlock(Encoding.UTF8.GetBytes(path), 0, Encoding.UTF8.GetByteCount(path), null, 0);
 			sha.TransformBlock(Encoding.UTF8.GetBytes(source), 0, Encoding.UTF8.GetByteCount(source), null, 0);
-		}
-
-		// NuGet package versions — update invalidates cache
-		foreach (var pkg in packages.OrderBy(p => p.Name, StringComparer.OrdinalIgnoreCase))
-		{
-			var pkgKey = $"{pkg.Name}@{pkg.Version}";
-			sha.TransformBlock(Encoding.UTF8.GetBytes(pkgKey), 0, Encoding.UTF8.GetByteCount(pkgKey), null, 0);
 		}
 
 		sha.TransformFinalBlock(Array.Empty<byte>(), 0, 0);

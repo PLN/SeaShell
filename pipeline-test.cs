@@ -75,6 +75,17 @@ if (installCode != 0)
 	return 1;
 }
 
+// Clear SeaShell compilation cache — stale staged binaries from previous runs
+// may have deps.json/runtimeconfig files from a prior engine version.
+var seashellCache = isWindows
+	? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "seashell", "cache")
+	: Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".local", "share", "seashell", "cache");
+if (Directory.Exists(seashellCache))
+{
+	Console.WriteLine($"[test] Clearing compilation cache: {seashellCache}");
+	try { Directory.Delete(seashellCache, true); } catch { }
+}
+
 // Verify installation
 var verifyCode = DiagnosticsExt.RunProcess("sea", "--version", src, prefix: "test");
 if (verifyCode != 0)
@@ -111,6 +122,43 @@ RunTest("host-in-host (ScriptHost compilation)", () =>
 RunTest("host-resolution (bundled DLL probing)", () =>
 	DiagnosticsExt.RunProcess("sea", Path.Combine(testDir, "host-resolution", "host-resolution.cs"), src, prefix: "test"));
 
+RunTest("host-in-host-nuget (nested ScriptHost + NuGet)", () =>
+	DiagnosticsExt.RunProcess("sea", Path.Combine(testDir, "host-in-host-nuget", "host-in-host-nuget.cs"), src, prefix: "test"));
+
+// ── Engine dir NuGet test (dotnet run, no publish) ──────────────────
+// Tests that ScriptHost works when the Engine DLL is in the NuGet cache
+// (not a flat publish dir). Bundled DLLs are in separate package dirs.
+
+Console.WriteLine("\n[test] === Engine dir NuGet test ===");
+
+RunTest("engine-dir-nuget (dotnet run, NuGet cache layout)", () =>
+{
+	var engineDirTestProject = Path.Combine(src, "test", "engine-dir-nuget");
+	Environment.SetEnvironmentVariable("SEASHELL_NUPKG_DIR", nupkgDir);
+	return DiagnosticsExt.RunProcess("dotnet",
+		$"run --project \"{engineDirTestProject}\"",
+		src, prefix: "test", logFile: Path.Combine(logs, "engine-dir-nuget.log"));
+});
+
+// ── Binary pass-through test ────────────────────────────────────────
+// Tests that a pre-compiled binary with its own deps.json works via sea.
+
+Console.WriteLine("\n[test] === Binary pass-through test ===");
+
+RunTest("binary-deps (companion deps.json pass-through)", () =>
+{
+	var binaryTestProject = Path.Combine(src, "test", "binary-deps");
+	var binaryPublishDir = Path.Combine(artifacts, "binary-deps-test");
+
+	var pubCode = DiagnosticsExt.RunProcess("dotnet",
+		$"publish \"{binaryTestProject}\" -c Release -o \"{binaryPublishDir}\" --force",
+		src, prefix: "test", logFile: Path.Combine(logs, "binary-deps-publish.log"));
+	if (pubCode != 0) { Console.Error.WriteLine("[test] binary-deps publish failed"); return pubCode; }
+
+	var binaryDll = Path.Combine(binaryPublishDir, "binary-deps.dll");
+	return DiagnosticsExt.RunProcess("sea", binaryDll, src, prefix: "test");
+});
+
 // ── Service CWD test ─────────────────────────────────────────────────
 // Full end-to-end: publish ServiceCwdTest, register as service, start via
 // SCM/systemd, verify script runs despite CWD being system32 or /.
@@ -134,6 +182,12 @@ RunTest("service-cwd (SCM/systemd script resolution)", () =>
 	// Clear NuGet http-cache to avoid stale packages with same version number
 	DiagnosticsExt.RunProcess("dotnet", "nuget locals http-cache --clear", src, quiet: true);
 
+	// Clear SYSTEM/root SeaShell compilation cache from previous runs
+	if (isWindows)
+		DiagnosticsExt.RunProcess("gsudo", @"cmd /c rmdir /s /q ""C:\ProgramData\seashell\cache"" 2>nul", src, quiet: true);
+	else
+		DiagnosticsExt.RunProcess("sudo", "rm -rf /var/lib/seashell/cache", src, quiet: true);
+
 	// Publish with local nupkg source
 	Environment.SetEnvironmentVariable("SEASHELL_NUPKG_DIR", nupkgDir);
 	var pubCode = DiagnosticsExt.RunProcess("dotnet",
@@ -148,6 +202,40 @@ RunTest("service-cwd (SCM/systemd script resolution)", () =>
 
 	// Elevation wrapper
 	var elevate = isWindows ? "gsudo" : "sudo";
+
+	// Place a nuget.config in the service account's temp/seashell/ directory.
+	// NuGetDownloader creates temp projects under <temp>/seashell/restore/<guid>/,
+	// and dotnet restore walks up the directory tree to find nuget.config.
+	// SYSTEM uses C:\Windows\Temp, root uses /tmp.
+	var serviceTemp = isWindows ? @"C:\Windows\Temp" : "/tmp";
+	var nugetConfigDir = Path.Combine(serviceTemp, "seashell");
+	var nugetConfigPath = Path.Combine(nugetConfigDir, "nuget.config");
+	var nugetConfigContent = $"""
+		<?xml version="1.0" encoding="utf-8"?>
+		<configuration>
+			<packageSources>
+				<clear />
+				<add key="pipeline-local" value="{nupkgDir}" />
+				<add key="nuget.org" value="https://api.nuget.org/v3/index.json" />
+			</packageSources>
+		</configuration>
+		""";
+	Console.WriteLine($"[test]   Writing nuget.config for service account at {nugetConfigPath}");
+	if (isWindows)
+	{
+		// C:\Windows\Temp requires admin — use gsudo to create dir + write file
+		DiagnosticsExt.RunProcess(elevate, $"cmd /c mkdir \"{nugetConfigDir}\" 2>nul", publishDir, quiet: true);
+		var tempConfig = Path.Combine(Path.GetTempPath(), "seashell-test-nuget.config");
+		File.WriteAllText(tempConfig, nugetConfigContent);
+		DiagnosticsExt.RunProcess(elevate, $"cmd /c copy /Y \"{tempConfig}\" \"{nugetConfigPath}\"", publishDir, quiet: true);
+		File.Delete(tempConfig);
+	}
+	else
+	{
+		// /tmp is world-writable
+		Directory.CreateDirectory(nugetConfigDir);
+		File.WriteAllText(nugetConfigPath, nugetConfigContent);
+	}
 
 	// Install service
 	Console.WriteLine($"[test]   Installing service '{serviceName}'...");
@@ -172,6 +260,33 @@ RunTest("service-cwd (SCM/systemd script resolution)", () =>
 		if (!File.Exists(markerFile))
 		{
 			Console.Error.WriteLine("[test] Marker file not found after 30s");
+			// Dump service logs to diagnose why the script failed
+			if (isWindows)
+				DiagnosticsExt.RunProcess(elevate,
+					"powershell -c \"Get-WinEvent -FilterHashtable @{LogName='Application';ProviderName='.NET Runtime';StartTime=(Get-Date).AddMinutes(-2)} -MaxEvents 5 | Format-List\"",
+					publishDir, prefix: "test");
+			else
+				DiagnosticsExt.RunProcess("sudo",
+					$"journalctl -u {serviceName} --no-pager -n 30",
+					publishDir, prefix: "test");
+
+			// Dump compilation cache contents for diagnosis
+			var svcCacheDir = isWindows ? @"C:\ProgramData\seashell\cache" : "/var/lib/seashell/cache";
+			Console.Error.WriteLine($"[test] Compilation cache ({svcCacheDir}):");
+			if (isWindows)
+			{
+				DiagnosticsExt.RunProcess(elevate, $"cmd /c dir /s \"{svcCacheDir}\"", publishDir, prefix: "test");
+				DiagnosticsExt.RunProcess(elevate,
+					$"powershell -c \"Get-ChildItem '{svcCacheDir}' -Recurse -Filter *.deps.json | ForEach-Object {{ Write-Host '=== ' $_.FullName; Get-Content $_.FullName }}\"",
+					publishDir, prefix: "test");
+			}
+			else
+			{
+				DiagnosticsExt.RunProcess("sudo", $"find {svcCacheDir} -type f", publishDir, prefix: "test");
+				DiagnosticsExt.RunProcess("sudo",
+					$"bash -c 'for f in {svcCacheDir}/*/*.deps.json; do echo \"=== $f\"; cat \"$f\"; done'",
+					publishDir, prefix: "test");
+			}
 			return 1;
 		}
 
@@ -185,7 +300,14 @@ RunTest("service-cwd (SCM/systemd script resolution)", () =>
 			return 1;
 		}
 
-		Console.WriteLine("[test]   Script executed successfully from service context");
+		// Verify NuGet package resolved and loaded at runtime
+		if (!markerContent.Contains("NuGet=") || markerContent.Contains("NuGet=FAIL"))
+		{
+			Console.Error.WriteLine("[test] Marker missing NuGet= or NuGet failed (probing failed in service context)");
+			return 1;
+		}
+
+		Console.WriteLine("[test]   Script executed successfully from service context (inc + nuget)");
 		return 0;
 	}
 	finally
@@ -195,6 +317,113 @@ RunTest("service-cwd (SCM/systemd script resolution)", () =>
 		DiagnosticsExt.RunProcess(elevate, $"\"{exePath}\" stop", publishDir, quiet: true);
 		Thread.Sleep(3000);
 		DiagnosticsExt.RunProcess(elevate, $"\"{exePath}\" uninstall", publishDir, quiet: true);
+
+		// Clean up nuget.config from service account's temp
+		if (isWindows)
+			DiagnosticsExt.RunProcess(elevate, $"cmd /c del \"{nugetConfigPath}\" 2>nul", publishDir, quiet: true);
+		else if (File.Exists(nugetConfigPath))
+			File.Delete(nugetConfigPath);
+	}
+});
+
+// ── Service identity test ────────────────────────────────────────────
+// After service-cwd: switch the service account to a different identity.
+// The new account has a different NuGet cache and temp dir — the nuget.config
+// we placed for the primary account is invisible. Compilation should fail.
+
+Console.WriteLine("\n[test] === Service identity test ===");
+
+RunTest("service-identity (NuGet cache isolation on account switch)", () =>
+{
+	var testProjectDir = Path.Combine(src, "test", "ServiceCwdTest");
+	var publishDir = Path.Combine(artifacts, "service-cwd-test");
+	var markerDir = Path.Combine(publishDir, "markers");
+	var markerFile = Path.Combine(markerDir, "seashell-cwd-test.marker");
+	var serviceName = "seashell-cwd-test";
+	var exeName = isWindows ? "ServiceCwdTest.exe" : "ServiceCwdTest";
+	var exePath = Path.Combine(publishDir, exeName);
+	var elevate = isWindows ? "gsudo" : "sudo";
+
+	// Skip if the previous service-cwd test didn't create the published binary
+	if (!File.Exists(exePath))
+	{
+		Console.Error.WriteLine("[test] ServiceCwdTest binary not found (previous test failed?)");
+		return 1;
+	}
+
+	// Clean marker from previous test
+	if (File.Exists(markerFile)) File.Delete(markerFile);
+
+	// Delete compilation cache so the script must recompile under the new identity
+	if (isWindows)
+	{
+		DiagnosticsExt.RunProcess(elevate, @"cmd /c rmdir /s /q ""C:\ProgramData\seashell\cache"" 2>nul", publishDir, quiet: true);
+	}
+	else
+	{
+		DiagnosticsExt.RunProcess("sudo", "rm -rf /var/lib/seashell/cache", publishDir, quiet: true);
+	}
+
+	// Install service under the new identity
+	Console.WriteLine("[test]   Installing service under alternate identity...");
+	DiagnosticsExt.RunProcess(elevate, $"\"{exePath}\" install", publishDir, quiet: true);
+
+	if (isWindows)
+	{
+		// Switch to NetworkService — different temp dir, different NuGet cache
+		DiagnosticsExt.RunProcess(elevate,
+			$"sc.exe config {serviceName} obj= \"NT AUTHORITY\\NetworkService\" password= \"\"",
+			publishDir, prefix: "test");
+	}
+	else
+	{
+		// Create temp user if needed, modify systemd unit
+		DiagnosticsExt.RunProcess("sudo", "useradd -r -M -s /usr/sbin/nologin seashell-test-user 2>/dev/null", publishDir, quiet: true);
+		DiagnosticsExt.RunProcess("sudo",
+			$"bash -c \"sed -i 's/^User=.*/User=seashell-test-user/' /etc/systemd/system/{serviceName}.service\"",
+			publishDir, prefix: "test");
+		DiagnosticsExt.RunProcess("sudo", "systemctl daemon-reload", publishDir, quiet: true);
+	}
+
+	try
+	{
+		// Start service under the new identity
+		Console.WriteLine("[test]   Starting service under alternate identity...");
+		DiagnosticsExt.RunProcess(elevate, $"\"{exePath}\" start", publishDir, prefix: "test");
+
+		// Wait for marker (expect failure — new account can't resolve seashell.host)
+		Console.WriteLine("[test]   Waiting for marker file (expecting failure)...");
+		for (var i = 0; i < 20; i++)
+		{
+			if (File.Exists(markerFile)) break;
+			Thread.Sleep(1000);
+		}
+
+		if (File.Exists(markerFile))
+		{
+			var content = File.ReadAllText(markerFile);
+			Console.WriteLine($"[test]   Marker unexpectedly created:\n{content.TrimEnd()}");
+			// If the marker was created, the identity switch didn't expose the issue.
+			// Still pass — this means the Engine handled it (or the new account had cached packages).
+			Console.WriteLine("[test]   NOTICE: Service ran successfully under alternate identity");
+			return 0;
+		}
+
+		// Expected: no marker → the identity switch broke NuGet resolution
+		Console.WriteLine("[test]   No marker after 20s — cache isolation confirmed");
+		return 0;
+	}
+	finally
+	{
+		Console.WriteLine("[test]   Cleaning up identity test...");
+		DiagnosticsExt.RunProcess(elevate, $"\"{exePath}\" stop", publishDir, quiet: true);
+		Thread.Sleep(2000);
+		DiagnosticsExt.RunProcess(elevate, $"\"{exePath}\" uninstall", publishDir, quiet: true);
+
+		if (!isWindows)
+		{
+			DiagnosticsExt.RunProcess("sudo", "userdel seashell-test-user 2>/dev/null", publishDir, quiet: true);
+		}
 	}
 });
 

@@ -1,43 +1,39 @@
-// ── Host Resolution Test ─────────────────────────────────────────────
+// ── Engine Dir NuGet Test ────────────────────────────────────────────
 //
-// Verifies that bundled DLLs (MessagePack, SeaShell.Ipc, SeaShell.Script)
-// resolve correctly when a ScriptHost consumer compiles and runs a script.
+// Tests that ScriptHost works when consumed via NuGet in a `dotnet run`
+// scenario (no publish). In this layout, SeaShell.Engine.dll lives in
+// the NuGet cache (~/.nuget/packages/seashell.engine/x.y.z/lib/net10.0/)
+// and bundled DLLs (MessagePack, SeaShell.Ipc, SeaShell.Script) are each
+// in their OWN package directories — not adjacent to the Engine.
 //
-// This catches a host-embedding bug: deps.json listed bundled assemblies as
-// type "project" entries, causing the .NET host to try NuGet cache
-// resolution for DLLs that only exist bundled inside the host package.
-//
-// Two verification points:
-//   1. Sea.ShutdownToken works         → SeaShell.Script.dll resolved
-//   2. MessagePackSerializer type loads → MessagePack.dll resolved
+// This exercises the _engineDir probing path: if the Engine assumes
+// bundled DLLs are next to SeaShell.Engine.dll, they won't be found.
 //
 // Exit 0 = pass, non-zero = fail.
-
-//sea_nuget seashell.host
 
 using System;
 using System.Diagnostics;
 using System.Linq;
 using System.Runtime.InteropServices;
-using System.Threading.Tasks;
-using SeaShell;
 using SeaShell.Host;
 
-var testName = "host-resolution";
-var isWindows = RuntimeInformation.IsOSPlatform(OSPlatform.Windows);
-
+var testName = "engine-dir-nuget";
 Console.WriteLine($"[{testName}] Running test...");
+
+// Verify we're NOT in a publish layout — the Engine DLL should be in the NuGet cache
+var engineLocation = typeof(SeaShell.Engine.ScriptCompiler).Assembly.Location;
+Console.WriteLine($"[{testName}]   Engine location: {engineLocation}");
 
 var host = new ScriptHost();
 
-// The inner snippet verifies all three resolution paths
+// The inner snippet checks that bundled DLLs resolve at runtime
 var snippet = """
 	using System;
 	using SeaShell;
 
 	var ok = true;
 
-	// 1. SeaShell.Script.dll — bundled, must resolve from app dir or engine dir
+	// 1. SeaShell.Script.dll (bundled)
 	try
 	{
 		var canCancel = Sea.ShutdownToken.CanBeCanceled;
@@ -49,7 +45,7 @@ var snippet = """
 		ok = false;
 	}
 
-	// 2. MessagePack.dll — bundled (transitive via Ipc), must resolve
+	// 2. MessagePack.dll (bundled, transitive via Ipc)
 	try
 	{
 		var type = Type.GetType("MessagePack.MessagePackSerializer, MessagePack");
@@ -89,11 +85,9 @@ try
 	}
 	else
 	{
-		// Verify all three checks passed
-		var output = result.StandardOutput;
 		foreach (var check in new[] { "CHECK-SCRIPT: OK", "CHECK-MSGPACK: OK" })
 		{
-			if (!output.Contains(check))
+			if (!result.StandardOutput.Contains(check))
 			{
 				Console.Error.WriteLine($"[{testName}]   Missing: {check}");
 				passed = false;
@@ -109,15 +103,12 @@ catch (Exception ex)
 
 // Cleanup
 var daemons = Process.GetProcessesByName("seashell-daemon");
-if (daemons.Length > 0)
-{
-	foreach (var d in daemons)
-		try { d.Kill(); } catch { }
-}
+foreach (var d in daemons)
+	try { d.Kill(); } catch { }
 
 if (passed)
 {
-	Console.WriteLine($"[{testName}] PASS: All bundled DLL and NuGet resolution checks passed");
+	Console.WriteLine($"[{testName}] PASS: Bundled DLLs resolved from NuGet cache layout");
 	return 0;
 }
 else

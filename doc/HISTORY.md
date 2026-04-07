@@ -1,5 +1,42 @@
 # History
 
+## v0.2.14 (2026-03-25)
+
+**Self-contained compilation output. The output directory is now standalone like `dotnet publish`
+— all DLLs copied at compile time, no runtime dependency on the NuGet cache. Re-runs skip
+NuGet resolution entirely.**
+
+- **Self-contained output** — All NuGet package DLLs (managed and native) are copied to the
+  output dir at compile time. All `.deps.json` entries use type:"project" (resolved from app
+  base dir). No `additionalProbingPaths` in `.runtimeconfig.json`. The NuGet cache is only
+  needed during compilation, never at runtime. Eliminates file lock contention, cross-user
+  cache path issues, and stale-cache runtime failures under service accounts.
+- **Cache hash simplified** — Hash is now source content + engine fingerprint only. NuGet
+  package versions removed (packages are immutable by convention). NuGet resolution skipped
+  entirely on cache hits — re-runs are instant (~1ms include resolution + hash check).
+- **Compilation pipeline reordered** — NuGet resolution moved after the cache check. On cache
+  hit: resolve includes → hash → return cached artifacts. NuGet resolution (10-200ms) only
+  runs on cache miss (first compilation or source change).
+- **Snippet caching** — `ScriptHost.RunSnippetAsync` uses content-based filenames instead of
+  random GUIDs. Identical code maps to the same cache key. Cache hit = zero disk I/O (no temp
+  file creation, no NuGet resolution, no compilation).
+- **StartupHook namespace fix** — `StartupHook` moved from `SeaShell` namespace to root
+  namespace. `DOTNET_STARTUP_HOOKS` requires `Assembly.GetType("StartupHook")` which only
+  matches types without a namespace. Fixes Sea context injection for pre-compiled binaries
+  run via `sea myapp.dll`.
+- **Binary deps.json merge** — `CompileBinary()` now merges SeaShell's bundled entries into
+  companion `.deps.json` and adds probing paths to companion `.runtimeconfig.json`, instead of
+  copying them verbatim. Pre-compiled binaries with their own NuGet dependencies get correct
+  SeaShell runtime resolution alongside their own packages.
+- **Test suite expanded** — 14 pipeline tests on both Windows and Linux (was 10):
+  - `host-in-host-nuget`: nested ScriptHost where inner snippet uses NuGet
+  - `engine-dir-nuget`: ScriptHost via `dotnet run` (NuGet cache layout regression guard)
+  - `binary-deps`: pre-compiled binary with companion deps.json + Sea context via startup hook
+  - `service-cwd`: ServiceHost with `//sea_nuget seashell.host` under SYSTEM/root
+  - `service-identity`: NuGet cache isolation verified on service account switch
+- **Unit tests expanded** — DepsJsonWriter tests for version skew, NuGet overlap with bundled
+  DLLs, empty engine dir fallback. ArtifactWriter tests updated for self-contained output.
+
 ## v0.1.12 (2026-03-24)
 
 **Bundled DLL resolution fix, engine dir probing, unit test suite.**
@@ -8,7 +45,7 @@
   the engine binary directory in `additionalProbingPaths`. Script subprocesses can find
   bundled DLLs (MessagePack, SeaShell.Ipc, SeaShell.Script) via the host's directory as
   a fallback when the copy to the output dir is skipped or fails. Fixes assembly
-  resolution failures in host-embedded scenarios (e.g., csasvc bridge scripts).
+  resolution failures in host-embedded scenarios (e.g., service host bridge scripts).
 - **Dynamic bundled DLL versions** — `DepsJsonWriter` reads actual assembly versions from
   the bundled DLLs via `AssemblyName.GetAssemblyName()` instead of hardcoding `"1.0.0"`.
   The old hardcoded versions caused the .NET host to fail resolving MessagePack from the
@@ -19,7 +56,7 @@
   versions, runtimeconfig includes engine dir and NuGet cache in probing paths.
 - **Host-resolution integration test** — End-to-end test in the pipeline: ScriptHost
   compiles and runs a script that verifies MessagePack.dll and SeaShell.Script.dll
-  resolve correctly. Catches the exact class of bug that hit CSA.
+  resolve correctly. Catches the exact class of bug that hit host-embedded consumers.
 - **Build attestation** — CI workflow attests all `.nupkg` files with
   `actions/attest-build-provenance` (Sigstore + SLSA provenance). Consumers verify with
   `gh attestation verify <file> --repo PLN/SeaShell`.

@@ -94,34 +94,55 @@ Host and Script during execution. Binary `byte[]` payload with optional topic ro
 Script source
   │
   ├─ IncludeResolver: walk //sea_inc directives, collect all sources
+  │
+  ├─ CompilationCache: SHA256(sources + engine fingerprint)
+  │   └─ Cache hit? → return existing artifacts (self-contained output dir)
+  │       No NuGet resolution, no disk I/O beyond the source files.
+  │
+  │  ── Cache miss: full compilation ──
+  │
   ├─ NuGetResolver: walk //sea_nuget directives, resolve transitive deps
-  │
-  ├─ CompilationCache: SHA256(sources + packages + engine fingerprint)
-  │   └─ Cache hit? → return existing artifacts
-  │
   ├─ SourceSplitter: separate top-level statements from type declarations
   ├─ Inject _SeaShellMeta (global usings + _SeaShellBoot module initializer)
   ├─ Roslyn CSharpCompilation / VBCompilation → emit to MemoryStream
   │
-  └─ ArtifactWriter:
-      ├─ {name}.dll            compiled assembly
-      ├─ {name}.runtimeconfig.json   runtime config + probing paths
-      ├─ {name}.deps.json      assembly probing manifest
-      ├─ {name}.sea.json       SeaShell metadata (sources, packages, assemblies)
-      ├─ SeaShell.Script.dll   copied from engine dir
-      ├─ SeaShell.Ipc.dll      copied from engine dir
-      ├─ MessagePack.dll       copied from engine dir
-      └─ MessagePack.Annotations.dll
+  └─ Output dir (self-contained, like dotnet publish):
+      ├─ {name}.dll                    compiled assembly
+      ├─ {name}.runtimeconfig.json     framework refs (no probing paths)
+      ├─ {name}.deps.json             all entries type:"project" (app base dir)
+      ├─ {name}.sea.json              SeaShell metadata
+      ├─ SeaShell.Script.dll          ┐
+      ├─ SeaShell.Ipc.dll             │ bundled (from engine dir)
+      ├─ MessagePack.dll              │
+      ├─ MessagePack.Annotations.dll  ┘
+      ├─ Serilog.dll                  ┐
+      ├─ OtherPackage.dll             │ NuGet (copied from cache)
+      └─ runtimes/{rid}/native/       ┘ native DLLs (structure preserved)
 ```
 
 The compiled script runs via `dotnet exec --runtimeconfig ... --depsfile ... assembly.dll`.
-The `.deps.json` is critical — it tells the dotnet host where to find runtime-specific
-and native DLLs, which is the key improvement over CS-Script's assembly loading.
 
-The `.runtimeconfig.json` includes two `additionalProbingPaths`: (1) the engine binary
-directory (where bundled DLLs live) and (2) the NuGet global cache (`~/.nuget/packages/`).
-This ensures script subprocesses can find bundled DLLs even when running inside a host
-application (e.g., csasvc) where the DLL copy might be skipped.
+### Self-contained output
+
+The output directory is completely standalone — no runtime dependency on the NuGet cache or
+engine directory. All DLLs (bundled SeaShell runtime + NuGet packages) are physically copied
+to the output dir at compile time. The `.deps.json` uses type:"project" entries exclusively,
+which resolve from the app base directory. No `additionalProbingPaths` in the runtimeconfig.
+
+This means:
+- **Cache-clearing safe** — `dotnet nuget locals all --clear` doesn't break cached scripts
+- **User-identity independent** — service accounts don't need NuGet cache access at runtime
+- **No file locks** — no probing into `~/.nuget/packages/` during execution
+- **Portable** — the output dir could be copied to another machine and still work
+
+### Cache hash
+
+The cache key is `SHA256(engine fingerprint + source paths + source content)`. NuGet package
+versions are NOT in the hash — packages are immutable by convention, and the output dir is
+self-contained. NuGet resolution is skipped entirely on cache hits.
+
+The engine fingerprint is the sum of file timestamps for the Engine, Script, Ipc, and
+MessagePack DLLs. Any rebuild of the engine invalidates all cached scripts.
 
 ## NuGet Resolution
 
@@ -134,8 +155,12 @@ are walked via `.nuspec` files. For each package:
 4. Collect native DLLs (`runtimes/{rid}/native/`) for `.deps.json`
 5. RID fallback chain: e.g. `win-x64` → `win` → `any`
 
-Missing packages are downloaded automatically. The background updater checks all cached
-packages every 8 hours against all configured NuGet sources (including private feeds).
+NuGet resolution only runs on cache miss (first compilation or source change). On cache hit,
+the self-contained output dir has everything needed — NuGet is not consulted.
+
+Missing packages are downloaded automatically via `dotnet restore` on a temporary project.
+The background updater checks all cached packages every 8 hours against all configured
+NuGet sources (including private feeds).
 
 ## Execution Paths
 

@@ -1,4 +1,6 @@
-namespace SeaShell;
+// NO NAMESPACE — DOTNET_STARTUP_HOOKS requires the type to be named "StartupHook"
+// in the global (root) namespace. The runtime uses Assembly.GetType("StartupHook")
+// which only matches types without a namespace.
 
 /// <summary>
 /// Required by DOTNET_STARTUP_HOOKS. When SeaShell.Script.dll is specified as a
@@ -8,5 +10,5 @@ namespace SeaShell;
 /// </summary>
 internal static class StartupHook
 {
-	internal static void Initialize() => Sea.EnsureInitialized();
+	internal static void Initialize() => SeaShell.Sea.EnsureInitialized();
 }
