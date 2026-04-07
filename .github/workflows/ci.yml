@@ -60,27 +60,23 @@ jobs:
       - name: Lifecycle — stop when already stopped (idempotent)
         run: dotnet run --project src/SeaShell.Cli -- --stop
 
-      # Upload platform-specific apphosts for cross-platform NuGet package
-      - name: Upload apphosts
-        if: startsWith(github.ref, 'refs/tags/v')
+      # Upload Linux apphosts for cross-platform NuGet package
+      - name: Upload Linux apphosts
+        if: startsWith(github.ref, 'refs/tags/v') && runner.os == 'Linux'
         uses: actions/upload-artifact@v4
         with:
-          name: apphosts-${{ runner.os }}
+          name: apphosts-linux
           path: |
-            src/SeaShell.Cli/bin/Release/net10.0/sea
-            src/SeaShell.Cli/bin/Release/net10.0/sea.exe
             src/SeaShell.Cli/bin/Release/net10.0/seashell-daemon
-            src/SeaShell.Cli/bin/Release/net10.0/seashell-daemon.exe
             src/SeaShell.Cli/bin/Release/net10.0/seashell-elevator
-            src/SeaShell.Cli/bin/Release/net10.0/seashell-elevator.exe
-          if-no-files-found: warn
 
   # Publish to nuget.org on version tags (v*)
-  # Combines apphosts from both platforms into one package
+  # Packs on Windows (gets .exe apphosts natively from the build),
+  # then injects Linux ELF apphosts into the nupkg.
   publish:
     needs: build
     if: startsWith(github.ref, 'refs/tags/v')
-    runs-on: ubuntu-latest
+    runs-on: windows-latest
 
     steps:
       - uses: actions/checkout@v4
@@ -91,23 +87,74 @@ jobs:
           dotnet-version: '10.0.x'
           dotnet-quality: 'preview'
 
-      - name: Build
-        run: dotnet build -c Release
-
-      - name: Download Windows apphosts
-        uses: actions/download-artifact@v4
-        with:
-          name: apphosts-Windows
-          path: src/SeaShell.Cli/bin/Release/net10.0/
+      - name: Pack
+        run: dotnet pack -c Release -o ./nupkg
 
       - name: Download Linux apphosts
         uses: actions/download-artifact@v4
         with:
-          name: apphosts-Linux
-          path: src/SeaShell.Cli/bin/Release/net10.0/
+          name: apphosts-linux
+          path: linux-apphosts/
 
-      - name: Pack (with cross-platform apphosts)
-        run: dotnet pack -c Release -o ./nupkg --no-build
+      - name: Inject Linux apphosts into nupkg
+        shell: pwsh
+        run: |
+          $nupkg = (Get-ChildItem nupkg/SeaShell.0.*.nupkg).FullName
+          Write-Host "Injecting Linux apphosts into $nupkg"
+
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+
+          $zip = [System.IO.Compression.ZipFile]::Open($nupkg, 'Update')
+          try {
+            # Add Linux ELF apphosts
+            foreach ($f in Get-ChildItem linux-apphosts/*) {
+              $entryName = "tools/net10.0/any/$($f.Name)"
+              Write-Host "  Adding $entryName"
+              [System.IO.Compression.ZipFileExtensions]::CreateEntryFromFile(
+                $zip, $f.FullName, $entryName) | Out-Null
+            }
+
+            # Patch [Content_Types].xml — add Override entries for extensionless files
+            $ctEntry = $zip.GetEntry('[Content_Types].xml')
+            $reader = [System.IO.StreamReader]::new($ctEntry.Open())
+            $ct = $reader.ReadToEnd()
+            $reader.Close()
+
+            foreach ($f in Get-ChildItem linux-apphosts/*) {
+              $override = "<Override PartName=`"/tools/net10.0/any/$($f.Name)`" ContentType=`"application/octet`" />"
+              if ($ct -notmatch [regex]::Escape($f.Name)) {
+                $ct = $ct -replace '</Types>', "  $override`n</Types>"
+              }
+            }
+
+            # Rewrite [Content_Types].xml
+            $ctEntry.Delete()
+            $newEntry = $zip.CreateEntry('[Content_Types].xml')
+            $writer = [System.IO.StreamWriter]::new($newEntry.Open())
+            $writer.Write($ct)
+            $writer.Close()
+          }
+          finally {
+            $zip.Dispose()
+          }
+
+          # Verify
+          $zip = [System.IO.Compression.ZipFile]::OpenRead($nupkg)
+          $names = $zip.Entries | ForEach-Object { $_.FullName }
+          foreach ($f in @('seashell-daemon', 'seashell-daemon.exe',
+                           'seashell-elevator', 'seashell-elevator.exe')) {
+            $path = "tools/net10.0/any/$f"
+            $status = if ($names -contains $path) { 'OK' } else { 'MISSING' }
+            Write-Host "  ${path}: $status"
+          }
+          $zip.Dispose()
 
       - name: Push to nuget.org
-        run: dotnet nuget push "./nupkg/*.nupkg" --api-key ${{ secrets.NUGET_API_KEY }} --source https://api.nuget.org/v3/index.json --skip-duplicate
+        shell: pwsh
+        run: |
+          foreach ($pkg in Get-ChildItem nupkg/*.nupkg) {
+            Write-Host "Pushing $($pkg.Name)"
+            dotnet nuget push $pkg.FullName --api-key $env:NUGET_API_KEY --source https://api.nuget.org/v3/index.json --skip-duplicate
+          }
+        env:
+          NUGET_API_KEY: ${{ secrets.NUGET_API_KEY }}
