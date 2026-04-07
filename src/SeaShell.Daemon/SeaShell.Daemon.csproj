@@ -4,6 +4,8 @@
 		<AssemblyName>seashell-daemon</AssemblyName>
 		<ApplicationIcon>..\..\content\icon\seashell-dark.ico</ApplicationIcon>
 		<IsPackable>false</IsPackable>
+		<!-- Pre-JIT for faster cold start and OS page cache sharing across daemon instances -->
+		<PublishReadyToRun>true</PublishReadyToRun>
 	</PropertyGroup>
 	<ItemGroup>
 		<ProjectReference Include="..\SeaShell.Protocol\SeaShell.Protocol.csproj" />

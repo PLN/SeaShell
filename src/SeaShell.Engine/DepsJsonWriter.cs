@@ -28,7 +28,7 @@ public static class DepsJsonWriter
 
 		// Read actual versions from bundled DLLs (avoids hardcoding)
 		var msgpackVer = GetBundledVersion(engineDir, "MessagePack.dll");
-		var ipcVer = GetBundledVersion(engineDir, "SeaShell.Ipc.dll");
+		var ipcVer = GetBundledVersion(engineDir, "SeaShell.Common.dll");
 		var scriptVer = GetBundledVersion(engineDir, "SeaShell.Script.dll");
 
 		// Build targets entries
@@ -50,7 +50,7 @@ public static class DepsJsonWriter
 				["MessagePack.Annotations.dll"] = new { }
 			}
 		};
-		targets[$"SeaShell.Ipc/{ipcVer}"] = new
+		targets[$"SeaShell.Common/{ipcVer}"] = new
 		{
 			dependencies = new Dictionary<string, string>
 			{
@@ -58,14 +58,14 @@ public static class DepsJsonWriter
 			},
 			runtime = new Dictionary<string, object>
 			{
-				["SeaShell.Ipc.dll"] = new { }
+				["SeaShell.Common.dll"] = new { }
 			}
 		};
 		targets[$"SeaShell.Script/{scriptVer}"] = new
 		{
 			dependencies = new Dictionary<string, string>
 			{
-				["SeaShell.Ipc"] = ipcVer
+				["SeaShell.Common"] = ipcVer
 			},
 			runtime = new Dictionary<string, object>
 			{
@@ -109,7 +109,7 @@ public static class DepsJsonWriter
 			sha512 = ""
 		};
 
-		libraries[$"SeaShell.Ipc/{ipcVer}"] = new
+		libraries[$"SeaShell.Common/{ipcVer}"] = new
 		{
 			type = "project",
 			serviceable = false,
@@ -163,7 +163,7 @@ public static class DepsJsonWriter
 		var node = JsonNode.Parse(File.ReadAllText(companionPath))!;
 
 		var msgpackVer = GetBundledVersion(engineDir, "MessagePack.dll");
-		var ipcVer = GetBundledVersion(engineDir, "SeaShell.Ipc.dll");
+		var ipcVer = GetBundledVersion(engineDir, "SeaShell.Common.dll");
 		var scriptVer = GetBundledVersion(engineDir, "SeaShell.Script.dll");
 
 		// Find the first (and usually only) TFM target
@@ -192,19 +192,19 @@ public static class DepsJsonWriter
 					}
 				};
 			}
-			if (!HasEntry(tfmObj, "SeaShell.Ipc"))
+			if (!HasEntry(tfmObj, "SeaShell.Common"))
 			{
-				tfmObj[$"SeaShell.Ipc/{ipcVer}"] = new JsonObject
+				tfmObj[$"SeaShell.Common/{ipcVer}"] = new JsonObject
 				{
 					["dependencies"] = new JsonObject { ["MessagePack"] = msgpackVer },
-					["runtime"] = new JsonObject { ["SeaShell.Ipc.dll"] = new JsonObject() }
+					["runtime"] = new JsonObject { ["SeaShell.Common.dll"] = new JsonObject() }
 				};
 			}
 			if (!HasEntry(tfmObj, "SeaShell.Script"))
 			{
 				tfmObj[$"SeaShell.Script/{scriptVer}"] = new JsonObject
 				{
-					["dependencies"] = new JsonObject { ["SeaShell.Ipc"] = ipcVer },
+					["dependencies"] = new JsonObject { ["SeaShell.Common"] = ipcVer },
 					["runtime"] = new JsonObject { ["SeaShell.Script.dll"] = new JsonObject() }
 				};
 			}
@@ -219,8 +219,8 @@ public static class DepsJsonWriter
 				{
 					["type"] = "project", ["serviceable"] = false, ["sha512"] = ""
 				};
-			if (!HasEntry(libs, "SeaShell.Ipc"))
-				libs[$"SeaShell.Ipc/{ipcVer}"] = new JsonObject
+			if (!HasEntry(libs, "SeaShell.Common"))
+				libs[$"SeaShell.Common/{ipcVer}"] = new JsonObject
 				{
 					["type"] = "project", ["serviceable"] = false, ["sha512"] = ""
 				};

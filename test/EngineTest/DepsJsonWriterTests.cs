@@ -29,7 +29,7 @@ public class DepsJsonWriterTests : IDisposable
 
 	[Theory]
 	[InlineData("MessagePack")]
-	[InlineData("SeaShell.Ipc")]
+	[InlineData("SeaShell.Common")]
 	[InlineData("SeaShell.Script")]
 	public void Write_BundledLibrary_InTargets(string libraryName)
 	{
@@ -44,7 +44,7 @@ public class DepsJsonWriterTests : IDisposable
 
 	[Theory]
 	[InlineData("MessagePack")]
-	[InlineData("SeaShell.Ipc")]
+	[InlineData("SeaShell.Common")]
 	[InlineData("SeaShell.Script")]
 	public void Write_BundledLibrary_InLibraries_AsProject(string libraryName)
 	{
@@ -61,7 +61,7 @@ public class DepsJsonWriterTests : IDisposable
 
 	[Theory]
 	[InlineData("MessagePack")]
-	[InlineData("SeaShell.Ipc")]
+	[InlineData("SeaShell.Common")]
 	[InlineData("SeaShell.Script")]
 	public void Write_BundledLibrary_VersionNotHardcoded(string libraryName)
 	{
@@ -83,7 +83,7 @@ public class DepsJsonWriterTests : IDisposable
 
 	[Theory]
 	[InlineData("MessagePack")]
-	[InlineData("SeaShell.Ipc")]
+	[InlineData("SeaShell.Common")]
 	[InlineData("SeaShell.Script")]
 	public void Write_NuGetProvidesBundled_BothEntriesAsProject(string packageName)
 	{
@@ -162,7 +162,7 @@ public class DepsJsonWriterTests : IDisposable
 
 	[Theory]
 	[InlineData("MessagePack")]
-	[InlineData("SeaShell.Ipc")]
+	[InlineData("SeaShell.Common")]
 	[InlineData("SeaShell.Script")]
 	public void Write_EngineDirMissingBundledDlls_FallbackVersions(string libraryName)
 	{

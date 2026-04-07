@@ -37,13 +37,33 @@ var r3 = await host.RunSnippetAsync("""
 Console.WriteLine($"  stdout: {r3.StandardOutput.Trim()}");
 Console.WriteLine($"  exit:   {r3.ExitCode}");
 
-// Test 4: Compile once, inspect, run twice
+// Test 4: Working directory override
+Console.WriteLine("\n=== Working directory ===");
+var cwdScript = Path.Combine(testDir, "cwd_test.cs");
+var r4cwd = await host.RunAsync(cwdScript, workingDirectory: testDir);
+Console.WriteLine($"  stdout: {r4cwd.StandardOutput.Trim()}");
+Console.WriteLine($"  exit:   {r4cwd.ExitCode}");
+if (!r4cwd.StandardOutput.Contains(testDir.Replace('\\', '/')))
+	if (!r4cwd.StandardOutput.Contains(testDir))
+		Console.Error.WriteLine($"  FAIL: expected CWD to contain {testDir}");
+
+// Test 5: Environment variable injection
+Console.WriteLine("\n=== Environment vars ===");
+var envScript = Path.Combine(testDir, "env_test.cs");
+var envVars = new Dictionary<string, string> { ["SEASHELL_TEST_VAR"] = "hello_from_host" };
+var r5env = await host.RunAsync(envScript, environmentVars: envVars);
+Console.WriteLine($"  stdout: {r5env.StandardOutput.Trim()}");
+Console.WriteLine($"  exit:   {r5env.ExitCode}");
+if (!r5env.StandardOutput.Contains("hello_from_host"))
+	Console.Error.WriteLine("  FAIL: expected env var SEASHELL_TEST_VAR=hello_from_host");
+
+// Test 6: Compile once, inspect, run twice
 Console.WriteLine("\n=== Compile + run twice ===");
 var compiled = host.Compile(Path.Combine(testDir, "hello.cs"));
 Console.WriteLine($"  success:  {compiled.Success}");
 Console.WriteLine($"  assembly: {Path.GetFileName(compiled.AssemblyPath)}");
 
-var r4a = await host.ExecuteAsync(compiled);
-var r4b = await host.ExecuteAsync(compiled);
-Console.WriteLine($"  run 1: {r4a.StandardOutput.Trim()}");
-Console.WriteLine($"  run 2: {r4b.StandardOutput.Trim()}");
+var r6a = await host.ExecuteAsync(compiled);
+var r6b = await host.ExecuteAsync(compiled);
+Console.WriteLine($"  run 1: {r6a.StandardOutput.Trim()}");
+Console.WriteLine($"  run 2: {r6b.StandardOutput.Trim()}");

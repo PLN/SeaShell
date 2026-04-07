@@ -1,7 +1,7 @@
 using System;
 using System.IO;
-using SeaShell.Ipc;
 using SeaShell.Protocol;
+using SeaShell.Invoker;
 using SeaShell.Cli;
 
 // ── Parse args ──────────────────────────────────────────────────────────
@@ -36,7 +36,9 @@ if (args.Length > 0 && args[0] is "--help" or "-h")
 	return 0;
 }
 
-var daemonAddress = TransportEndpoint.GetDaemonAddress(TransportEndpoint.CurrentUserIdentity);
+var daemonAddress = TransportEndpoint.GetDaemonAddress(TransportEndpoint.CurrentUserIdentity, TransportEndpoint.CurrentVersion);
+Action<string> log = msg => Console.WriteLine($"  {msg}");
+Action<string> logErr = msg => Console.Error.WriteLine($"  {msg}");
 
 // No arguments → REPL
 if (args.Length == 0)
@@ -51,24 +53,43 @@ switch (args[0])
 	case "-i" or "--repl":
 		var replPackages = args.Length > 1 ? args[1..] : Array.Empty<string>();
 		return await ReplClient.ReplAsync(daemonAddress, replPackages);
+
+	// ── Daemon management (via Invoker) ────────────────────────────
 	case "--status":
-		return await DaemonManager.StatusAsync(daemonAddress);
+		var status = await DaemonManager.StatusAsync(daemonAddress);
+		if (status != null)
+		{
+			Console.WriteLine($"  daemon:   v{status.Version}, uptime {status.UptimeSeconds}s, {status.ActiveScripts} active");
+			Console.WriteLine($"  elevator: {(status.ElevatorConnected ? "connected" : "not connected")}");
+			return 0;
+		}
+		Console.WriteLine("  daemon:   not running");
+		Console.WriteLine("  elevator: unknown (daemon not running)");
+		return 1;
+
 	case "--daemon-stop":
-		return await DaemonManager.DaemonStopAsync(daemonAddress);
+		var stopped = await DaemonManager.DaemonStopAsync(daemonAddress);
+		Console.WriteLine(stopped ? "daemon: stop requested" : "daemon: not running");
+		return stopped ? 0 : 1;
+
 	case "--daemon-start":
-		return DaemonManager.StartDaemon();
+		return DaemonManager.StartDaemon(logErr);
+
+	// ── Task management (via Invoker) ──────────────────────────────
 	case "--start":
-		return ScheduledTasks.Start();
+		return ScheduledTasks.Start(log);
 	case "--stop":
-		return await ScheduledTasks.Stop();
+		return await ScheduledTasks.Stop(log);
 	case "--install-daemon":
-		return ScheduledTasks.InstallDaemon();
+		return ScheduledTasks.InstallDaemon(log);
 	case "--install-elevator":
-		return ScheduledTasks.InstallElevator();
+		return ScheduledTasks.InstallElevator(log);
 	case "--uninstall-daemon":
-		return ScheduledTasks.UninstallDaemon();
+		return ScheduledTasks.UninstallDaemon(log);
 	case "--uninstall-elevator":
-		return ScheduledTasks.UninstallElevator();
+		return ScheduledTasks.UninstallElevator(log);
+
+	// ── File association (CLI-only) ────────────────────────────────
 	case "--associate":
 		var ext = args.Length > 1 ? args[1] : ".cs";
 		return FileAssoc.Associate(ext);

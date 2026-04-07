@@ -49,15 +49,16 @@ public static class TransportEndpoint
 {
 	/// <summary>
 	/// Pipe name (Windows) or socket file path (Linux) for the daemon.
+	/// Version in the address enables side-by-side: each version gets its own daemon.
 	/// </summary>
-	public static string GetDaemonAddress(string identity) =>
-		GetAddress($"seashell-{identity}");
+	public static string GetDaemonAddress(string identity, string version) =>
+		GetAddress($"seashell-{version}-{identity}");
 
 	/// <summary>
 	/// Pipe name (Windows) or socket file path (Linux) for the elevator.
 	/// </summary>
-	public static string GetElevatorAddress(string identity) =>
-		GetAddress($"seashell-elevated-{identity}");
+	public static string GetElevatorAddress(string identity, string version) =>
+		GetAddress($"seashell-elevated-{version}-{identity}");
 
 	private static string GetAddress(string name)
 	{
@@ -76,6 +77,10 @@ public static class TransportEndpoint
 	/// <summary>The identity string for the current user.</summary>
 	public static string CurrentUserIdentity =>
 		Environment.UserName.ToLowerInvariant();
+
+	/// <summary>3-part version of the Protocol assembly, used as the side-by-side key.</summary>
+	public static string CurrentVersion =>
+		typeof(TransportEndpoint).Assembly.GetName().Version?.ToString(3) ?? "0.0.0";
 }
 
 // ── Server (daemon side) ────────────────────────────────────────────────
@@ -106,12 +111,16 @@ public sealed class TransportServer : IAsyncDisposable
 			if (File.Exists(_address))
 				File.Delete(_address);
 
-			_unixListener = new Socket(AddressFamily.Unix, SocketType.Stream, ProtocolType.Unspecified);
-			_unixListener.Bind(new UnixDomainSocketEndPoint(_address));
+			// Set restrictive umask BEFORE bind to close the TOCTOU gap —
+			// the socket is created with owner-only permissions from the start.
+			using (PosixUmask.RestrictiveUmask())
+			{
+				_unixListener = new Socket(AddressFamily.Unix, SocketType.Stream, ProtocolType.Unspecified);
+				_unixListener.Bind(new UnixDomainSocketEndPoint(_address));
+			}
 			_unixListener.Listen(8);
 
-			// Restrict socket to owner only — prevents other local users from
-			// connecting and executing arbitrary code via the daemon.
+			// Defense-in-depth: explicitly set permissions in case umask was bypassed
 			File.SetUnixFileMode(_address,
 				UnixFileMode.UserRead | UnixFileMode.UserWrite);
 		}
@@ -147,8 +156,16 @@ public sealed class TransportServer : IAsyncDisposable
 			outBufferSize: 0,
 			security);
 
-		await pipe.WaitForConnectionAsync(ct);
-		return new TransportStream(pipe, pipe);
+		try
+		{
+			await pipe.WaitForConnectionAsync(ct);
+			return new TransportStream(pipe, pipe);
+		}
+		catch
+		{
+			await pipe.DisposeAsync();
+			throw;
+		}
 	}
 
 	private async Task<TransportStream> AcceptUnixAsync(CancellationToken ct)

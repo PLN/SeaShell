@@ -1,6 +1,7 @@
 using System;
 using System.Threading.Tasks;
 using SeaShell.Ipc;
+using SeaShell.Invoker;
 using SeaShell.Protocol;
 
 namespace SeaShell.Cli;
@@ -10,21 +11,11 @@ static class ReplClient
 	/// <summary>Full interactive REPL loop: connect to daemon, send/receive eval requests.</summary>
 	public static async Task<int> ReplAsync(string daemonAddress, string[] packages)
 	{
-		// Ensure daemon is running
-		if (!await TransportClient.ProbeAsync(daemonAddress))
+		// Ensure daemon is running (via Invoker)
+		if (!await DaemonLauncher.EnsureRunningAsync(daemonAddress, msg => Console.Error.WriteLine($"sea: {msg}")))
 		{
-			DaemonManager.StartDaemon();
-			for (int i = 0; i < 20; i++)
-			{
-				await Task.Delay(250);
-				if (await TransportClient.ProbeAsync(daemonAddress))
-					break;
-			}
-			if (!await TransportClient.ProbeAsync(daemonAddress))
-			{
-				Console.Error.WriteLine("sea: daemon failed to start");
-				return 1;
-			}
+			Console.Error.WriteLine("sea: daemon failed to start");
+			return 1;
 		}
 
 		await using var conn = await TransportClient.ConnectAsync(daemonAddress, timeoutMs: 10000);

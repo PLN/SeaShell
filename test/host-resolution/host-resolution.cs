@@ -1,6 +1,6 @@
 // ── Host Resolution Test ─────────────────────────────────────────────
 //
-// Verifies that bundled DLLs (MessagePack, SeaShell.Ipc, SeaShell.Script)
+// Verifies that bundled DLLs (MessagePack, SeaShell.Common, SeaShell.Script)
 // resolve correctly when a ScriptHost consumer compiles and runs a script.
 //
 // This catches a host-embedding bug: deps.json listed bundled assemblies as

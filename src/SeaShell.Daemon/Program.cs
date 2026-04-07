@@ -38,12 +38,40 @@ Log.Logger = logConfig.CreateLogger();
 
 // ── Single-instance check ───────────────────────────────────────────────
 
-var address = TransportEndpoint.GetDaemonAddress(TransportEndpoint.CurrentUserIdentity);
+var address = TransportEndpoint.GetDaemonAddress(TransportEndpoint.CurrentUserIdentity, TransportEndpoint.CurrentVersion);
 
 if (await TransportClient.ProbeAsync(address))
 {
 	Log.Warning("Another daemon instance is already running");
 	return 1;
+}
+
+// ── Idle timeout ────────────────────────────────────────────────────────
+
+static TimeSpan ParseIdleTimeout(string value)
+{
+	value = value.Trim();
+	if (value == "0") return TimeSpan.Zero;
+	if (value.EndsWith("ms", StringComparison.Ordinal) && double.TryParse(value[..^2], out var ms)) return TimeSpan.FromMilliseconds(ms);
+	if (value.EndsWith("s", StringComparison.Ordinal) && double.TryParse(value[..^1], out var s)) return TimeSpan.FromSeconds(s);
+	if (value.EndsWith("m", StringComparison.Ordinal) && double.TryParse(value[..^1], out var m)) return TimeSpan.FromMinutes(m);
+	if (value.EndsWith("h", StringComparison.Ordinal) && double.TryParse(value[..^1], out var h)) return TimeSpan.FromHours(h);
+	if (double.TryParse(value, out var sec)) return TimeSpan.FromSeconds(sec);
+	return TimeSpan.Zero;
+}
+
+var idleTimeout = TimeSpan.Zero;
+var envTimeout = Environment.GetEnvironmentVariable("SEASHELL_IDLE_TIMEOUT");
+if (!string.IsNullOrEmpty(envTimeout))
+	idleTimeout = ParseIdleTimeout(envTimeout);
+
+for (int i = 0; i < args.Length - 1; i++)
+{
+	if (args[i] == "--idle-timeout")
+	{
+		idleTimeout = ParseIdleTimeout(args[i + 1]);
+		break;
+	}
 }
 
 // ── Run ─────────────────────────────────────────────────────────────────
@@ -58,7 +86,7 @@ Console.CancelKeyPress += (_, e) =>
 	cts.Cancel();
 };
 
-await using var server = new DaemonServer(address);
+await using var server = new DaemonServer(address) { IdleTimeout = idleTimeout };
 
 _ = Task.Run(async () =>
 {

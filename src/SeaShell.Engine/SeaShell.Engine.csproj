@@ -1,11 +1,8 @@
 <Project Sdk="Microsoft.NET.Sdk">
 	<PropertyGroup>
-		<Description>SeaShell compilation engine. Roslyn-based C# and VB.NET compiler, NuGet resolver with transitive dependency resolution, .deps.json generation, and background package updater.</Description>
-		<PackageTags>scripting;seashell;roslyn;compiler;nuget;engine</PackageTags>
+		<IsPackable>false</IsPackable>
 		<GenerateDocumentationFile>true</GenerateDocumentationFile>
 		<NoWarn>CS1591</NoWarn>
-		<PackageReadmeFile>README.md</PackageReadmeFile>
-		<!-- Copy NuGet DLLs (MessagePack etc.) to output so they can be bundled in the package -->
 		<CopyLocalLockFileAssemblies>true</CopyLocalLockFileAssemblies>
 	</PropertyGroup>
 	<ItemGroup>
@@ -34,7 +31,7 @@
 	        DependsOnTargets="ResolveAssemblyReferences">
 		<ItemGroup>
 			<_RuntimeDlls Include="@(ReferenceCopyLocalPaths)"
-			              Condition="%(Filename) == 'SeaShell.Script' or %(Filename) == 'SeaShell.Ipc'
+			              Condition="%(Filename) == 'SeaShell.Script' or %(Filename) == 'SeaShell.Common'
 			                      or %(Filename) == 'MessagePack' or %(Filename) == 'MessagePack.Annotations'" />
 		</ItemGroup>
 		<ItemGroup>

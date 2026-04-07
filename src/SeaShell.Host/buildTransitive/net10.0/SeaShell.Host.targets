@@ -6,8 +6,14 @@
 		<Reference Include="SeaShell.Script"
 		           HintPath="$(MSBuildThisFileDirectory)SeaShell.Script.dll"
 		           Private="true" />
-		<Reference Include="SeaShell.Ipc"
-		           HintPath="$(MSBuildThisFileDirectory)SeaShell.Ipc.dll"
+		<Reference Include="SeaShell.Common"
+		           HintPath="$(MSBuildThisFileDirectory)SeaShell.Common.dll"
+		           Private="true" />
+		<Reference Include="SeaShell.Protocol"
+		           HintPath="$(MSBuildThisFileDirectory)SeaShell.Protocol.dll"
+		           Private="true" />
+		<Reference Include="SeaShell.Invoker"
+		           HintPath="$(MSBuildThisFileDirectory)SeaShell.Invoker.dll"
 		           Private="true" />
 		<None Include="$(MSBuildThisFileDirectory)MessagePack.dll"
 		      CopyToOutputDirectory="PreserveNewest" Link="MessagePack.dll" />

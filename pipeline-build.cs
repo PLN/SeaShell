@@ -7,7 +7,7 @@ using Serilog;
 
 // ── SeaShell Pipeline: Build ─────────────────────────────────────────
 // Runs on each build host. Compiles and publishes platform binaries.
-// Pushes publish output to /pipeline/common/ for cross-platform exchange.
+// Pushes publish output to shared artifacts directory for cross-platform exchange.
 
 var src = Environment.GetEnvironmentVariable("PIPELINE_SRC")!;
 var artifacts = Environment.GetEnvironmentVariable("PIPELINE_ARTIFACTS")!;

@@ -1,0 +1,5 @@
+<Project>
+	<!-- SeaShell.Service: daemon and elevator binaries.
+	     Binaries are staged from the NuGet cache to DataDir by DaemonManager
+	     at runtime. No build-time copying needed. -->
+</Project>
