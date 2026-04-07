@@ -105,12 +105,13 @@ public sealed class ScriptInvoker
 		string? workingDirectory, Dictionary<string, string>? environmentVars,
 		bool windowMode, CancellationToken ct)
 	{
-		// Ensure daemon is running
-		if (!await DaemonLauncher.EnsureRunningAsync(daemonAddress, _log, _verboseLog, ct))
+		// Ensure daemon is running — address may resolve to a compatible higher version
+		var resolvedAddress = await DaemonLauncher.EnsureRunningAsync(daemonAddress, _log, _verboseLog, ct);
+		if (resolvedAddress == null)
 			return new ScriptResult(1, "", "Daemon failed to start");
 
 		// Compile via daemon — keep connection open for watch mode
-		var conn = await TransportClient.ConnectAsync(daemonAddress, ct: ct);
+		var conn = await TransportClient.ConnectAsync(resolvedAddress, ct: ct);
 		var request = new RunRequest(
 			scriptPath, args,
 			Environment.CurrentDirectory,
@@ -142,9 +143,9 @@ public sealed class ScriptInvoker
 			await conn.DisposeAsync();
 
 			if (IsCurrentProcessElevated())
-				return await ExecuteDirectAsync(compiled, args, daemonAddress, scriptPath, output, connection, workingDirectory, environmentVars, windowMode, ct);
+				return await ExecuteDirectAsync(compiled, args, resolvedAddress, scriptPath, output, connection, workingDirectory, environmentVars, windowMode, ct);
 
-			return await ExecuteElevatedAsync(compiled, args, daemonAddress, output, ct);
+			return await ExecuteElevatedAsync(compiled, args, resolvedAddress, output, ct);
 		}
 
 		if (compiled.Watch)
@@ -154,7 +155,7 @@ public sealed class ScriptInvoker
 		}
 
 		await conn.DisposeAsync();
-		return await ExecuteDirectAsync(compiled, args, daemonAddress, scriptPath, output, connection, workingDirectory, environmentVars, windowMode, ct);
+		return await ExecuteDirectAsync(compiled, args, resolvedAddress, scriptPath, output, connection, workingDirectory, environmentVars, windowMode, ct);
 	}
 
 	/// <summary>Execute an already-compiled script.</summary>
