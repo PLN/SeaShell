@@ -292,7 +292,8 @@ public sealed class ScriptInvoker
 				args,
 				Environment.CurrentDirectory,
 				envVars.ToArray(),
-				Environment.ProcessId);
+				Environment.ProcessId,
+				DirectExe: compiled.DirectExe);
 
 			var spawnResult = await DaemonManager.RequestElevatedSpawnAsync(daemonAddress, spawnReq);
 

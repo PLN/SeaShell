@@ -213,6 +213,26 @@ jobs:
           if ($failed) { Write-Host "VALIDATION FAILED" -ForegroundColor Red; exit 1 }
           Write-Host "All packages validated OK" -ForegroundColor Green
 
+      - name: Publish packages to Gitea registry
+        run: |
+          for pkg in nupkg/*.nupkg; do
+            echo "Publishing $(basename "$pkg")..."
+            HTTP_CODE=$(curl -s -w '%{http_code}' -o /tmp/nuget_push_response.txt \
+              -X PUT "${{ github.server_url }}/api/packages/${{ github.repository_owner }}/nuget/" \
+              -H "Authorization: token ${{ secrets.API_TOKEN }}" \
+              -H "Content-Type: application/octet-stream" \
+              --data-binary "@$pkg")
+            if [ "$HTTP_CODE" = "201" ]; then
+              echo "  Pushed (201 Created)"
+            elif [ "$HTTP_CODE" = "409" ]; then
+              echo "  Skipped (409 Conflict — already exists)"
+            else
+              echo "  Failed (HTTP $HTTP_CODE)"
+              cat /tmp/nuget_push_response.txt
+              exit 1
+            fi
+          done
+
       - name: Upload packages
         uses: https://gitea.com/actions/upload-artifact@v3
         with:
