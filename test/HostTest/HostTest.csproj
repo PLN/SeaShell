@@ -4,6 +4,6 @@
 		<ImplicitUsings>enable</ImplicitUsings>
 	</PropertyGroup>
 	<ItemGroup>
-		<ProjectReference Include="..\..\src\SeaShell.Host\SeaShell.Host.csproj" />
+		<PackageReference Include="SeaShell.Host" Version="0.*" />
 	</ItemGroup>
 </Project>

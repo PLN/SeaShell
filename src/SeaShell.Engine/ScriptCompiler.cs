@@ -21,6 +21,7 @@ public sealed class ScriptCompiler
 	private readonly string _cacheDir;
 	private readonly IncludeResolver _includeResolver;
 	private readonly string _scriptAssemblyPath;
+	private readonly string _engineDir;
 
 	public readonly NuGetResolver NuGetResolver;
 
@@ -43,8 +44,12 @@ public sealed class ScriptCompiler
 			catch { }
 		}
 
-		// Locate SeaShell.Script.dll — shipped alongside the daemon
-		_scriptAssemblyPath = Path.Combine(AppContext.BaseDirectory, "SeaShell.Script.dll");
+		// Locate SeaShell runtime DLLs — prefer the Engine assembly's own directory
+		// (correct for both daemon and NuGet-hosted ScriptHost scenarios).
+		// Falls back to AppContext.BaseDirectory for compatibility.
+		_engineDir = Path.GetDirectoryName(typeof(ScriptCompiler).Assembly.Location)
+			?? AppContext.BaseDirectory;
+		_scriptAssemblyPath = Path.Combine(_engineDir, "SeaShell.Script.dll");
 		_includeResolver = new IncludeResolver();
 		NuGetResolver = new NuGetResolver();
 	}
@@ -270,7 +275,7 @@ public sealed class ScriptCompiler
 		foreach (var dllName in new[] { "SeaShell.Script.dll", "SeaShell.Ipc.dll", "MessagePack.dll", "MessagePack.Annotations.dll" })
 		{
 			if (nugetRuntimeNames.Contains(dllName)) continue;
-			var src = Path.Combine(AppContext.BaseDirectory, dllName);
+			var src = Path.Combine(_engineDir, dllName);
 			var dest = Path.Combine(outputDir, dllName);
 			if (File.Exists(src) && !File.Exists(dest))
 				File.Copy(src, dest);
@@ -365,11 +370,12 @@ public sealed class ScriptCompiler
 		// SeaShell runtime libraries — Sea static class + IPC messaging + MessagePack.
 		// Skip any that are already provided by the NuGet dependency graph (avoids CS1704
 		// when a package transitively depends on SeaShell.Script/Ipc/etc.).
+		var engineDir = Path.GetDirectoryName(scriptAssemblyPath) ?? AppContext.BaseDirectory;
 		foreach (var name in new[] {
 			scriptAssemblyPath,
-			Path.Combine(AppContext.BaseDirectory, "SeaShell.Ipc.dll"),
-			Path.Combine(AppContext.BaseDirectory, "MessagePack.dll"),
-			Path.Combine(AppContext.BaseDirectory, "MessagePack.Annotations.dll"),
+			Path.Combine(engineDir, "SeaShell.Ipc.dll"),
+			Path.Combine(engineDir, "MessagePack.dll"),
+			Path.Combine(engineDir, "MessagePack.Annotations.dll"),
 		})
 		{
 			if (File.Exists(name) && !nugetAssemblyNames.Contains(Path.GetFileName(name)))
@@ -489,7 +495,7 @@ public sealed class ScriptCompiler
 		foreach (var dll in new[] { "SeaShell.Script.dll", "SeaShell.Ipc.dll",
 		                             "MessagePack.dll", "MessagePack.Annotations.dll" })
 		{
-			var src = Path.Combine(AppContext.BaseDirectory, dll);
+			var src = Path.Combine(_engineDir, dll);
 			var dest = Path.Combine(outputDir, dll);
 			if (File.Exists(src)) WriteIfMissing(dest, File.ReadAllBytes(src));
 		}
