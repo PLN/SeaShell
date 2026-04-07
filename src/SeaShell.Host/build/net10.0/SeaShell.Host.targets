@@ -1,0 +1,15 @@
+<Project>
+	<!-- Copy SeaShell runtime DLLs to consumer output directories.
+	     These are bundled in the NuGet package (not listed as dependencies)
+	     because the Engine loads them explicitly at AppContext.BaseDirectory. -->
+	<ItemGroup>
+		<None Include="$(MSBuildThisFileDirectory)SeaShell.Script.dll"
+		      CopyToOutputDirectory="PreserveNewest" Link="SeaShell.Script.dll" />
+		<None Include="$(MSBuildThisFileDirectory)SeaShell.Ipc.dll"
+		      CopyToOutputDirectory="PreserveNewest" Link="SeaShell.Ipc.dll" />
+		<None Include="$(MSBuildThisFileDirectory)MessagePack.dll"
+		      CopyToOutputDirectory="PreserveNewest" Link="MessagePack.dll" />
+		<None Include="$(MSBuildThisFileDirectory)MessagePack.Annotations.dll"
+		      CopyToOutputDirectory="PreserveNewest" Link="MessagePack.Annotations.dll" />
+	</ItemGroup>
+</Project>

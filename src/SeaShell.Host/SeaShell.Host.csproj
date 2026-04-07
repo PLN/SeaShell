@@ -5,12 +5,39 @@
 		<GenerateDocumentationFile>true</GenerateDocumentationFile>
 		<NoWarn>CS1591</NoWarn>
 		<PackageReadmeFile>README.md</PackageReadmeFile>
+		<!-- Copy NuGet DLLs (MessagePack etc.) to output so the staging target can bundle them -->
+		<CopyLocalLockFileAssemblies>true</CopyLocalLockFileAssemblies>
 	</PropertyGroup>
 	<ItemGroup>
 		<None Include="..\..\README.md" Pack="true" PackagePath="/" />
 	</ItemGroup>
 	<ItemGroup>
 		<ProjectReference Include="..\SeaShell.Engine\SeaShell.Engine.csproj" />
-		<ProjectReference Include="..\SeaShell.Script\SeaShell.Script.csproj" />
+		<!-- PrivateAssets=all: Script.dll copies to output for Engine to find,
+		     but does NOT flow as a NuGet dependency to consumers. -->
+		<ProjectReference Include="..\SeaShell.Script\SeaShell.Script.csproj">
+			<PrivateAssets>all</PrivateAssets>
+		</ProjectReference>
+		<!-- MessagePack is a transitive dep of Script → Ipc, but PrivateAssets=all
+		     on Script suppresses transitive PackageReference flow. Add it directly
+		     so the staging target can find and bundle it. -->
+		<PackageReference Include="MessagePack" Version="3.1.3" PrivateAssets="all" />
 	</ItemGroup>
+
+	<!-- Bundle SeaShell runtime DLLs into the NuGet package.
+	     The .targets file copies them to consumer output directories. -->
+	<ItemGroup>
+		<None Include="build\**" Pack="true" PackagePath="build\" />
+	</ItemGroup>
+
+	<!-- Stage runtime DLLs into build/net10.0/ before packing.
+	     Uses ReferenceCopyLocalPaths (populated by ResolveAssemblyReferences) to find
+	     DLLs regardless of whether they're project outputs or NuGet cache assets. -->
+	<Target Name="StageScriptBinaries" BeforeTargets="Pack" DependsOnTargets="ResolveAssemblyReferences">
+		<ItemGroup>
+			<_ScriptDlls Include="@(ReferenceCopyLocalPaths)"
+			             Condition="%(Filename) == 'SeaShell.Script' or %(Filename) == 'SeaShell.Ipc' or %(Filename) == 'MessagePack' or %(Filename) == 'MessagePack.Annotations'" />
+		</ItemGroup>
+		<Copy SourceFiles="@(_ScriptDlls)" DestinationFolder="build/net10.0/" SkipUnchangedFiles="true" />
+	</Target>
 </Project>

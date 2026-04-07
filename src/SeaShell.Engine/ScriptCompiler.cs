@@ -259,9 +259,17 @@ public sealed class ScriptCompiler
 		if (!File.Exists(depsPath))
 			DepsJsonWriter.Write(depsPath, assemblyName, resolvedPackages);
 
-		// Copy SeaShell runtime DLLs to output dir (for runtime loading)
+		// Copy SeaShell runtime DLLs to output dir (for runtime loading).
+		// Skip DLLs already provided by NuGet — they're mapped in .deps.json
+		// and resolved from the NuGet cache at runtime.
+		var nugetRuntimeNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+		foreach (var pkg in resolvedPackages)
+			foreach (var asset in pkg.RuntimeAssets)
+				nugetRuntimeNames.Add(Path.GetFileName(asset.FullPath));
+
 		foreach (var dllName in new[] { "SeaShell.Script.dll", "SeaShell.Ipc.dll", "MessagePack.dll", "MessagePack.Annotations.dll" })
 		{
+			if (nugetRuntimeNames.Contains(dllName)) continue;
 			var src = Path.Combine(AppContext.BaseDirectory, dllName);
 			var dest = Path.Combine(outputDir, dllName);
 			if (File.Exists(src) && !File.Exists(dest))
@@ -343,16 +351,20 @@ public sealed class ScriptCompiler
 		}
 
 		// NuGet packages — load compile DLLs via read-to-bytes (no file locks held)
+		var nugetAssemblyNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 		foreach (var pkg in packages)
 		{
 			foreach (var dll in pkg.CompileDlls)
 			{
+				nugetAssemblyNames.Add(Path.GetFileName(dll));
 				var bytes = File.ReadAllBytes(dll);
 				refs.Add(MetadataReference.CreateFromImage(bytes, filePath: dll));
 			}
 		}
 
-		// SeaShell runtime libraries — Sea static class + IPC messaging + MessagePack
+		// SeaShell runtime libraries — Sea static class + IPC messaging + MessagePack.
+		// Skip any that are already provided by the NuGet dependency graph (avoids CS1704
+		// when a package transitively depends on SeaShell.Script/Ipc/etc.).
 		foreach (var name in new[] {
 			scriptAssemblyPath,
 			Path.Combine(AppContext.BaseDirectory, "SeaShell.Ipc.dll"),
@@ -360,7 +372,7 @@ public sealed class ScriptCompiler
 			Path.Combine(AppContext.BaseDirectory, "MessagePack.Annotations.dll"),
 		})
 		{
-			if (File.Exists(name))
+			if (File.Exists(name) && !nugetAssemblyNames.Contains(Path.GetFileName(name)))
 			{
 				var bytes = File.ReadAllBytes(name);
 				refs.Add(MetadataReference.CreateFromImage(bytes, filePath: name));
