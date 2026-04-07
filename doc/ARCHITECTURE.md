@@ -95,9 +95,9 @@ Script source
   │
   ├─ IncludeResolver: walk //sea_inc directives, collect all sources
   │
-  ├─ CompilationCache: SHA256(sources + engine fingerprint)
+  ├─ CompilationCache: SHA256(sources + engine fingerprint + direct NuGet versions)
   │   └─ Cache hit? → return existing artifacts (self-contained output dir)
-  │       No NuGet resolution, no disk I/O beyond the source files.
+  │       No NuGet resolution, no disk I/O beyond source files + version dir listing.
   │
   │  ── Cache miss: full compilation ──
   │

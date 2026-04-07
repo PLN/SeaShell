@@ -4,10 +4,10 @@
 		<LangVersion>latest</LangVersion>
 		<Nullable>enable</Nullable>
 		<ImplicitUsings>disable</ImplicitUsings>
-		<Version>0.2.14</Version>
+		<Version>0.2.15</Version>
 		<!-- Local pipeline passes -p:BuildNumber={runCounter} for unique versions per build.
 		     GitHub CI omits it, keeping the clean 3-component version for NuGet.org. -->
-		<Version Condition="'$(BuildNumber)' != ''">0.2.14.$(BuildNumber)</Version>
+		<Version Condition="'$(BuildNumber)' != ''">0.2.15.$(BuildNumber)</Version>
 
 		<!-- Shared NuGet metadata -->
 		<Authors>PLN;Claude (Anthropic)</Authors>
@@ -16,4 +16,10 @@
 		<RepositoryUrl>https://github.com/PLN/SeaShell</RepositoryUrl>
 		<RepositoryType>git</RepositoryType>
 	</PropertyGroup>
+	<ItemGroup>
+		<!-- Override transitive System.Diagnostics.EventLog 8.0.0 (from Serilog.Sinks.EventLog)
+		     with a version that has net10.0 assets. The 8.0.0 package only ships net8.0 libs
+		     and causes runtime failures on hosts without the .NET 8 runtime installed. -->
+		<PackageReference Include="System.Diagnostics.EventLog" Version="10.0.5" />
+	</ItemGroup>
 </Project>

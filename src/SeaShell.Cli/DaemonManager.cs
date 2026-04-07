@@ -211,11 +211,7 @@ static class DaemonManager
 			return (stageDir, hash);
 
 		Directory.CreateDirectory(stageDir);
-		foreach (var file in Directory.GetFiles(sourceDir))
-		{
-			var dest = Path.Combine(stageDir, Path.GetFileName(file));
-			try { File.Copy(file, dest); } catch { }
-		}
+		CopyDirectory(sourceDir, stageDir);
 
 		// Generate .runtimeconfig.dev.json with NuGet probing path so the staged
 		// binary can resolve package dependencies (EventLog, Serilog sinks, etc.)
@@ -243,12 +239,27 @@ static class DaemonManager
 		return (stageDir, hash);
 	}
 
+	private static void CopyDirectory(string source, string destination)
+	{
+		foreach (var file in Directory.GetFiles(source))
+		{
+			var dest = Path.Combine(destination, Path.GetFileName(file));
+			try { File.Copy(file, dest); } catch { }
+		}
+		foreach (var dir in Directory.GetDirectories(source))
+		{
+			var destDir = Path.Combine(destination, Path.GetFileName(dir));
+			Directory.CreateDirectory(destDir);
+			CopyDirectory(dir, destDir);
+		}
+	}
+
 	private static string ComputeDirHash(string dir)
 	{
 		var ticks = 0L;
 		try
 		{
-			foreach (var f in Directory.GetFiles(dir, "*.dll").OrderBy(f => f))
+			foreach (var f in Directory.GetFiles(dir, "*.dll", SearchOption.AllDirectories).OrderBy(f => f))
 				ticks += File.GetLastWriteTimeUtc(f).Ticks;
 		}
 		catch { }

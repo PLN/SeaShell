@@ -102,11 +102,16 @@ public sealed class ScriptCompiler
 			return new CompileResult { Error = ex.Message };
 		}
 
-		// ── Check cache (source content + engine fingerprint only) ──────
-		// NuGet resolution is expensive — skip it entirely on cache hits.
-		// The output dir is self-contained (all DLLs copied there at compile time),
-		// so NuGet packages with the same id+version always produce the same output.
-		var hash = CompilationCache.ComputeHash(resolved.Sources);
+		// ── Check cache ─────────────────────────────────────────────────
+		// Hash includes source content, engine fingerprint, and resolved direct
+		// NuGet versions. Transitive deps are not included (immutable by convention).
+		// Version resolution is lightweight: explicit versions are free, versionless
+		// directives do a single directory listing in the NuGet cache (~1-2ms each).
+		var nugetVersions = resolved.Directives.NuGets
+			.Select(n => $"{n.PackageName.ToLowerInvariant()}@{NuGetResolver.ResolveDirectVersion(n.PackageName, n.Version) ?? "?"}")
+			.OrderBy(s => s, StringComparer.OrdinalIgnoreCase)
+			.ToList();
+		var hash = CompilationCache.ComputeHash(resolved.Sources, nugetVersions);
 		var outputDir = Path.Combine(_cacheDir, $"{scriptName}_{hash[..8]}");
 		var dllPath = Path.Combine(outputDir, $"{scriptName}.dll");
 		var runtimeConfigPath = Path.Combine(outputDir, $"{scriptName}.runtimeconfig.json");

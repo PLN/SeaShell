@@ -415,6 +415,21 @@ public sealed class NuGetResolver
 		return new List<ResolvedAsset>();
 	}
 
+	/// <summary>
+	/// Resolve the concrete version for a direct NuGet reference.
+	/// For explicit versions, returns as-is. For versionless, picks the latest
+	/// from the NuGet cache via directory listing. Lightweight — no .nuspec
+	/// parsing, no transitive resolution.
+	/// </summary>
+	public string? ResolveDirectVersion(string packageName, string? explicitVersion)
+	{
+		if (explicitVersion != null) return explicitVersion;
+		var packageDir = Path.Combine(_cacheRoot, packageName.ToLowerInvariant());
+		if (!Directory.Exists(packageDir)) return null;
+		var latest = PickLatestVersion(packageDir);
+		return latest != null ? Path.GetFileName(latest) : null;
+	}
+
 	private string? PickLatestVersion(string packageDir)
 	{
 		return Directory.GetDirectories(packageDir)
