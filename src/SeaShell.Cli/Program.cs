@@ -195,6 +195,16 @@ if (!File.Exists(scriptPath))
 }
 
 var isConsoleEphemeral = ConsoleHelper.IsConsoleEphemeral();
+
+// Set console title: "Script {~} SeaShell v0.4.2.202"
+try
+{
+	var scriptName = Path.GetFileNameWithoutExtension(scriptPath);
+	var seaVersion = typeof(Program).Assembly.GetName().Version?.ToString(4) ?? "0.1.0";
+	Console.Title = $"{scriptName} {{~}} SeaShell v{seaVersion}";
+}
+catch { /* no console, or redirected — ignore */ }
+
 var scriptArgs = args.Length > 1 ? args[1..] : Array.Empty<string>();
 var exitCode = await ScriptRunner.RunScriptAsync(scriptPath, scriptArgs, daemonAddress, isConsoleEphemeral, isWindowMode, verbose);
 ConsoleHelper.ExitDelay(isConsoleEphemeral);

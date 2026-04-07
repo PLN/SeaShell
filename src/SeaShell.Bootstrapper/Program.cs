@@ -4,7 +4,9 @@ using System.IO;
 using System.IO.Compression;
 using System.Linq;
 using System.Reflection;
+using System.Collections.Generic;
 using System.Runtime.InteropServices;
+using System.Text.Json;
 
 // ── SeaShell Bootstrapper ───────────────────────────────────────────
 // Installed via: dotnet tool install -g SeaShell
@@ -466,6 +468,40 @@ int Status()
 	{
 		Console.WriteLine("  daemon       -");
 		Console.WriteLine("  elevator     -");
+	}
+
+	// Registered versions from seashell.json
+	var manifestPath = Path.Combine(GetDataDir(), "seashell.json");
+	if (File.Exists(manifestPath))
+	{
+		try
+		{
+			var manifestJson = JsonDocument.Parse(File.ReadAllText(manifestPath));
+			if (manifestJson.RootElement.TryGetProperty("installations", out var installations))
+			{
+				var entries = new List<(string ver, string line)>();
+				foreach (var prop in installations.EnumerateObject())
+				{
+					var ver = prop.Name;
+					var installedAt = prop.Value.TryGetProperty("installedAt", out var at) ? at.GetString() : null;
+					var daemonStatus = CheckComponentHealth(prop.Value, "daemon", "seashell-daemon");
+					var elevatorStatus = CheckComponentHealth(prop.Value, "elevator", "seashell-elevator");
+					var datePart = installedAt != null ? $"  {installedAt}" : "";
+					entries.Add((ver, $"    v{ver}{datePart}  {daemonStatus}  {elevatorStatus}"));
+				}
+
+				if (entries.Count > 0)
+				{
+					Console.WriteLine();
+					Console.WriteLine("  Versions:");
+					// Sort newest-first (string comparison works for dotted versions with same segment count)
+					entries.Sort((a, b) => string.Compare(b.ver, a.ver, StringComparison.Ordinal));
+					foreach (var entry in entries)
+						Console.WriteLine(entry.line);
+				}
+			}
+		}
+		catch { /* manifest parse failure — skip versions section */ }
 	}
 
 	Console.WriteLine();
@@ -949,6 +985,37 @@ string RunProcess(string exe, string args)
 }
 
 // ── Task Scheduler helpers ─────────────────────────────────────────
+
+/// <summary>
+/// Check health of a daemon/elevator staging directory.
+/// Returns a summary like "daemon: ok" or "daemon: BROKEN (missing 3 files)".
+/// </summary>
+string CheckComponentHealth(JsonElement versionEntry, string componentName, string binaryBaseName)
+{
+	var label = componentName;
+	if (!versionEntry.TryGetProperty(componentName, out var comp))
+		return $"{label}: -";
+
+	var path = comp.TryGetProperty("path", out var p) ? p.GetString() : null;
+	if (path == null || !Directory.Exists(path))
+		return $"{label}: not staged";
+
+	// Critical files that must exist for the component to start
+	var required = componentName == "daemon"
+		? new[] { $"{binaryBaseName}.dll", $"{binaryBaseName}.runtimeconfig.json",
+		          $"{binaryBaseName}.deps.json", "SeaShell.Engine.dll", "SeaShell.Common.dll", "Serilog.dll" }
+		: new[] { $"{binaryBaseName}.dll", $"{binaryBaseName}.runtimeconfig.json" };
+
+	var missing = required.Count(f => !File.Exists(Path.Combine(path, f)));
+	if (missing > 0)
+	{
+		var taskField = comp.TryGetProperty("scheduledTask", out var t) ? t.GetString() : null;
+		var taskNote = taskField != null ? " task: stale" : "";
+		return $"{label}: BROKEN (missing {missing} files){taskNote}";
+	}
+
+	return $"{label}: ok";
+}
 
 /// <summary>
 /// Find a SeaShell task by component prefix (e.g. "SeaShell Daemon").

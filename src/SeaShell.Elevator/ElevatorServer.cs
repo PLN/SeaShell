@@ -108,30 +108,44 @@ public sealed class ElevatorWorker
 
 		try
 		{
-			var psi = new ProcessStartInfo
+			ProcessStartInfo psi;
+			if (request.DirectExe)
 			{
-				FileName = "dotnet",
-				WorkingDirectory = request.WorkingDirectory,
-				UseShellExecute = false,
-				// Hidden window — the process needs a console handle to initialize,
-				// but the window is invisible. Sea.Initialize immediately calls
-				// FreeConsole + AttachConsole to switch to the CLI's console.
-				WindowStyle = ProcessWindowStyle.Hidden,
-			};
+				psi = new ProcessStartInfo
+				{
+					FileName = request.AssemblyPath,
+					WorkingDirectory = request.WorkingDirectory,
+					UseShellExecute = false,
+					WindowStyle = ProcessWindowStyle.Hidden,
+				};
+			}
+			else
+			{
+				psi = new ProcessStartInfo
+				{
+					FileName = "dotnet",
+					WorkingDirectory = request.WorkingDirectory,
+					UseShellExecute = false,
+					// Hidden window — the process needs a console handle to initialize,
+					// but the window is invisible. Sea.Initialize immediately calls
+					// FreeConsole + AttachConsole to switch to the CLI's console.
+					WindowStyle = ProcessWindowStyle.Hidden,
+				};
+				psi.ArgumentList.Add("exec");
+				if (request.RuntimeConfigPath != null)
+				{
+					psi.ArgumentList.Add("--runtimeconfig");
+					psi.ArgumentList.Add(request.RuntimeConfigPath);
+				}
+				if (request.DepsJsonPath != null)
+				{
+					psi.ArgumentList.Add("--depsfile");
+					psi.ArgumentList.Add(request.DepsJsonPath);
+				}
+				psi.ArgumentList.Add(request.AssemblyPath);
+			}
 			if (request.CliPid > 0)
 				psi.Environment["SEASHELL_CLI_PID"] = request.CliPid.ToString();
-			psi.ArgumentList.Add("exec");
-			if (request.RuntimeConfigPath != null)
-			{
-				psi.ArgumentList.Add("--runtimeconfig");
-				psi.ArgumentList.Add(request.RuntimeConfigPath);
-			}
-			if (request.DepsJsonPath != null)
-			{
-				psi.ArgumentList.Add("--depsfile");
-				psi.ArgumentList.Add(request.DepsJsonPath);
-			}
-			psi.ArgumentList.Add(request.AssemblyPath);
 			foreach (var a in request.Args)
 				psi.ArgumentList.Add(a);
 

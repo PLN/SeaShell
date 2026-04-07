@@ -122,6 +122,7 @@ public sealed class ScriptCompiler
 		if (File.Exists(dllPath) && File.Exists(runtimeConfigPath))
 		{
 			_log.Debug("Cache hit for {ScriptName} ({Hash})", scriptName, hash[..8]);
+			var cachedAppHost = AppHostWriter.FindExisting(outputDir, scriptName);
 			return new CompileResult
 			{
 				Success = true,
@@ -130,7 +131,8 @@ public sealed class ScriptCompiler
 				Restart = resolved.Directives.Restart,
 			MutexScope = resolved.Directives.MutexScope,
 			MutexAttach = resolved.Directives.MutexAttach,
-				AssemblyPath = dllPath,
+				AssemblyPath = cachedAppHost ?? dllPath,
+				DirectExe = cachedAppHost != null,
 				RuntimeConfigPath = runtimeConfigPath,
 				DepsJsonPath = ArtifactWriter.FindDepsJson(outputDir, scriptName),
 				ManifestPath = ArtifactWriter.FindManifest(outputDir, scriptName),
@@ -314,6 +316,10 @@ public sealed class ScriptCompiler
 		var manifestPath = Path.Combine(outputDir, $"{scriptName}.sea.json");
 		ArtifactWriter.WriteManifest(manifestPath, scriptPath, resolved, resolvedPackages);
 
+		// ── Generate apphost (best-effort) ──────────────────────────────
+		var appHostPath = AppHostWriter.Generate(
+			outputDir, $"{scriptName}.dll", resolved.Directives.Window);
+
 		return new CompileResult
 		{
 			Success = true,
@@ -322,7 +328,8 @@ public sealed class ScriptCompiler
 			Restart = resolved.Directives.Restart,
 			MutexScope = resolved.Directives.MutexScope,
 			MutexAttach = resolved.Directives.MutexAttach,
-			AssemblyPath = dllPath,
+			AssemblyPath = appHostPath ?? dllPath,
+			DirectExe = appHostPath != null,
 			RuntimeConfigPath = runtimeConfigPath,
 			DepsJsonPath = depsPath,
 			ManifestPath = manifestPath,
