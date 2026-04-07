@@ -1,6 +1,7 @@
 //css_inc Mother.cs
 //css_inc System.Diagnostics.Ext.cs
 using System;
+using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.IO.Compression;
@@ -32,6 +33,7 @@ if (string.IsNullOrEmpty(src) || string.IsNullOrEmpty(artifacts) || string.IsNul
 
 var nupkgDir = Path.Combine(artifacts, "nupkg");
 var linuxArtifacts = Path.Combine(artifacts, "linux-x64");
+var muslArtifacts = Path.Combine(artifacts, "linux-musl-x64");
 
 Directory.CreateDirectory(nupkgDir);
 Directory.CreateDirectory(logs);
@@ -39,6 +41,7 @@ Directory.CreateDirectory(logs);
 Console.WriteLine($"[package] Source:   {src}");
 Console.WriteLine($"[package] NuPkg:    {nupkgDir}");
 Console.WriteLine($"[package] Linux:    {linuxArtifacts}");
+Console.WriteLine($"[package] Musl:     {muslArtifacts}");
 
 // ── Check Linux artifacts (host pipeline.cs already awaited them) ─────
 
@@ -49,6 +52,12 @@ if (!Directory.Exists(linuxArtifacts) || Directory.GetFiles(linuxArtifacts).Leng
 }
 
 Console.WriteLine($"[package] Linux artifacts: {Directory.GetFiles(linuxArtifacts).Length} files");
+
+var hasMuslArtifacts = Directory.Exists(muslArtifacts) && Directory.GetFiles(muslArtifacts).Length > 0;
+if (hasMuslArtifacts)
+	Console.WriteLine($"[package] Musl artifacts:  {Directory.GetFiles(muslArtifacts).Length} files");
+else
+	Console.WriteLine("[package] Musl artifacts:  not available (skipping musl injection)");
 
 // ── Pack ──────────────────────────────────────────────────────────────
 
@@ -88,6 +97,25 @@ using (var zip = ZipFile.Open(toolPkg, ZipArchiveMode.Update))
 		Console.WriteLine($"[package]   + {entryName}");
 	}
 
+	// ── Inject musl apphosts into runtimes/linux-musl-x64/ ──────────
+	if (hasMuslArtifacts)
+	{
+		foreach (var name in new[] { "seashell-daemon", "seashell-elevator" })
+		{
+			var muslBin = Path.Combine(muslArtifacts, name);
+			if (!File.Exists(muslBin))
+			{
+				Console.Error.WriteLine($"[package] Musl apphost not found: {muslBin}");
+				return 1;
+			}
+
+			var entryName = $"runtimes/linux-musl-x64/{name}";
+			zip.GetEntry(entryName)?.Delete();
+			zip.CreateEntryFromFile(muslBin, entryName);
+			Console.WriteLine($"[package]   + {entryName}");
+		}
+	}
+
 	// Patch [Content_Types].xml for extensionless files
 	var ctEntry = zip.GetEntry("[Content_Types].xml")!;
 	string ct;
@@ -97,8 +125,15 @@ using (var zip = ZipFile.Open(toolPkg, ZipArchiveMode.Update))
 	foreach (var name in new[] { "seashell-daemon", "seashell-elevator" })
 	{
 		var overrideTag = $"<Override PartName=\"/tools/net10.0/any/{name}\" ContentType=\"application/octet\" />";
-		if (!ct.Contains(name))
+		if (!ct.Contains($"/tools/net10.0/any/{name}\""))
 			ct = ct.Replace("</Types>", $"  {overrideTag}\n</Types>");
+
+		if (hasMuslArtifacts)
+		{
+			var muslOverride = $"<Override PartName=\"/runtimes/linux-musl-x64/{name}\" ContentType=\"application/octet\" />";
+			if (!ct.Contains($"/runtimes/linux-musl-x64/{name}\""))
+				ct = ct.Replace("</Types>", $"  {muslOverride}\n</Types>");
+		}
 	}
 
 	ctEntry.Delete();
@@ -129,7 +164,7 @@ void AssertContains(string nupkg, string[] expected)
 }
 
 Console.WriteLine("\n[package] SeaShell (tool):");
-AssertContains(toolPkg, new[] {
+var toolExpected = new List<string> {
 	"tools/net10.0/any/sea.dll",
 	"tools/net10.0/any/seashell-daemon.dll",
 	"tools/net10.0/any/seashell-daemon.exe",
@@ -140,7 +175,13 @@ AssertContains(toolPkg, new[] {
 	"tools/net10.0/any/SeaShell.Script.dll",
 	"tools/net10.0/any/SeaShell.Ipc.dll",
 	"tools/net10.0/any/MessagePack.dll",
-});
+};
+if (hasMuslArtifacts)
+{
+	toolExpected.Add("runtimes/linux-musl-x64/seashell-daemon");
+	toolExpected.Add("runtimes/linux-musl-x64/seashell-elevator");
+}
+AssertContains(toolPkg, toolExpected.ToArray());
 
 var hostPkg = Directory.GetFiles(nupkgDir, "SeaShell.Host.*.nupkg").FirstOrDefault();
 if (hostPkg != null)

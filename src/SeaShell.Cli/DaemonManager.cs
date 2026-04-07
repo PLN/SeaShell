@@ -12,6 +12,12 @@ namespace SeaShell.Cli;
 
 static class DaemonManager
 {
+	/// <summary>True when running on a musl-based Linux (Alpine, Void, etc.).</summary>
+	internal static bool IsMuslRuntime { get; } =
+		!RuntimeInformation.IsOSPlatform(OSPlatform.Windows)
+		&& (RuntimeInformation.RuntimeIdentifier.Contains("musl", StringComparison.OrdinalIgnoreCase)
+			|| File.Exists("/etc/alpine-release"));
+
 	/// <summary>Show daemon and elevator status via a PingRequest.</summary>
 	public static async Task<int> StatusAsync(string daemonAddress)
 	{
@@ -184,9 +190,16 @@ static class DaemonManager
 		}
 
 		// Priority 2: published mode — native apphost next to CLI
+		// On musl the glibc apphost exists but won't execute; check runtimes/ instead.
 		var daemonExe = RuntimeInformation.IsOSPlatform(OSPlatform.Windows)
 			? "seashell-daemon.exe" : "seashell-daemon";
-		if (File.Exists(Path.Combine(cliDir, daemonExe)))
+		if (IsMuslRuntime)
+		{
+			var muslDir = GetMuslRuntimesDir(cliDir);
+			if (muslDir != null && File.Exists(Path.Combine(muslDir, "seashell-daemon")))
+				return (cliDir, LaunchMode.Published);
+		}
+		else if (File.Exists(Path.Combine(cliDir, daemonExe)))
 			return (cliDir, LaunchMode.Published);
 
 		// Priority 3: dotnet tool mode — DLL next to CLI
@@ -194,6 +207,18 @@ static class DaemonManager
 			return (cliDir, LaunchMode.Tool);
 
 		return (null, LaunchMode.Dev);
+	}
+
+	// ── Musl runtime helpers ──────────────────────────────────────────
+
+	/// <summary>
+	/// Resolve the runtimes/linux-musl-x64/ directory from a tool package's tools/net10.0/any/ dir.
+	/// Returns null if the directory doesn't exist (dev mode, or old package without musl support).
+	/// </summary>
+	internal static string? GetMuslRuntimesDir(string toolAnyDir)
+	{
+		var dir = Path.GetFullPath(Path.Combine(toolAnyDir, "..", "..", "..", "runtimes", "linux-musl-x64"));
+		return Directory.Exists(dir) ? dir : null;
 	}
 
 	// ── Binary staging ─────────────────────────────────────────────────
@@ -212,6 +237,17 @@ static class DaemonManager
 
 		Directory.CreateDirectory(stageDir);
 		CopyDirectory(sourceDir, stageDir);
+
+		// On musl, overwrite glibc apphosts with musl-linked versions from runtimes/
+		if (IsMuslRuntime)
+		{
+			var muslDir = GetMuslRuntimesDir(sourceDir);
+			if (muslDir != null)
+			{
+				foreach (var file in Directory.GetFiles(muslDir))
+					File.Copy(file, Path.Combine(stageDir, Path.GetFileName(file)), overwrite: true);
+			}
+		}
 
 		// Generate .runtimeconfig.dev.json with NuGet probing path so the staged
 		// binary can resolve package dependencies (EventLog, Serilog sinks, etc.)

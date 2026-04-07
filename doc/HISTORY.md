@@ -1,5 +1,26 @@
 # History
 
+## v0.2.16 (2026-03-28)
+
+**Alpine Linux (linux-musl-x64) support, pipeline test rework.**
+
+- **Alpine / musl support** — NuGet resolver detects musl-based Linux via
+  `RuntimeInformation.RuntimeIdentifier` and `/etc/alpine-release`, returns
+  `linux-musl-x64` RID with fallback chain `linux-musl-x64` → `linux-x64` →
+  `linux` → `any`. Daemon manager probes `runtimes/linux-musl-x64/` for musl
+  apphosts and overwrites glibc variants during staging. Falls back to
+  `dotnet exec` if musl apphost is missing.
+- **Pipeline packaging** — Injects musl apphosts into `runtimes/linux-musl-x64/`
+  in the tool nupkg alongside the existing glibc apphosts in `tools/net10.0/any/`.
+  Conditional on musl artifacts being present.
+- **GitHub Actions CI** — Alpine build via `mcr.microsoft.com/dotnet/sdk:10.0-alpine`
+  container in the matrix. Release job downloads, injects, and validates musl
+  apphosts.
+- **Pipeline test rework** — Three-phase structure: contained tests first, then
+  install/update for both current user and root/SYSTEM, then smoke tests.
+  No rollback — develop forward. Clears all caches (compilation, daemon staging,
+  elevator staging) and unregisters stale Task Scheduler tasks before install.
+
 ## v0.2.15 (2026-03-27)
 
 **Daemon staging fix, .NET 10 dependency cleanup, cache hash includes direct NuGet versions.**

@@ -437,12 +437,16 @@ public sealed class NuGetResolver
 			.FirstOrDefault();
 	}
 
-	/// <summary>RID fallback chain, e.g., win-x64 → win → any.</summary>
+	/// <summary>RID fallback chain, e.g., linux-musl-x64 → linux-x64 → linux → any.</summary>
 	private IEnumerable<string> GetRidFallbacks()
 	{
-		yield return _rid;                                         // e.g., win-x64
+		yield return _rid;                                         // e.g., linux-musl-x64
+		if (_rid.Contains("-musl-"))
+		{
+			yield return _rid.Replace("-musl", "");                // e.g., linux-x64
+		}
 		var dashIdx = _rid.IndexOf('-');
-		if (dashIdx > 0) yield return _rid[..dashIdx];             // e.g., win
+		if (dashIdx > 0) yield return _rid[..dashIdx];             // e.g., linux
 		yield return "any";
 	}
 
@@ -458,7 +462,13 @@ public sealed class NuGetResolver
 		};
 
 		if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows)) return $"win-{arch}";
-		if (RuntimeInformation.IsOSPlatform(OSPlatform.Linux)) return $"linux-{arch}";
+		if (RuntimeInformation.IsOSPlatform(OSPlatform.Linux))
+		{
+			if (RuntimeInformation.RuntimeIdentifier.Contains("musl", StringComparison.OrdinalIgnoreCase)
+				|| File.Exists("/etc/alpine-release"))
+				return $"linux-musl-{arch}";
+			return $"linux-{arch}";
+		}
 		if (RuntimeInformation.IsOSPlatform(OSPlatform.OSX)) return $"osx-{arch}";
 		return $"linux-{arch}";
 	}

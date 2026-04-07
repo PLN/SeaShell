@@ -10,11 +10,12 @@ using System.Threading;
 using Serilog;
 
 // ── SeaShell Pipeline: Test ──────────────────────────────────────────
-// Runs on each build host. Tests the actual NuGet packages:
-// - Install sea tool from nupkg
-// - Script smoke tests
-// - Lifecycle tests
-// Pushes test log to /pipeline/common/
+// Runs on each build host. Three phases:
+//   1. Contained tests (no sea install needed)
+//   2. Install/update sea for current user + root/SYSTEM
+//   3. Smoke tests using the freshly installed sea
+//
+// Does NOT roll back — develop forward, not back.
 
 var src = Environment.GetEnvironmentVariable("PIPELINE_SRC")!;
 var artifacts = Environment.GetEnvironmentVariable("PIPELINE_ARTIFACTS")!;
@@ -25,6 +26,7 @@ var commonDir = Environment.GetEnvironmentVariable("PIPELINE_COMMON")!;
 
 var nupkgDir = Path.Combine(artifacts, "nupkg");
 var isWindows = RuntimeInformation.IsOSPlatform(OSPlatform.Windows);
+var elevate = isWindows ? "gsudo" : "sudo";
 var passed = 0;
 var failed = 0;
 var results = new List<(string name, bool pass, string detail)>();
@@ -46,15 +48,43 @@ if (!Directory.Exists(nupkgDir) || Directory.GetFiles(nupkgDir, "*.nupkg").Lengt
 
 Console.WriteLine($"[test] Found {Directory.GetFiles(nupkgDir, "*.nupkg").Length} packages");
 
-// ── Install sea from local packages ──────────────────────────────────
+var testDir = Path.Combine(src, "test");
 
-Console.WriteLine("\n[test] === Installing sea from local packages ===");
+// ═════════════════════════════════════════════════════════════════════
+// Phase 1: Contained tests (no sea install needed)
+// ═════════════════════════════════════════════════════════════════════
 
-// Kill daemon process directly (avoids needing sea itself to stop it)
+Console.WriteLine("\n[test] ══ Phase 1: Contained tests ══");
+
+// ── Engine dir NuGet test (dotnet run, no publish) ──────────────────
+// Tests that ScriptHost works when the Engine DLL is in the NuGet cache
+// (not a flat publish dir). Bundled DLLs are in separate package dirs.
+
+RunTest("engine-dir-nuget (dotnet run, NuGet cache layout)", () =>
+{
+	var engineDirTestProject = Path.Combine(src, "test", "engine-dir-nuget");
+	Environment.SetEnvironmentVariable("SEASHELL_NUPKG_DIR", nupkgDir);
+	return DiagnosticsExt.RunProcess("dotnet",
+		$"run --project \"{engineDirTestProject}\"",
+		src, prefix: "test", logFile: Path.Combine(logs, "engine-dir-nuget.log"));
+});
+
+// ═════════════════════════════════════════════════════════════════════
+// Phase 2: Install / Update
+// ═════════════════════════════════════════════════════════════════════
+
+Console.WriteLine("\n[test] ══ Phase 2: Install / Update ══");
+
+// ── Kill running processes and unregister tasks ─────────────────────
+
 if (isWindows)
 {
 	DiagnosticsExt.RunProcess("taskkill", "/F /IM seashell-daemon.exe", src, quiet: true);
 	DiagnosticsExt.RunProcess("taskkill", "/F /IM seashell-elevator.exe", src, quiet: true);
+	// Unregister Task Scheduler tasks — they point to the old staged binary
+	// which we're about to delete. The fresh install will re-stage on first use.
+	DiagnosticsExt.RunProcess("schtasks.exe", $"/Delete /TN \"\\SeaShell\\SeaShell Daemon ({Environment.UserName})\" /F", src, quiet: true);
+	DiagnosticsExt.RunProcess("schtasks.exe", $"/Delete /TN \"\\SeaShell\\SeaShell Elevator ({Environment.UserName})\" /F", src, quiet: true);
 }
 else
 {
@@ -63,30 +93,60 @@ else
 }
 Thread.Sleep(2000); // Let processes fully exit
 
+// ── Install for current user ────────────────────────────────────────
+
+Console.WriteLine("[test] Installing sea for current user...");
 DiagnosticsExt.RunProcess("dotnet", "tool uninstall -g SeaShell", src, quiet: true);
 
-// Install from nupkg directory
 var installCode = DiagnosticsExt.RunProcess("dotnet", $"tool install -g SeaShell --add-source \"{nupkgDir}\"", src, prefix: "test");
 if (installCode != 0)
 {
-	Console.Error.WriteLine("[test] Failed to install sea from packages");
-	// Try to restore the previous version
-	DiagnosticsExt.RunProcess("dotnet", "tool install -g SeaShell --version 0.1.7", src, quiet: true);
+	Console.Error.WriteLine("[test] Failed to install sea for current user");
 	return 1;
 }
 
-// Clear SeaShell compilation cache — stale staged binaries from previous runs
-// may have deps.json/runtimeconfig files from a prior engine version.
-var seashellCache = isWindows
-	? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "seashell", "cache")
-	: Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".local", "share", "seashell", "cache");
-if (Directory.Exists(seashellCache))
+// ── Install for root/SYSTEM ─────────────────────────────────────────
+
+Console.WriteLine("[test] Installing sea for root/SYSTEM...");
+DiagnosticsExt.RunProcess(elevate, "dotnet tool uninstall -g SeaShell", src, quiet: true);
+
+var rootInstallCode = DiagnosticsExt.RunProcess(elevate,
+	$"dotnet tool install -g SeaShell --add-source \"{nupkgDir}\"", src, prefix: "test");
+if (rootInstallCode != 0)
+	Console.Error.WriteLine("[test] WARNING: Failed to install sea for root/SYSTEM (non-fatal)");
+
+// ── Clear all SeaShell caches (both accounts) ───────────────────────
+
+Console.WriteLine("[test] Clearing SeaShell caches...");
+
+// Current user: cache + daemon staging + elevator staging
+var seashellDataDir = isWindows
+	? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "seashell")
+	: Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".local", "share", "seashell");
+foreach (var sub in new[] { "cache", "daemon", "elevator" })
 {
-	Console.WriteLine($"[test] Clearing compilation cache: {seashellCache}");
-	try { Directory.Delete(seashellCache, true); } catch { }
+	var dir = Path.Combine(seashellDataDir, sub);
+	if (Directory.Exists(dir))
+	{
+		Console.WriteLine($"[test]   Clearing {sub}: {dir}");
+		try { Directory.Delete(dir, true); } catch { }
+	}
 }
 
-// Verify installation
+// Root/SYSTEM caches
+if (isWindows)
+{
+	DiagnosticsExt.RunProcess("gsudo", @"cmd /c rmdir /s /q ""C:\ProgramData\seashell\cache"" 2>nul", src, quiet: true);
+	DiagnosticsExt.RunProcess("gsudo", @"cmd /c rmdir /s /q ""C:\ProgramData\seashell\daemon"" 2>nul", src, quiet: true);
+	DiagnosticsExt.RunProcess("gsudo", @"cmd /c rmdir /s /q ""C:\ProgramData\seashell\elevator"" 2>nul", src, quiet: true);
+}
+else
+{
+	DiagnosticsExt.RunProcess("sudo", "rm -rf /var/lib/seashell/cache /var/lib/seashell/daemon /var/lib/seashell/elevator", src, quiet: true);
+}
+
+// ── Verify installation ─────────────────────────────────────────────
+
 var verifyCode = DiagnosticsExt.RunProcess("sea", "--version", src, prefix: "test");
 if (verifyCode != 0)
 {
@@ -94,11 +154,13 @@ if (verifyCode != 0)
 	return 1;
 }
 
+// ═════════════════════════════════════════════════════════════════════
+// Phase 3: Smoke tests (using freshly installed sea)
+// ═════════════════════════════════════════════════════════════════════
+
+Console.WriteLine("\n[test] ══ Phase 3: Smoke tests ══");
+
 // ── Script smoke tests ───────────────────────────────────────────────
-
-Console.WriteLine("\n[test] === Script smoke tests ===");
-
-var testDir = Path.Combine(src, "test");
 
 RunTest("hello.cs", () =>
 	DiagnosticsExt.RunProcess("sea", Path.Combine(testDir, "hello.cs"), src, prefix: "test"));
@@ -110,8 +172,6 @@ RunTest("interactive_ok.cs", () =>
 	DiagnosticsExt.RunProcess("sea", Path.Combine(testDir, "interactive_ok.cs"), src, prefix: "test"));
 
 // ── Regression tests ─────────────────────────────────────────────────
-
-Console.WriteLine("\n[test] === Regression tests ===");
 
 RunTest("nuget-transitive (CS1704 dedup)", () =>
 	DiagnosticsExt.RunProcess("sea", Path.Combine(testDir, "nuget-transitive", "nuget-transitive.cs"), src, prefix: "test"));
@@ -125,25 +185,8 @@ RunTest("host-resolution (bundled DLL probing)", () =>
 RunTest("host-in-host-nuget (nested ScriptHost + NuGet)", () =>
 	DiagnosticsExt.RunProcess("sea", Path.Combine(testDir, "host-in-host-nuget", "host-in-host-nuget.cs"), src, prefix: "test"));
 
-// ── Engine dir NuGet test (dotnet run, no publish) ──────────────────
-// Tests that ScriptHost works when the Engine DLL is in the NuGet cache
-// (not a flat publish dir). Bundled DLLs are in separate package dirs.
-
-Console.WriteLine("\n[test] === Engine dir NuGet test ===");
-
-RunTest("engine-dir-nuget (dotnet run, NuGet cache layout)", () =>
-{
-	var engineDirTestProject = Path.Combine(src, "test", "engine-dir-nuget");
-	Environment.SetEnvironmentVariable("SEASHELL_NUPKG_DIR", nupkgDir);
-	return DiagnosticsExt.RunProcess("dotnet",
-		$"run --project \"{engineDirTestProject}\"",
-		src, prefix: "test", logFile: Path.Combine(logs, "engine-dir-nuget.log"));
-});
-
 // ── Binary pass-through test ────────────────────────────────────────
 // Tests that a pre-compiled binary with its own deps.json works via sea.
-
-Console.WriteLine("\n[test] === Binary pass-through test ===");
 
 RunTest("binary-deps (companion deps.json pass-through)", () =>
 {
@@ -163,8 +206,6 @@ RunTest("binary-deps (companion deps.json pass-through)", () =>
 // Full end-to-end: publish ServiceCwdTest, register as service, start via
 // SCM/systemd, verify script runs despite CWD being system32 or /.
 
-Console.WriteLine("\n[test] === Service CWD test ===");
-
 RunTest("service-cwd (SCM/systemd script resolution)", () =>
 {
 	var testProjectDir = Path.Combine(src, "test", "ServiceCwdTest");
@@ -182,12 +223,6 @@ RunTest("service-cwd (SCM/systemd script resolution)", () =>
 	// Clear NuGet http-cache to avoid stale packages with same version number
 	DiagnosticsExt.RunProcess("dotnet", "nuget locals http-cache --clear", src, quiet: true);
 
-	// Clear SYSTEM/root SeaShell compilation cache from previous runs
-	if (isWindows)
-		DiagnosticsExt.RunProcess("gsudo", @"cmd /c rmdir /s /q ""C:\ProgramData\seashell\cache"" 2>nul", src, quiet: true);
-	else
-		DiagnosticsExt.RunProcess("sudo", "rm -rf /var/lib/seashell/cache", src, quiet: true);
-
 	// Publish with local nupkg source
 	Environment.SetEnvironmentVariable("SEASHELL_NUPKG_DIR", nupkgDir);
 	var pubCode = DiagnosticsExt.RunProcess("dotnet",
@@ -200,47 +235,10 @@ RunTest("service-cwd (SCM/systemd script resolution)", () =>
 	var exeName = isWindows ? "ServiceCwdTest.exe" : "ServiceCwdTest";
 	var exePath = Path.Combine(publishDir, exeName);
 
-	// Elevation wrapper
-	var elevate = isWindows ? "gsudo" : "sudo";
-
-	// Place a nuget.config in the service account's temp/seashell/ directory.
-	// NuGetDownloader creates temp projects under <temp>/seashell/restore/<guid>/,
-	// and dotnet restore walks up the directory tree to find nuget.config.
-	// SYSTEM uses C:\Windows\Temp, root uses /tmp.
-	var serviceTemp = isWindows ? @"C:\Windows\Temp" : "/tmp";
-	var nugetConfigDir = Path.Combine(serviceTemp, "seashell");
-	var nugetConfigPath = Path.Combine(nugetConfigDir, "nuget.config");
-	var nugetConfigContent = $"""
-		<?xml version="1.0" encoding="utf-8"?>
-		<configuration>
-			<packageSources>
-				<clear />
-				<add key="pipeline-local" value="{nupkgDir}" />
-				<add key="nuget.org" value="https://api.nuget.org/v3/index.json" />
-			</packageSources>
-		</configuration>
-		""";
-	Console.WriteLine($"[test]   Writing nuget.config for service account at {nugetConfigPath}");
-	if (isWindows)
-	{
-		// C:\Windows\Temp requires admin — use gsudo to create dir + write file
-		DiagnosticsExt.RunProcess(elevate, $"cmd /c mkdir \"{nugetConfigDir}\" 2>nul", publishDir, quiet: true);
-		var tempConfig = Path.Combine(Path.GetTempPath(), "seashell-test-nuget.config");
-		File.WriteAllText(tempConfig, nugetConfigContent);
-		DiagnosticsExt.RunProcess(elevate, $"cmd /c copy /Y \"{tempConfig}\" \"{nugetConfigPath}\"", publishDir, quiet: true);
-		File.Delete(tempConfig);
-	}
-	else
-	{
-		// /tmp is world-writable
-		Directory.CreateDirectory(nugetConfigDir);
-		File.WriteAllText(nugetConfigPath, nugetConfigContent);
-	}
-
 	// Install service
 	Console.WriteLine($"[test]   Installing service '{serviceName}'...");
-	var installCode = DiagnosticsExt.RunProcess(elevate, $"\"{exePath}\" install", publishDir, prefix: "test");
-	if (installCode != 0) { Console.Error.WriteLine("[test] Service install failed"); return installCode; }
+	var installServiceCode = DiagnosticsExt.RunProcess(elevate, $"\"{exePath}\" install", publishDir, prefix: "test");
+	if (installServiceCode != 0) { Console.Error.WriteLine("[test] Service install failed"); return installServiceCode; }
 
 	try
 	{
@@ -317,12 +315,6 @@ RunTest("service-cwd (SCM/systemd script resolution)", () =>
 		DiagnosticsExt.RunProcess(elevate, $"\"{exePath}\" stop", publishDir, quiet: true);
 		Thread.Sleep(3000);
 		DiagnosticsExt.RunProcess(elevate, $"\"{exePath}\" uninstall", publishDir, quiet: true);
-
-		// Clean up nuget.config from service account's temp
-		if (isWindows)
-			DiagnosticsExt.RunProcess(elevate, $"cmd /c del \"{nugetConfigPath}\" 2>nul", publishDir, quiet: true);
-		else if (File.Exists(nugetConfigPath))
-			File.Delete(nugetConfigPath);
 	}
 });
 
@@ -330,8 +322,6 @@ RunTest("service-cwd (SCM/systemd script resolution)", () =>
 // After service-cwd: switch the service account to a different identity.
 // The new account has a different NuGet cache and temp dir — the nuget.config
 // we placed for the primary account is invisible. Compilation should fail.
-
-Console.WriteLine("\n[test] === Service identity test ===");
 
 RunTest("service-identity (NuGet cache isolation on account switch)", () =>
 {
@@ -342,7 +332,6 @@ RunTest("service-identity (NuGet cache isolation on account switch)", () =>
 	var serviceName = "seashell-cwd-test";
 	var exeName = isWindows ? "ServiceCwdTest.exe" : "ServiceCwdTest";
 	var exePath = Path.Combine(publishDir, exeName);
-	var elevate = isWindows ? "gsudo" : "sudo";
 
 	// Skip if the previous service-cwd test didn't create the published binary
 	if (!File.Exists(exePath))
@@ -462,17 +451,6 @@ File.WriteAllText(Path.Combine(logs, "test.log"), logContent);
 var commonLogDir = Path.Combine(commonDir, "logs");
 Directory.CreateDirectory(commonLogDir);
 File.WriteAllText(Path.Combine(commonLogDir, $"test-{host}.log"), logContent);
-
-// ── Restore original sea version ─────────────────────────────────────
-
-Console.WriteLine("\n[test] Restoring sea 0.1.7...");
-if (isWindows)
-	DiagnosticsExt.RunProcess("taskkill", "/F /IM seashell-daemon.exe", src, quiet: true);
-else
-	DiagnosticsExt.RunProcess("pkill", "-f seashell-daemon", src, quiet: true);
-Thread.Sleep(2000);
-DiagnosticsExt.RunProcess("dotnet", "tool uninstall -g SeaShell", src, quiet: true);
-DiagnosticsExt.RunProcess("dotnet", "tool install -g SeaShell --version 0.1.7", src, quiet: true);
 
 return failed > 0 ? 1 : 0;
 

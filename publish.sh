@@ -8,7 +8,7 @@ OUT="$PROJ/publish"
 
 rm -rf "$OUT"
 
-for RID in win-x64 linux-x64; do
+for RID in win-x64 linux-x64 linux-musl-x64; do
     echo "=== Publishing for $RID ==="
     dotnet publish "$PROJ/src/SeaShell.Cli/SeaShell.Cli.csproj" \
         -c Release -r $RID --self-contained false -o "$OUT/$RID" -p:PublishSingleFile=false
@@ -20,7 +20,7 @@ done
 
 echo ""
 echo "=== Published ==="
-for RID in win-x64 linux-x64; do
+for RID in win-x64 linux-x64 linux-musl-x64; do
     echo "$RID:"
     ls -1 "$OUT/$RID/sea"* "$OUT/$RID/seashell-"* 2>/dev/null | sed 's|.*/|  |'
 done
