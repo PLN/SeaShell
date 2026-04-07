@@ -116,7 +116,7 @@ static class ScheduledTasks
 	public static int InstallDaemon()
 	{
 		if (!RequireWindows()) return 1;
-		var result = FindBinary("SeaShell.Daemon", "seashell-daemon");
+		var result = FindAndStageBinary("SeaShell.Daemon", "seashell-daemon", "daemon");
 		if (result == null) return 1;
 		Console.WriteLine($"  binary: {result.Value.command}{(result.Value.arguments != null ? " " + result.Value.arguments : "")}");
 		return RegisterTask(DaemonTaskName, result.Value.command, result.Value.arguments, elevated: false) ? 0 : 1;
@@ -125,7 +125,7 @@ static class ScheduledTasks
 	public static int InstallElevator()
 	{
 		if (!RequireWindows()) return 1;
-		var result = FindBinary("SeaShell.Elevator", "seashell-elevator");
+		var result = FindAndStageBinary("SeaShell.Elevator", "seashell-elevator", "elevator");
 		if (result == null) return 1;
 		Console.WriteLine($"  binary: {result.Value.command}{(result.Value.arguments != null ? " " + result.Value.arguments : "")}");
 		Console.WriteLine("  NOTE: This registers a task with highest privileges.");
@@ -378,6 +378,60 @@ static class ScheduledTasks
 	}
 
 	// ── Binary discovery ───────────────────────────────────────────────
+
+	/// <summary>Find the source binary, stage it, and return the staged command.</summary>
+	private static (string command, string? arguments)? FindAndStageBinary(string projectName, string assemblyName, string stageName)
+	{
+		var baseDir = AppContext.BaseDirectory;
+		var ext = RuntimeInformation.IsOSPlatform(OSPlatform.Windows) ? ".exe" : "";
+		string? sourceDir = null;
+
+		// Published mode: sibling to CLI
+		if (File.Exists(Path.Combine(baseDir, assemblyName + ext)) || File.Exists(Path.Combine(baseDir, assemblyName + ".dll")))
+			sourceDir = baseDir;
+
+		// Dev mode: sibling project build output
+		if (sourceDir == null)
+		{
+			var devDir = FindDevBinaryDir(projectName);
+			if (devDir != null) sourceDir = devDir;
+		}
+
+		if (sourceDir == null)
+		{
+			Console.Error.WriteLine($"sea: could not find {assemblyName}");
+			return null;
+		}
+
+		// Stage to data dir
+		var (stagedDir, _) = DaemonManager.StageBinary(sourceDir, stageName);
+		Console.WriteLine($"  staged: {stagedDir}");
+
+		// Build command from staged path
+		var stagedExe = Path.Combine(stagedDir, assemblyName + ext);
+		if (ext != "" && File.Exists(stagedExe))
+			return (stagedExe, null);
+
+		var stagedDll = Path.Combine(stagedDir, assemblyName + ".dll");
+		if (File.Exists(stagedDll))
+			return ("dotnet", $"exec \"{stagedDll}\"");
+
+		Console.Error.WriteLine($"sea: staged binary not found in {stagedDir}");
+		return null;
+	}
+
+	private static string? FindDevBinaryDir(string projectName)
+	{
+		var dir = AppContext.BaseDirectory;
+		for (int i = 0; i < 5; i++)
+		{
+			var parent = Path.GetDirectoryName(dir);
+			if (parent == null) break;
+			dir = parent;
+		}
+		var candidate = Path.Combine(dir, projectName, "bin", "Debug", "net10.0");
+		return Directory.Exists(candidate) ? candidate : null;
+	}
 
 	private static (string command, string? arguments)? FindBinary(string projectName, string assemblyName)
 	{

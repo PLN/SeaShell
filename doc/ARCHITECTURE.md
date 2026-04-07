@@ -146,7 +146,11 @@ CLI → read ScriptExit → exit code → optional exit delay
 
 ```
 CLI → Daemon.RunRequest → compile → RunResponse(elevated=true)
-CLI → Daemon.SpawnRequest → Elevator.HandleSpawn → Process.Start(elevated)
+CLI → Daemon.SpawnRequest → if no elevator:
+  CLI → start elevator task (if registered)
+  CLI → Daemon.SpawnRequest(AwaitElevatorMs=15000)
+  Daemon → wait for ElevatorHello (up to 15s)
+Daemon → Elevator.HandleSpawn → Process.Start(elevated)
 Elevated script → Sea.Initialize → FreeConsole + AttachConsole(CLI pid)
 Elevated script → create pipe server → accept CLI connection
 CLI → connect → send ScriptInit

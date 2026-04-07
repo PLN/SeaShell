@@ -1,0 +1,17 @@
+[Unit]
+Description={description}
+After=network.target
+
+[Service]
+Type=notify
+ExecStart={exePath}
+WorkingDirectory={workDir}
+Restart=always
+RestartSec=5
+KillMode=process
+KillSignal=SIGTERM
+TimeoutStopSec=30
+User={user}
+
+[Install]
+WantedBy=multi-user.target

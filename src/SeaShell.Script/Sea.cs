@@ -96,6 +96,9 @@ public static class Sea
 	/// </summary>
 	public static event Action<byte[], string?>? MessageReceived;
 
+	/// <summary>True when running in watch mode (//sea_watch). Enables file-change hot-swap.</summary>
+	public static bool IsWatchMode { get; private set; }
+
 	/// <summary>True if this instance was started as a hot-swap replacement (not the first run).</summary>
 	public static bool IsReload { get; private set; }
 
@@ -179,6 +182,28 @@ public static class Sea
 	/// <summary>Send a string message to the Host (synchronous, UTF-8). No-op if not connected.</summary>
 	public static void SendMessage(string payload, string? topic = null) =>
 		SendMessage(Encoding.UTF8.GetBytes(payload), topic);
+
+	// ── Script-initiated reload ─────────────────────────────────────────
+
+	/// <summary>
+	/// Request this script to be recompiled and reloaded. Triggers the same hot-swap
+	/// path as a file change. Works in both direct and watch mode.
+	/// </summary>
+	/// <param name="clearCache">If true, forces a full recompile by clearing the compilation cache.</param>
+	/// <param name="reason">Optional reason string for logging.</param>
+	public static void RequestReload(bool clearCache = false, string? reason = null)
+	{
+		var ch = _channel ?? throw new InvalidOperationException("No IPC channel — script was not launched by SeaShell");
+		try { ch.SendAsync(new ScriptReloadRequest(reason, clearCache)).AsTask().GetAwaiter().GetResult(); }
+		catch { }
+	}
+
+	/// <summary>Async version of <see cref="RequestReload"/>.</summary>
+	public static async System.Threading.Tasks.Task RequestReloadAsync(bool clearCache = false, string? reason = null)
+	{
+		var ch = _channel ?? throw new InvalidOperationException("No IPC channel — script was not launched by SeaShell");
+		await ch.SendAsync(new ScriptReloadRequest(reason, clearCache));
+	}
 
 	// ── Initialization ──────────────────────────────────────────────────
 
@@ -344,6 +369,7 @@ public static class Sea
 			Assemblies = init.Assemblies;
 
 		IsConsoleEphemeral = init.IsConsoleEphemeral;
+		IsWatchMode = init.Watch;
 
 		if (init.ReloadCount > 0)
 		{

@@ -1,5 +1,88 @@
 # History
 
+## v0.1.6 (2026-03-22)
+
+**Binary running, script-initiated reload, cross-platform service hosting, and daemon staging.**
+
+- **Binary running** — `sea myapp.dll` and `host.RunAsync("myapp.dll")` run pre-compiled
+  assemblies with full Sea context. `ScriptCompiler.Compile()` detects `.dll`/`.exe`/extensionless
+  binaries and stages them with companion files — both CLI and Host get this for free.
+  Three .exe tiers: Tier 1 (apphost → redirect to .dll), Tier 2 (framework-dependent single-file),
+  Tier 3 (self-contained single-file). Companion `.sea.json` file enables directives for binaries
+  (`{"watch": true}`). ASP.NET Core auto-detected from PE assembly references.
+- **`Sea.RequestReload()`** — Scripts can programmatically trigger their own reload with optional
+  cache clearing. Works in both direct and watch mode. In direct mode the CLI opens a new daemon
+  connection; in watch mode it sends `RecompileRequest` over the held connection. The Host handles
+  it internally (it owns the compiler). New IPC messages: `ScriptReloadRequest` (tag 8),
+  `RecompileRequest` (tag 30). `RunRequest` gained `ClearCache` field.
+- **`CompilationCache.ClearScript()`** — Deletes all cache directories for a script, used by
+  `RequestReload(clearCache: true)`.
+- **`Sea.IsWatchMode`** — Public property set from `ScriptInit.Watch`.
+- **`StartupHook`** — `DOTNET_STARTUP_HOOKS` contract class in SeaShell.Script for injecting
+  Sea context into .dll binaries that don't reference SeaShell.Script.
+- **`AssemblyInspector`** — PE metadata inspection via `System.Reflection.Metadata`. Checks for
+  SeaShell.Script and ASP.NET Core references without loading the assembly.
+- **`ScriptHost` reload loop** — `ExecuteAsync` now handles `ScriptReloadRequest` internally with
+  a restart loop. Watch mode (`//sea_watch`) starts `ScriptWatcher` embedded in the Host — no
+  daemon needed. `ScriptConnection.StopAsync()` sends `ScriptStop` for graceful shutdown.
+- **`SeaShell.ServiceHost`** — New NuGet package. Cross-platform service hosting with a 6-line
+  consumer API (`ServiceHostBuilder`). Auto-detects init system (Windows Service, systemd, runit,
+  OpenRC, sysvinit). `install`/`uninstall`/`start`/`stop`/`status` management commands built into
+  the binary. `ServiceHostWorker` runs scripts with crash recovery and optional NuGet update loop
+  for zero-locking automatic updates. Embedded init script templates.
+- **Graceful service shutdown** — `RunOneInstanceAsync` sends `ScriptStop` through IPC on
+  cancellation token, waits for graceful exit, kills after timeout. No orphaned child processes.
+- **systemd `KillMode=process`** — Only the main PID receives SIGTERM; child script process gets
+  graceful `ScriptStop` via IPC instead of direct signal kill.
+- **CI service smoke test** — Full install/start/reload/stop/uninstall cycle on both Windows and
+  Linux runners. Verifies PID change (reload worked) and no orphaned processes.
+- **Linux binary support** — Extensionless ELF binaries detected and handled as direct executables
+  (same as Tier 2/3 .exe on Windows).
+- **`HotSwapNotify` extended** — Carries `StartupHookPath` and `DirectExe` fields so watch-mode
+  restarts preserve binary execution mode.
+- **`SeaShellPaths`** — New static class centralizing all data directory paths. Per-user
+  `%LOCALAPPDATA%\seashell\` (Windows) or `~/.local/share/seashell/` (Linux). System accounts
+  (SYSTEM/root) use `%ProgramData%\seashell\` or `/var/lib/seashell/`. Override with `SEASHELL_DATA`
+  env var. Compilation cache moved from `%TEMP%` to persistent AppData.
+- **Daemon staging** — `DaemonManager.StartDaemon()` copies daemon binaries to
+  `{DataDir}/daemon/{hash}/` before launching. Eliminates DLL lock conflicts: `dotnet build`
+  succeeds while daemon is running. Same for elevator via `{DataDir}/elevator/{hash}/`.
+  `--install-daemon`/`--install-elevator` register staged paths with Task Scheduler.
+- **Daemon version-check** — `PingResponse` gains `Pid` and `DaemonHash` fields. On script run,
+  CLI compares running daemon's hash with staged hash. Mismatch triggers automatic restart.
+  Last-resort PID kill if IPC stop fails.
+- **`.runtimeconfig.dev.json` generation** — Staged binaries get a dev config with
+  `additionalProbingPaths` pointing to the NuGet cache, so package dependencies (EventLog,
+  Serilog sinks, etc.) resolve correctly from the staging directory.
+
+## v0.1.5 (2026-03-22)
+
+**Daemon lifecycle, cross-platform packaging, and one-liner installers.**
+
+- **`--stop` via IPC** — `sea --stop` now uses IPC first (works for any running daemon,
+  including on Linux), then ends Task Scheduler tasks if registered. Reports actual state
+  — no misleading output when nothing is running. Output aligned with `--status` format.
+- **Task preference** — `StartDaemon` prefers a registered Task Scheduler task over
+  `Process.Start`. Falls back to spawning a process if no task is registered.
+- **Elevator auto-start** — When a `//sea_elevate` script fails because the elevator isn't
+  connected, the CLI starts the elevator task and the daemon waits internally for the
+  elevator's `ElevatorHello` (`AwaitElevatorMs` on `SpawnRequest`). One round trip, no
+  CLI polling.
+- **Independent binary search** — `--install-daemon` only searches for the daemon binary,
+  `--install-elevator` only for the elevator. No more confusing cross-errors.
+- **Dotnet tool mode** — `FindBinary` detects `.dll` (dotnet tool store) and registers
+  tasks with `dotnet exec` as fallback. `BuildTaskXml` supports `<Arguments>` element.
+- **Cross-platform nupkg** — CI packs on Windows (gets `.exe` WinExe apphosts natively),
+  then injects Linux ELF apphosts into the nupkg. Both platforms get native executables
+  — daemon and elevator use WinExe subsystem on Windows (no console window).
+- **CI lifecycle tests** — `--status`, `--stop`, and idempotent stop tested on both
+  Windows and Linux runners.
+- **`install.ps1`** — One-liner Windows installer: checks .NET 10, installs/updates tool,
+  stops running instances, registers daemon task, optionally registers elevator via gsudo,
+  associates `.cs`. Usage: `iex (irm https://raw.githubusercontent.com/PLN/SeaShell/main/install.ps1)`
+- **`install.sh`** — One-liner Linux installer: checks .NET 10, stops running instances,
+  installs/updates tool. Usage: `curl -fsSL https://raw.githubusercontent.com/PLN/SeaShell/main/install.sh | sh`
+
 ## v0.1.2 (2026-03-20)
 
 **Binary IPC and Host↔Script messaging.**
