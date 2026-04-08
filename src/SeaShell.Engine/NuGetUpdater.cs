@@ -149,8 +149,8 @@ public sealed class NuGetUpdater
 	{
 		var versions = Directory.GetDirectories(packageDir)
 			.Select(Path.GetFileName)
-			.Where(v => v != null && char.IsDigit(v[0]))
-			.OrderByDescending(v => v)
+			.Where(v => v != null && Version.TryParse(v, out _))
+			.OrderByDescending(v => Version.Parse(v!))
 			.FirstOrDefault();
 		return versions;
 	}

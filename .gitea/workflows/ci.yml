@@ -341,66 +341,20 @@ jobs:
       - name: "Install: Verify sea --version"
         run: sea --version
 
-      - name: "Install: Install for root/SYSTEM (non-fatal)"
-
+      - name: "Install: Install for root (Linux)"
+        if: matrix.os == 'linux'
         continue-on-error: true
         run: |
-          if [ "${{ matrix.os }}" = "linux" ]; then
-            sudo env "PATH=$HOME/.dotnet/tools:$PATH" dotnet tool uninstall -g SeaShell 2>/dev/null || true
-            sudo env "PATH=$HOME/.dotnet/tools:$PATH" dotnet tool install -g SeaShell --add-source "$(pwd)/nupkg" || true
-            sudo env "PATH=$HOME/.dotnet/tools:$PATH" seashell install || true
-          fi
+          sudo env "PATH=$HOME/.dotnet/tools:$PATH" dotnet tool uninstall -g SeaShell 2>/dev/null || true
+          sudo env "PATH=$HOME/.dotnet/tools:$PATH" dotnet tool install -g SeaShell --add-source "$(pwd)/nupkg" || true
+          sudo env "PATH=$HOME/.dotnet/tools:$PATH" seashell install || true
 
-      - name: "Install: Install SeaShell as SYSTEM (Windows)"
+      - name: "Install: Install SeaShell --system (Windows)"
         if: matrix.os == 'windows'
         shell: powershell
         continue-on-error: true
         run: |
-          $nupkgDir = "$(Get-Location)\nupkg"
-          $logFile = "$(Get-Location)\artifacts\system-install.log"
-          New-Item -ItemType Directory -Force -Path "$(Get-Location)\artifacts" | Out-Null
-
-          # Create a script that runs as SYSTEM to perform the install
-          $scriptPath = "$env:TEMP\seashell-system-install.ps1"
-          @"
-          `$ErrorActionPreference = 'Continue'
-          Start-Transcript -Path '$logFile' -Force
-          Write-Host "Running as: $([System.Security.Principal.WindowsIdentity]::GetCurrent().Name)"
-          dotnet tool uninstall -g SeaShell 2>`$null
-          dotnet tool install -g SeaShell --add-source '$nupkgDir'
-          # dotnet tools go to the SYSTEM profile's .dotnet/tools
-          `$toolsDir = Join-Path `$env:USERPROFILE '.dotnet\tools'
-          `$env:PATH = "`$toolsDir;`$env:PATH"
-          seashell install
-          Stop-Transcript
-          "@ | Set-Content -Path $scriptPath -Encoding UTF8
-
-          # Create and run a scheduled task as SYSTEM
-          $taskName = "SeaShell_SystemInstall"
-          try { schtasks /Delete /TN $taskName /F *>$null } catch {}
-          schtasks /Create /TN $taskName /TR "powershell -ExecutionPolicy Bypass -File `"$scriptPath`"" /SC ONCE /ST 00:00 /F /RU SYSTEM
-          schtasks /Run /TN $taskName
-
-          # Wait for completion (monitor log file)
-          $timeout = 60
-          for ($i = 0; $i -lt $timeout; $i++) {
-            Start-Sleep -Seconds 1
-            $state = (schtasks /Query /TN $taskName /FO CSV /NH 2>$null) -split ',' | Select-Object -Index 2
-            if ($state) { $state = $state.Trim('"') }
-            if ($state -eq 'Ready') { break }
-          }
-
-          # Clean up task
-          schtasks /Delete /TN $taskName /F 2>$null
-          Remove-Item $scriptPath -Force -ErrorAction SilentlyContinue
-
-          # Show log
-          if (Test-Path $logFile) {
-            Write-Host "=== SYSTEM install log ==="
-            Get-Content $logFile
-          } else {
-            Write-Host "No log file produced"
-          }
+          seashell install --system
 
       - name: "Install: Stage SeaShell.Service package"
 

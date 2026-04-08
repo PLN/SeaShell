@@ -151,7 +151,12 @@ public static class ServiceManifest
 		}
 
 		// Newest first — probe latest compatible version first
-		candidates.Sort((a, b) => string.Compare(b.version, a.version, StringComparison.Ordinal));
+		candidates.Sort((a, b) =>
+		{
+			var av = Version.TryParse(a.version, out var va) ? va : new Version(0, 0);
+			var bv = Version.TryParse(b.version, out var vb) ? vb : new Version(0, 0);
+			return bv.CompareTo(av);
+		});
 		return candidates.Select(c => c.address).ToArray();
 	}
 

@@ -433,7 +433,8 @@ public sealed class NuGetResolver
 	private string? PickLatestVersion(string packageDir)
 	{
 		return Directory.GetDirectories(packageDir)
-			.OrderByDescending(d => Path.GetFileName(d))  // simple string sort works for semver
+			.Where(d => Version.TryParse(Path.GetFileName(d), out _))
+			.OrderByDescending(d => Version.Parse(Path.GetFileName(d)!))
 			.FirstOrDefault();
 	}
 

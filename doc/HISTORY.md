@@ -1,5 +1,70 @@
 # History
 
+## v0.4.4.207 (2026-04-08)
+
+**System-wide install, version sorting fix.**
+
+- **`seashell install --system`** — System-wide install for SYSTEM/root. Installs to
+  `%ProgramData%\seashell\bin` (Windows) or the root user's standard location (Linux).
+  Uses machine PATH instead of user PATH. Skips Task Scheduler registration — daemon
+  starts lazily on first `sea` invocation. Requires elevation (gsudo/sudo).
+- **`seashell uninstall --system`** — Reverses system install.
+- **Version string sorting fix** — `NuGetResolver.PickLatestVersion()`,
+  `NuGetUpdater.GetLatestCachedVersion()`, `ServiceManifest.GetCompatibleDaemonAddresses()`,
+  and the bootstrapper status display now use `Version.Parse()` instead of lexicographic
+  string comparison. Fixes incorrect version ordering when segment values cross digit
+  boundaries (e.g., v49 > v50 under string sort).
+
+## v0.4.3.204 (2026-04-07)
+
+**Per-script apphosts, console title, status improvements.**
+
+- **Per-script apphost** — `AppHostWriter` generates a native executable per script
+  instead of using `dotnet exec`. Scripts launch instantly as native processes with
+  correct process names in task manager.
+- **Console title** — `sea` sets the console title to `{scriptName} — SeaShell v{version}`
+  while a script is running.
+- **`seashell status` improvements** — Shows installed versions from the service manifest
+  with daemon/elevator health status. Detects and reports broken staging directories.
+
+## v0.4.2.194 (2026-04-06)
+
+**Compatible daemon discovery.**
+
+- **DaemonLauncher version fallback** — When the exact-version daemon isn't running,
+  `DaemonLauncher` queries the service manifest for newer compatible versions and probes
+  their addresses. Scripts can run against a higher-version daemon without restarting.
+  Eliminates unnecessary daemon restarts during development when the version bumps
+  but the protocol is compatible.
+
+## v0.4.1.190 (2026-04-04)
+
+**Gitea Actions CI, bootstrapper improvements, bug fixes.**
+
+### CI/CD
+
+- **Gitea Actions** — Full CI/CD pipeline on self-hosted Gitea instance, replacing the
+  custom pipeline (orchestrator + Unison + worker.cs). Three-runner matrix: win-x64,
+  linux-x64, linux-musl-x64. Jobs: version → build (3×) → package → test. Version
+  counter bumped automatically via Gitea API.
+- **`seashell schedule` / `seashell unschedule`** — Bootstrapper subcommands for managing
+  scheduled script execution via Task Scheduler (Windows).
+
+### Bug fixes
+
+- **Bootstrapper DataDir for SYSTEM** — `GetDataDir()` detects SYSTEM/LocalService/
+  NetworkService SIDs and uses `%ProgramData%\seashell` instead of `%LOCALAPPDATA%`.
+- **Daemon staging ownership** — Bootstrapper writes the service manifest during install;
+  Invoker reads it. Eliminates race between staging and manifest updates.
+- **seaw error reporting** — Uses `GetConsoleWindow()` instead of `GetConsoleProcessList()`
+  for console detection. Compilation errors logged to Event Log when no console is available.
+- **windowMode passthrough** — `windowMode` parameter propagated through all `ScriptInit`
+  paths. Previously missing from some code paths, causing incorrect console behavior.
+- **OpenRC/sysvinit service start** — Init scripts stripped of CRLF line endings. `/sbin`
+  added to PATH before invoking OpenRC/sysvinit commands on Alpine.
+- **MessagePack 3.1.4** — Upgraded in Engine and Host to match Common, fixing serialization
+  compatibility.
+
 ## v0.4.0.110 (2026-03-31)
 
 **Archive-based distribution, seaw.exe, mutex/attach/restart directives.**
