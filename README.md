@@ -15,6 +15,15 @@ On Windows, run elevated (`gsudo seashell install`) to also register the
 elevator task for UAC-free `//sea_elevate` scripts and the Windows Event Log
 source. Without elevation the daemon is registered but the elevator is skipped.
 
+For a system-wide install (SYSTEM/root), use `--system` with elevation:
+```
+gsudo seashell install --system      # Windows
+sudo seashell install --system       # Linux
+```
+This installs to `%ProgramData%\seashell\bin` (Windows) or root's standard
+location (Linux), adds to machine PATH, and skips Task Scheduler registration
+— the daemon starts lazily on first `sea` invocation.
+
 Run `seashell` with no arguments to see a dashboard with version, platform,
 daemon/elevator state, and idle time. Use `seashell start` / `seashell stop`
 to manage daemon lifecycle.
@@ -375,12 +384,17 @@ The `seashell` command (installed via `dotnet tool install -g SeaShell`) manages
 SeaShell installation:
 
 ```
-seashell                        Dashboard: version, platform, daemon/elevator state
-seashell install                Extract archives, register daemon, update PATH
-seashell uninstall              Remove binaries, daemon task, file associations
-seashell start                  Start daemon (and elevator if registered)
-seashell stop                   Stop daemon and elevator
-seashell status                 Show running state and versions
+seashell                          Dashboard: version, platform, daemon/elevator state
+seashell install                  Extract archives, register daemon, update PATH
+seashell install --system         System-wide install (requires elevation)
+seashell uninstall                Remove binaries, daemon task, file associations
+seashell uninstall --system       Remove system-wide install
+seashell start                    Start daemon (and elevator if registered)
+seashell stop                     Stop daemon and elevator
+seashell status                   Show running state and versions
+seashell schedule <script> <timing>  Schedule a script via Task Scheduler
+seashell schedule                 List scheduled scripts
+seashell unschedule <script>      Remove a scheduled script
 ```
 
 `seashell install` and `seashell update` are identical — both extract the latest

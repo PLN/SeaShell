@@ -17,7 +17,11 @@ using System.Text.Json;
 
 var version = typeof(Program).Assembly.GetName().Version?.ToString(4) ?? "0.0.0";
 var isWindows = RuntimeInformation.IsOSPlatform(OSPlatform.Windows);
-var installDir = GetInstallDir();
+var systemMode = args.Any(a => a is "--system");
+args = args.Where(a => a is not "--system").ToArray();
+var installDir = systemMode && isWindows
+	? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData), "seashell", "bin")
+	: GetInstallDir();
 
 if (args.Length == 0)
 	return Status();
@@ -28,7 +32,9 @@ if (args[0] is "--help" or "-h")
 	Console.WriteLine();
 	Console.WriteLine("Usage: seashell              Show installation status");
 	Console.WriteLine("       seashell install      Install or update SeaShell");
+	Console.WriteLine("       seashell install --system  System-wide install (requires elevation)");
 	Console.WriteLine("       seashell uninstall    Remove SeaShell binaries and PATH entry");
+	Console.WriteLine("       seashell uninstall --system  Remove system-wide install");
 	Console.WriteLine("       seashell start        Start daemon and elevator");
 	Console.WriteLine("       seashell stop         Stop daemon and elevator");
 	Console.WriteLine("       seashell schedule <script.cs> <timing...>");
@@ -71,7 +77,13 @@ switch (args[0].ToLowerInvariant())
 
 int Install()
 {
-	Console.WriteLine($"{{~}} SeaShell Installer v{version}");
+	if (systemMode && !IsElevatedOrRoot())
+	{
+		Console.Error.WriteLine("  ERROR: --system requires elevation (gsudo on Windows, sudo on Linux).");
+		return 1;
+	}
+
+	Console.WriteLine($"{{~}} SeaShell Installer v{version}{(systemMode ? " (system)" : "")}");
 	Console.WriteLine();
 
 	// 1. Check .NET runtime
@@ -173,8 +185,8 @@ int Install()
 	Console.WriteLine("  Staging daemon...");
 	StageBinariesAndWriteManifest(installDir);
 
-	// 9. Register scheduled tasks (Windows only)
-	if (isWindows)
+	// 9. Register scheduled tasks (Windows only, skip for --system)
+	if (isWindows && !systemMode)
 	{
 		Console.WriteLine("  Registering daemon...");
 		RunProcess(seaPath, "--install-daemon");
@@ -202,8 +214,8 @@ int Install()
 		}
 	}
 
-	// 10. File associations (Windows)
-	if (isWindows)
+	// 10. File associations (Windows, skip for --system)
+	if (isWindows && !systemMode)
 	{
 		Console.WriteLine("  Registering file associations...");
 		RunProcess(seaPath, "--associate .cs");
@@ -356,13 +368,19 @@ static string QuoteArg(string s) => s.Contains(' ') ? $"\"{s}\"" : s;
 
 int Uninstall()
 {
-	Console.WriteLine($"{{~}} SeaShell Uninstaller");
+	if (systemMode && !IsElevatedOrRoot())
+	{
+		Console.Error.WriteLine("  ERROR: --system requires elevation (gsudo on Windows, sudo on Linux).");
+		return 1;
+	}
+
+	Console.WriteLine($"{{~}} SeaShell Uninstaller{(systemMode ? " (system)" : "")}");
 	Console.WriteLine();
 
 	StopExistingInstances();
 
-	// Remove file associations (Windows)
-	if (isWindows)
+	// Remove file associations (Windows, skip for --system)
+	if (isWindows && !systemMode)
 	{
 		var seaPath = Path.Combine(installDir, "sea.exe");
 		if (File.Exists(seaPath))
@@ -384,9 +402,11 @@ int Uninstall()
 	RemoveFromPath();
 
 	// Remove staged daemon/cache
-	var dataDir = isWindows
-		? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "seashell")
-		: Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".local", "share", "seashell");
+	var dataDir = systemMode && isWindows
+		? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData), "seashell")
+		: isWindows
+			? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "seashell")
+			: Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".local", "share", "seashell");
 
 	if (Directory.Exists(dataDir))
 	{
@@ -494,8 +514,12 @@ int Status()
 				{
 					Console.WriteLine();
 					Console.WriteLine("  Versions:");
-					// Sort newest-first (string comparison works for dotted versions with same segment count)
-					entries.Sort((a, b) => string.Compare(b.ver, a.ver, StringComparison.Ordinal));
+					entries.Sort((a, b) =>
+					{
+						var av = Version.TryParse(a.ver, out var va) ? va : new Version(0, 0);
+						var bv = Version.TryParse(b.ver, out var vb) ? vb : new Version(0, 0);
+						return bv.CompareTo(av);
+					});
 					foreach (var entry in entries)
 						Console.WriteLine(entry.line);
 				}
@@ -811,7 +835,9 @@ string GetDataDir()
 
 	if (isWindows)
 	{
-		// SYSTEM/LocalService/NetworkService → ProgramData, user → LocalAppData
+		// --system → ProgramData; SYSTEM/LocalService/NetworkService → ProgramData; user → LocalAppData
+		if (systemMode)
+			return Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData), "seashell");
 		try
 		{
 			using var identity = System.Security.Principal.WindowsIdentity.GetCurrent();
@@ -895,11 +921,13 @@ void AddToPath()
 {
 	if (isWindows)
 	{
-		var userPath = Environment.GetEnvironmentVariable("PATH", EnvironmentVariableTarget.User) ?? "";
-		if (!userPath.Contains(installDir, StringComparison.OrdinalIgnoreCase))
+		var target = systemMode ? EnvironmentVariableTarget.Machine : EnvironmentVariableTarget.User;
+		var label = systemMode ? "machine" : "user";
+		var existingPath = Environment.GetEnvironmentVariable("PATH", target) ?? "";
+		if (!existingPath.Contains(installDir, StringComparison.OrdinalIgnoreCase))
 		{
-			Environment.SetEnvironmentVariable("PATH", $"{installDir};{userPath}", EnvironmentVariableTarget.User);
-			Console.WriteLine($"  Added {installDir} to user PATH");
+			Environment.SetEnvironmentVariable("PATH", $"{installDir};{existingPath}", target);
+			Console.WriteLine($"  Added {installDir} to {label} PATH");
 			Console.WriteLine("  NOTE: Restart your terminal for PATH changes to take effect.");
 		}
 	}
@@ -927,15 +955,17 @@ void RemoveFromPath()
 {
 	if (isWindows)
 	{
-		var userPath = Environment.GetEnvironmentVariable("PATH", EnvironmentVariableTarget.User) ?? "";
-		var parts = userPath.Split(';')
+		var target = systemMode ? EnvironmentVariableTarget.Machine : EnvironmentVariableTarget.User;
+		var label = systemMode ? "machine" : "user";
+		var existingPath = Environment.GetEnvironmentVariable("PATH", target) ?? "";
+		var parts = existingPath.Split(';')
 			.Where(p => !p.Equals(installDir, StringComparison.OrdinalIgnoreCase))
 			.ToArray();
 		var newPath = string.Join(';', parts);
-		if (newPath != userPath)
+		if (newPath != existingPath)
 		{
-			Environment.SetEnvironmentVariable("PATH", newPath, EnvironmentVariableTarget.User);
-			Console.WriteLine("  Removed from user PATH");
+			Environment.SetEnvironmentVariable("PATH", newPath, target);
+			Console.WriteLine($"  Removed from {label} PATH");
 		}
 	}
 	else
@@ -959,6 +989,18 @@ bool IsElevated()
 		using var identity = System.Security.Principal.WindowsIdentity.GetCurrent();
 		var principal = new System.Security.Principal.WindowsPrincipal(identity);
 		return principal.IsInRole(System.Security.Principal.WindowsBuiltInRole.Administrator);
+	}
+	catch { return false; }
+}
+
+bool IsElevatedOrRoot()
+{
+	if (isWindows) return IsElevated();
+	try
+	{
+		[DllImport("libc", EntryPoint = "geteuid")]
+		static extern uint GetEuid();
+		return GetEuid() == 0;
 	}
 	catch { return false; }
 }
