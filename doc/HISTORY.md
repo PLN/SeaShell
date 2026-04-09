@@ -1,5 +1,13 @@
 # History
 
+## v0.4.5.209 (2026-04-09)
+
+**Install rename-on-write fallback on Linux.**
+
+- **Bootstrapper** — The locked-file fallback (rename `.old`, extract new) was guarded by
+  `isWindows`. On Linux, `File.Move` works on a running binary (inode stays) and
+  `File.Delete` of the `.old` succeeds, so the same strategy applies. Removed the guard.
+
 ## v0.4.4.207 (2026-04-08)
 
 **System-wide install, version sorting fix.**

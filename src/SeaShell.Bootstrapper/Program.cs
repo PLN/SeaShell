@@ -138,7 +138,7 @@ int Install()
 			{
 				entry.ExtractToFile(dest, overwrite: true);
 			}
-			catch (IOException) when (isWindows && File.Exists(dest))
+			catch (IOException) when (File.Exists(dest))
 			{
 				// File is locked by a running process — rename and install alongside.
 				// The old process keeps running from the renamed file; new processes
