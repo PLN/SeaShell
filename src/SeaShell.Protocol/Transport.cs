@@ -85,6 +85,120 @@ public static class TransportEndpoint
 	/// prevents silent version mismatches between CLI and daemon.</summary>
 	public static string CurrentVersion =>
 		typeof(TransportEndpoint).Assembly.GetName().Version?.ToString(4) ?? "0.0.0";
+
+	/// <summary>
+	/// Enumerate all SeaShell daemon endpoints currently present on the host that
+	/// match the given identity, sorted newest version first. On Windows this lists
+	/// named pipes under <c>\\.\pipe\</c>; on Linux it lists socket files in
+	/// <c>$XDG_RUNTIME_DIR</c> (or <see cref="Path.GetTempPath()"/> fallback).
+	/// <para>
+	/// This is a point-in-time snapshot. Callers must still probe each returned
+	/// address to confirm the daemon is actually reachable — a zombie Linux socket
+	/// file left behind by a crashed daemon, or a Windows pipe that closes between
+	/// enumeration and probe, will still appear here. Pair this with
+	/// <see cref="TransportClient.ProbeAsync"/> in the caller.
+	/// </para>
+	/// <para>
+	/// Elevator endpoints (<c>seashell-elevated-*</c>) are deliberately excluded.
+	/// If a consumer ever needs to enumerate those, add a sibling
+	/// <c>EnumerateElevatorEndpoints</c> method.
+	/// </para>
+	/// </summary>
+	/// <param name="identity">
+	/// The identity string to filter by (typically <see cref="CurrentUserIdentity"/>).
+	/// Only endpoints whose name ends with <c>-{identity}</c> are returned.
+	/// </param>
+	public static IReadOnlyList<(string Version, string Address)> EnumerateDaemonEndpoints(string identity)
+	{
+		string[] entries;
+		try
+		{
+			if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+			{
+				entries = Directory.GetFiles(@"\\.\pipe\", "seashell-*");
+			}
+			else
+			{
+				var runtimeDir = Environment.GetEnvironmentVariable("XDG_RUNTIME_DIR");
+				if (string.IsNullOrEmpty(runtimeDir) || !Directory.Exists(runtimeDir))
+					runtimeDir = Path.GetTempPath();
+				entries = Directory.GetFiles(runtimeDir, "seashell-*.sock");
+			}
+		}
+		catch
+		{
+			return Array.Empty<(string, string)>();
+		}
+
+		var matches = new List<(string Version, string Address)>();
+		foreach (var entry in entries)
+		{
+			if (TryParseDaemonEntry(entry) is not { } parsed) continue;
+			if (!string.Equals(parsed.Identity, identity, StringComparison.Ordinal)) continue;
+			matches.Add((parsed.Version, parsed.Address));
+		}
+
+		// Sort newest-version-first. Unparseable versions sink to the end —
+		// matches the ordering used in ServiceManifest.GetCompatibleDaemonAddresses.
+		matches.Sort((a, b) =>
+		{
+			var av = System.Version.TryParse(a.Version, out var pa) ? pa : new System.Version(0, 0);
+			var bv = System.Version.TryParse(b.Version, out var pb) ? pb : new System.Version(0, 0);
+			return bv.CompareTo(av);
+		});
+
+		return matches;
+	}
+
+	/// <summary>
+	/// Parse an enumerated entry (a pipe path on Windows, a socket file path on
+	/// Linux) into (version, identity, address). Returns null for entries that
+	/// don't match the <c>seashell-{version}-{identity}</c> shape — elevator
+	/// pipes, internal handshake pipes with GUID-shaped names, etc.
+	/// <para>
+	/// The identity string is whatever follows the LAST hyphen in the base name.
+	/// This handles identities with special characters like <c>$</c> (e.g. the
+	/// <c>{MachineName}$</c> form that .NET 10 <see cref="Environment.UserName"/>
+	/// returns under LocalSystem), but would break for an identity that itself
+	/// contains a hyphen. No such identity exists in any known SeaShell
+	/// deployment; if one turns up, switch to a regex anchored on a 4-part
+	/// dotted version.
+	/// </para>
+	/// </summary>
+	private static (string Version, string Identity, string Address)? TryParseDaemonEntry(string rawEntry)
+	{
+		string name;     // parseable basename: "seashell-{version}-{identity}"
+		string address;  // value to hand to TransportClient.ConnectAsync
+
+		if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+		{
+			const string prefix = @"\\.\pipe\";
+			if (!rawEntry.StartsWith(prefix, StringComparison.Ordinal)) return null;
+			name = rawEntry[prefix.Length..];
+			address = name; // Windows client connects by pipe name, not path
+		}
+		else
+		{
+			var fileName = Path.GetFileName(rawEntry);
+			if (!fileName.EndsWith(".sock", StringComparison.Ordinal)) return null;
+			name = fileName[..^".sock".Length];
+			address = rawEntry; // Linux client connects by full socket path
+		}
+
+		// Exclude elevator endpoints — consumers that need those should enumerate separately.
+		if (name.StartsWith("seashell-elevated-", StringComparison.Ordinal)) return null;
+
+		if (!name.StartsWith("seashell-", StringComparison.Ordinal)) return null;
+		var rest = name["seashell-".Length..];
+
+		var lastDash = rest.LastIndexOf('-');
+		if (lastDash <= 0 || lastDash >= rest.Length - 1) return null;
+
+		var version = rest[..lastDash];
+		var ident = rest[(lastDash + 1)..];
+
+		return (version, ident, address);
+	}
 }
 
 // ── Server (daemon side) ────────────────────────────────────────────────
