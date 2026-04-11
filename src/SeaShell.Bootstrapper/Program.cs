@@ -31,6 +31,7 @@ if (args[0] is "--help" or "-h")
 	Console.WriteLine($"{{~}} SeaShell v{version}");
 	Console.WriteLine();
 	Console.WriteLine("Usage: seashell              Show installation status");
+	Console.WriteLine("       seashell status --system  Show system-wide installation status");
 	Console.WriteLine("       seashell install      Install or update SeaShell");
 	Console.WriteLine("       seashell install --system  System-wide install (requires elevation)");
 	Console.WriteLine("       seashell uninstall    Remove SeaShell binaries and PATH entry");
@@ -98,10 +99,13 @@ int Install()
 		try { RunProcess(seaPathBefore, "--daemon-stop"); } catch { }
 	}
 
-	// 3. Clean up .old files from previous hot upgrades
+	// 3. Clean up stamped .old.<ticks> files from previous hot upgrades (best-effort).
+	// Recursive: the extract loop writes to subdirectories of installDir, so locked
+	// files can end up anywhere. Still-locked stale files are left for next install —
+	// with stamped suffixes, their presence cannot collide with anything new.
 	if (Directory.Exists(installDir))
 	{
-		foreach (var oldFile in Directory.GetFiles(installDir, "*.old"))
+		foreach (var oldFile in Directory.EnumerateFiles(installDir, "*.old.*", SearchOption.AllDirectories))
 		{
 			try { File.Delete(oldFile); }
 			catch { } // Still locked — leave for next install
@@ -126,10 +130,15 @@ int Install()
 	Console.WriteLine($"  Extracting {rid} archive...");
 	Directory.CreateDirectory(installDir);
 
+	// Unique per-install stamp so the rename-aside path cannot collide with a
+	// .old file still held by a running process from a previous install.
+	var oldStamp = DateTime.UtcNow.Ticks.ToString();
+
 	using (var stream = assembly.GetManifestResourceStream(resourceName)!)
 	using (var zip = new ZipArchive(stream, ZipArchiveMode.Read))
 	{
 		var count = 0;
+		var renamedCount = 0;
 		foreach (var entry in zip.Entries)
 		{
 			if (entry.FullName.EndsWith('/')) continue;
@@ -140,17 +149,20 @@ int Install()
 			}
 			catch (IOException) when (File.Exists(dest))
 			{
-				// File is locked by a running process — rename and install alongside.
-				// The old process keeps running from the renamed file; new processes
-				// use the newly extracted file. Renamed files are cleaned up on next install.
-				var oldPath = dest + ".old";
-				try { File.Delete(oldPath); } catch { }
+				// File is locked by a running process — rename aside with a unique
+				// stamp so we never collide with a .old file still held from a
+				// previous install. The old process keeps running from the renamed
+				// file; new processes use the newly extracted file.
+				var oldPath = $"{dest}.old.{oldStamp}";
 				File.Move(dest, oldPath);
 				entry.ExtractToFile(dest, overwrite: false);
+				renamedCount++;
 			}
 			count++;
 		}
 		Console.WriteLine($"  Extracted {count} files.");
+		if (renamedCount > 0)
+			Console.WriteLine($"  Renamed {renamedCount} locked file(s) aside (.old.{oldStamp}).");
 	}
 
 	// 5. Set execute bits on Linux
@@ -424,7 +436,7 @@ int Uninstall()
 
 int Status()
 {
-	Console.WriteLine($"{{~}} SeaShell");
+	Console.WriteLine($"{{~}} SeaShell{(systemMode ? " (system)" : "")}");
 	Console.WriteLine();
 
 	var seaPath = Path.Combine(installDir, isWindows ? "sea.exe" : "sea");
@@ -459,27 +471,90 @@ int Status()
 	// Daemon / elevator status
 	if (installed)
 	{
-		var statusOutput = RunProcess(seaPath, "--status").Trim();
-		if (!string.IsNullOrEmpty(statusOutput))
+		if (systemMode && isWindows)
 		{
-			// Check if daemon reported as running (output contains "up ")
-			var daemonRunning = statusOutput.Contains(", up ");
-			foreach (var line in statusOutput.Split('\n'))
+			// System-mode: don't shell out to `sea --status` — that invocation always
+			// probes the *current user's* pipe (identity = Environment.UserName), which
+			// is the wrong pipe for system-install diagnostics.
+			//
+			// Instead, enumerate \\.\pipe\ for any `seashell-*` pipes, filter out pipes
+			// belonging to the current user, and probe each remaining pipe for
+			// reachability. This approach is identity-agnostic: it doesn't matter whether
+			// a SYSTEM-context daemon uses "system", "{machine}$", or something else —
+			// we just report what's actually there.
+			var currentUser = Environment.UserName.ToLowerInvariant();
+			var foundDaemons = new List<(string ident, string version, string state)>();
+			var foundElevators = new List<(string ident, string version, string state)>();
+			var anyAclBlocked = false;
+
+			foreach (var pipe in EnumerateSeashellPipes())
 			{
-				var trimmed = line.Trim();
-				if (trimmed.Length > 0)
-					Console.WriteLine($"  {trimmed}");
+				// Pipe name shape: seashell-{version}-{identity}  or  seashell-elevated-{version}-{identity}
+				var isElevator = pipe.StartsWith("seashell-elevated-", StringComparison.Ordinal);
+				var rest = isElevator
+					? pipe["seashell-elevated-".Length..]
+					: pipe["seashell-".Length..];
+
+				// Split version and identity at the LAST hyphen. Versions are dotted
+				// (e.g. 0.4.6.211), so the last hyphen separates version from identity.
+				var lastDash = rest.LastIndexOf('-');
+				if (lastDash < 0) continue;  // not our shape (e.g. internal GUID-named pipes)
+				var ver = rest[..lastDash];
+				var ident = rest[(lastDash + 1)..];
+
+				// Skip pipes owned by the current principal — that's the "user daemon"
+				// section of the status output, not a "system" daemon from this caller's
+				// perspective. Note: under .NET 10 running as LocalSystem this evaluates
+				// to "{MachineName}$" (not "system"), which is also what such a daemon
+				// uses when it constructs its own listening address — so the filter is
+				// self-consistent across principal contexts.
+				if (ident == currentUser) continue;
+
+				var state = ProbeSystemPipe(pipe);
+				if (state.Contains("ACL", StringComparison.Ordinal)) anyAclBlocked = true;
+
+				(isElevator ? foundElevators : foundDaemons).Add((ident, ver, state));
 			}
 
-			// If daemon isn't running, check task state directly
-			if (!daemonRunning && isWindows)
+			if (foundDaemons.Count == 0)
+				Console.WriteLine("  daemon       not running");
+			else
+				foreach (var (ident, ver, state) in foundDaemons)
+					Console.WriteLine($"  daemon       v{ver} ({ident}) — {state}");
+
+			if (foundElevators.Count == 0)
+				Console.WriteLine("  elevator     not running");
+			else
+				foreach (var (ident, ver, state) in foundElevators)
+					Console.WriteLine($"  elevator     v{ver} ({ident}) — {state}");
+
+			if (anyAclBlocked)
+				Console.WriteLine("  (re-run under gsudo for full details)");
+		}
+		else
+		{
+			var statusOutput = RunProcess(seaPath, "--status").Trim();
+			if (!string.IsNullOrEmpty(statusOutput))
 			{
-				var elevatorTask = FindTask("SeaShell Elevator");
-				if (elevatorTask != null)
+				// Check if daemon reported as running (output contains "up ")
+				var daemonRunning = statusOutput.Contains(", up ");
+				foreach (var line in statusOutput.Split('\n'))
 				{
-					var state = QueryTaskState(elevatorTask);
-					if (state != null)
-						Console.WriteLine($"  elevator: task {state.ToLowerInvariant()}");
+					var trimmed = line.Trim();
+					if (trimmed.Length > 0)
+						Console.WriteLine($"  {trimmed}");
+				}
+
+				// If daemon isn't running, check task state directly
+				if (!daemonRunning && isWindows)
+				{
+					var elevatorTask = FindTask("SeaShell Elevator");
+					if (elevatorTask != null)
+					{
+						var state = QueryTaskState(elevatorTask);
+						if (state != null)
+							Console.WriteLine($"  elevator: task {state.ToLowerInvariant()}");
+					}
 				}
 			}
 		}
@@ -577,28 +652,22 @@ void StageBinariesAndWriteManifest(string sourceDir)
 	// Read existing manifest
 	var manifest = ReadManifest(manifestPath);
 
-	// Clean up old version entries (where daemon is not running)
-	var identity = Environment.UserName.ToLowerInvariant();
-	var keysToRemove = new System.Collections.Generic.List<string>();
-	foreach (var kvp in manifest)
-	{
-		if (kvp.Key == version) continue; // don't touch current version
-		// Check if daemon is running by probing the socket
-		var entry = kvp.Value;
-		var address = entry.TryGetValue("daemon.address", out var addr) ? addr : null;
-		if (address != null && IsSocketResponding(address))
-			continue; // leave running daemons alone
-
-		// Not running — clean up staged dirs
-		if (entry.TryGetValue("daemon.path", out var dPath) && Directory.Exists(dPath))
-			try { Directory.Delete(dPath, true); } catch { }
-		if (entry.TryGetValue("elevator.path", out var ePath) && Directory.Exists(ePath))
-			try { Directory.Delete(ePath, true); } catch { }
-
-		keysToRemove.Add(kvp.Key);
-	}
-	foreach (var key in keysToRemove)
-		manifest.Remove(key);
+	// Installs are additive with respect to old staged binaries. We deliberately
+	// do NOT remove prior-version entries or their staged dirs here:
+	//   - The old "stale-version cleanup" loop read a predicted daemon.address
+	//     field from the manifest and probed it to decide whether an old-version
+	//     daemon was still running. The prediction was frequently wrong (the
+	//     installer's identity doesn't necessarily match the daemon's runtime
+	//     identity), and IsSocketResponding on Windows additionally returned
+	//     false unconditionally — so the probe would routinely claim a live
+	//     daemon was dead and delete its staged dir, yanking DLLs out from
+	//     under it.
+	//   - The proper replacement (explicit `seashell gc` / `seashell uninstall
+	//     --version X` with multi-identity liveness checks) is tracked in
+	//     doc/TODO.md — see "SeaShell: uninstall/cleanup + --system task
+	//     registration + scheduled-task identity".
+	//   - The orphan-dir cleanup below is kept: it only deletes <hash> dirs
+	//     that no manifest entry references, a narrower (and safer) condition.
 
 	// Clean orphaned staged directories not referenced by any manifest entry
 	var referencedPaths = new System.Collections.Generic.HashSet<string>(StringComparer.OrdinalIgnoreCase);
@@ -622,8 +691,11 @@ void StageBinariesAndWriteManifest(string sourceDir)
 		}
 	}
 
-	// Write current version entry
-	var socketAddress = GetDaemonSocketAddress(identity, version);
+	// Write current version entry.
+	// daemon.address is intentionally NOT written — it is a runtime property
+	// (see TransportEndpoint.EnumerateDaemonEndpoints in SeaShell.Protocol).
+	// An install-time prediction is unsound when the installer and the
+	// daemon-launcher run under different principals.
 	var entry2 = new System.Collections.Generic.Dictionary<string, string?>
 	{
 		["installedAt"] = DateTime.Now.ToString("yyyy.MMdd.HHmm"),
@@ -633,7 +705,6 @@ void StageBinariesAndWriteManifest(string sourceDir)
 	{
 		entry2["daemon.hash"] = daemonHash;
 		entry2["daemon.path"] = daemonStagedDir;
-		entry2["daemon.address"] = socketAddress;
 	}
 	if (elevatorStagedDir != null)
 	{
@@ -707,26 +778,6 @@ string ComputeDirHash(string dir)
 	var bytes = System.Security.Cryptography.SHA256.HashData(
 		System.Text.Encoding.UTF8.GetBytes(sb.ToString()));
 	return Convert.ToHexString(bytes)[..16].ToLowerInvariant();
-}
-
-string GetDaemonSocketAddress(string identity, string ver)
-{
-	if (isWindows)
-		return $"seashell-{ver}-{identity}";
-	// Linux: use XDG_RUNTIME_DIR if available, otherwise /tmp
-	var xdg = Environment.GetEnvironmentVariable("XDG_RUNTIME_DIR");
-	var dir = !string.IsNullOrEmpty(xdg) ? xdg : "/tmp";
-	return Path.Combine(dir, $"seashell-{ver}-{identity}.sock");
-}
-
-bool IsSocketResponding(string address)
-{
-	// Quick check: does the socket file exist (Linux) or named pipe (Windows)?
-	if (!isWindows)
-		return File.Exists(address);
-	// Windows named pipes don't have a simple file check; assume not running
-	// if we're cleaning up old entries during install
-	return false;
 }
 
 // ── Manifest I/O (standalone — bootstrapper doesn't reference Invoker) ──
@@ -1003,6 +1054,58 @@ bool IsElevatedOrRoot()
 		return GetEuid() == 0;
 	}
 	catch { return false; }
+}
+
+// Enumerate named pipes matching `seashell-*`. Windows exposes the named pipe
+// namespace at `\\.\pipe\` as a pseudo-filesystem that can be enumerated
+// without requiring connect rights on individual pipes. Returns an empty list
+// on non-Windows platforms.
+//
+// This is a Bootstrapper-local copy of the canonical enumeration in
+// SeaShell.Protocol.TransportEndpoint.EnumerateDaemonEndpoints — duplicated
+// deliberately so the Bootstrapper assembly doesn't take a dependency on
+// SeaShell.Protocol (same rationale as GetDataDir() replicating
+// SeaShellPaths.DataDir). The shape of what this helper yields is
+// intentionally simpler than the Protocol version: it returns raw pipe names
+// without parsing them into (version, identity) tuples, because `seashell
+// status --system` has its own parser that uses different filter semantics
+// (it wants pipes whose identity does NOT match the current user, whereas
+// the Protocol helper filters by a specific identity). If the two helpers
+// ever diverge on pipe-name conventions, keep them in sync by hand.
+IEnumerable<string> EnumerateSeashellPipes()
+{
+	if (!isWindows) yield break;
+	string[] entries;
+	try { entries = Directory.GetFiles(@"\\.\pipe\", "seashell-*"); }
+	catch { yield break; }
+	foreach (var entry in entries)
+	{
+		// Directory.GetFiles returns fully-qualified paths like `\\.\pipe\seashell-{ver}-{identity}`.
+		// Strip the namespace prefix so callers see just the pipe name.
+		var name = entry.StartsWith(@"\\.\pipe\", StringComparison.Ordinal)
+			? entry[@"\\.\pipe\".Length..]
+			: Path.GetFileName(entry);
+		yield return name;
+	}
+}
+
+// Probe a named pipe without speaking the protocol. Returns a human-readable
+// state: "reachable", "present (ACL-blocked)", or "not running". Used by
+// `seashell status --system` to classify each enumerated pipe.
+string ProbeSystemPipe(string pipeName)
+{
+	if (!isWindows) return "not running";
+	try
+	{
+		using var client = new System.IO.Pipes.NamedPipeClientStream(
+			".", pipeName, System.IO.Pipes.PipeDirection.InOut);
+		client.Connect(200);  // 200ms: local pipe, fast fail
+		return "reachable";
+	}
+	catch (TimeoutException)                 { return "not running"; }
+	catch (System.IO.FileNotFoundException)  { return "not running"; }
+	catch (UnauthorizedAccessException)      { return "present (ACL-blocked)"; }
+	catch                                    { return "not running"; }
 }
 
 string RunProcess(string exe, string args)

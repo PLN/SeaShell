@@ -1,5 +1,44 @@
 # History
 
+## v0.4.7.213 (2026-04-11)
+
+**Runtime daemon discovery, install cleanup, locked-file install robustness.**
+
+- **`daemon.address` removed from manifest — runtime enumeration replaces install-time prediction.**
+  The `daemon.address` field in `seashell.json` was written by the installer using its own
+  `Environment.UserName`, which diverges from the daemon's runtime identity when the two run
+  under different principals — notably on .NET 10 under LocalSystem, where `Environment.UserName`
+  returns `{MachineName}$`, not `"SYSTEM"`. The field is deleted from `ComponentEntry`
+  (`System.Text.Json`'s default `UnmappedMemberHandling=Skip` silently drops it on read, so
+  existing manifests migrate automatically) and replaced with a new
+  `TransportEndpoint.EnumerateDaemonEndpoints(identity)` helper that enumerates live named pipes
+  on Windows (`\\.\pipe\seashell-*`) or socket files on Linux (`$XDG_RUNTIME_DIR/seashell-*.sock`
+  with `Path.GetTempPath` fallback). `ServiceManifest.GetCompatibleDaemonAddresses` now uses the
+  enumeration helper directly and no longer consults the manifest for address lookup.
+  `DaemonLauncher.EnsureRunningAsync`'s contract is unchanged.
+- **Bootstrapper stale-version cleanup loop removed — installs are additive.**
+  The loop probed manifest-stored addresses to decide whether to delete old staged daemon binaries
+  at install time. Combined with `IsSocketResponding` on Windows returning `false` unconditionally,
+  the loop routinely concluded "daemon not running" and deleted staged DLLs while a live daemon
+  was loading them. Old `{dataDir}/daemon/<hash>/` dirs now linger across upgrades. A safe
+  explicit-uninstall replacement is tracked as a follow-up alongside `--system` scheduled-task
+  registration and the matching identity capture in `ScheduledTasks.cs`, which share the same
+  identity-mismatch root cause and need to be designed cohesively.
+- **`seashell status --system` diagnostic.**
+  New command that enumerates pipes under `\\.\pipe\seashell-*`, filters out the current
+  principal's own pipes, and probes each remaining pipe with `NamedPipeClientStream.Connect`.
+  Classifies each as `reachable` / `present (ACL-blocked)` / `not running`, with a gsudo hint
+  when anything is ACL-blocked. Identity-agnostic by design — it reports whatever is actually
+  on the filesystem rather than hardcoding an expected identity string.
+- **Stamped `.old.<ticks>` suffix for install rename-on-write.**
+  When the installer encounters a locked file, it renames the existing copy aside and extracts
+  the new one in place. The rename suffix was a fixed `.old`, which collided if the prior
+  install's `.old` file was still held open by a running process — causing the second install
+  to crash with `IOException: Cannot create a file when that file already exists`. The suffix
+  now includes `DateTime.UtcNow.Ticks` so each install's rename targets are unique per-install.
+  The sweep that cleans up stamped `.old.*` files at the start of the next install is recursive
+  and best-effort.
+
 ## v0.4.6.211 (2026-04-11)
 
 **Fix named-pipe accept-loop race on Windows.**

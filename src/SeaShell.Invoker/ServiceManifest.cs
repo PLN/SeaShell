@@ -57,7 +57,13 @@ public static class ServiceManifest
 	{
 		public string? Hash { get; set; }
 		public string? Path { get; set; }
-		public string? Address { get; set; }
+		// Note: there is deliberately no Address field here. The daemon's pipe/socket
+		// address is a *runtime* property (determined by the daemon's own
+		// Environment.UserName at startup, which on .NET 10 under LocalSystem is
+		// "{MachineName}$", not "SYSTEM"). Storing an install-time prediction
+		// here was unsound and has been removed — consumers that need to know
+		// which daemons are currently live should call
+		// TransportEndpoint.EnumerateDaemonEndpoints at query time.
 		public string? ScheduledTask { get; set; }
 		public string? SystemdUnit { get; set; }
 		public string? RunitService { get; set; }
@@ -125,39 +131,36 @@ public static class ServiceManifest
 	}
 
 	/// <summary>
-	/// Get candidate daemon addresses for compatible versions (&gt; requested).
-	/// Returns addresses from the manifest, ordered by version descending
-	/// (newest first). Excludes the exact requested version (caller probes that separately).
-	/// Uses ComponentEntry.Address when available, otherwise constructs from version key.
+	/// Get candidate daemon addresses for compatible versions (strictly newer than
+	/// <paramref name="requestedVersion"/>), ordered by version descending (newest first).
+	/// Excludes the exact requested version (caller probes that separately).
+	/// <para>
+	/// Unlike the previous design which read predicted addresses from the manifest,
+	/// this enumerates pipes/sockets currently live on the host. The manifest is not
+	/// consulted here — addresses are determined purely at runtime so an installer
+	/// running under one principal (e.g. an elevated interactive user) cannot
+	/// misrepresent the address of a daemon that later runs under a different
+	/// principal (e.g. LocalSystem, whose <see cref="Environment.UserName"/>
+	/// returns <c>{MachineName}$</c> on .NET 10).
+	/// </para>
+	/// <para>
+	/// The returned addresses are already known to exist at call time (they were
+	/// on <c>\\.\pipe\</c> or in <c>$XDG_RUNTIME_DIR</c>), but may still fail to
+	/// accept a connection due to TOCTOU (daemon died between enumerate and probe)
+	/// or ACLs. Callers still need to probe each address.
+	/// </para>
 	/// </summary>
 	public static string[] GetCompatibleDaemonAddresses(string requestedVersion)
 	{
-		var manifest = Read();
 		var identity = TransportEndpoint.CurrentUserIdentity;
-		var candidates = new List<(string version, string address)>();
+		var endpoints = TransportEndpoint.EnumerateDaemonEndpoints(identity);
 
-		foreach (var kvp in manifest.Installations)
-		{
-			if (string.Compare(kvp.Key, requestedVersion, StringComparison.Ordinal) <= 0)
-				continue; // same or older — skip
-
-			var daemon = kvp.Value.Daemon;
-			if (daemon == null)
-				continue;
-
-			var address = daemon.Address
-				?? TransportEndpoint.GetDaemonAddress(identity, kvp.Key);
-			candidates.Add((kvp.Key, address));
-		}
-
-		// Newest first — probe latest compatible version first
-		candidates.Sort((a, b) =>
-		{
-			var av = Version.TryParse(a.version, out var va) ? va : new Version(0, 0);
-			var bv = Version.TryParse(b.version, out var vb) ? vb : new Version(0, 0);
-			return bv.CompareTo(av);
-		});
-		return candidates.Select(c => c.address).ToArray();
+		// Already sorted newest-first by EnumerateDaemonEndpoints. Filter to
+		// strictly-newer-than-requested (ordinal compare matches the old behavior).
+		return endpoints
+			.Where(e => string.Compare(e.Version, requestedVersion, StringComparison.Ordinal) > 0)
+			.Select(e => e.Address)
+			.ToArray();
 	}
 
 	private static string? LookupComponent(string version, string componentName, Action<string>? log)
