@@ -1,5 +1,30 @@
 # History
 
+## v0.4.6.211 (2026-04-11)
+
+**Fix named-pipe accept-loop race on Windows.**
+
+- **Listener pool** — `TransportServer` on Windows used to create exactly one
+  `NamedPipeServerStream` instance per `AcceptAsync` call, leaving a window
+  with zero listening instances between accept-loop iterations. Clients
+  probing in that window hit `ERROR_FILE_NOT_FOUND` (surfaced as Access
+  Denied by the OS to unprivileged callers), causing intermittent
+  health-check failures during daemon startup bursts. The server now holds
+  a pool of pre-created concurrently-pending accept tasks (4 on Windows;
+  1 on Linux, where the Unix domain socket + kernel backlog already absorb
+  bursts) and refills synchronously after each successful accept, so at
+  least N-1 listeners remain live while any connection handler runs.
+- **`PipeSecurity` lifetime** — Built once in the `TransportServer`
+  constructor and shared across all pool instances. Mismatched security
+  across instances of the same pipe name would otherwise throw from
+  `Create`.
+- **`AcceptAsync` / accept loop** — `AcceptAsync` gains an optional
+  `maxWait` parameter that returns `null` on expiry without disturbing the
+  pool. DaemonServer's two accept-loop branches (always-on and
+  idle-timeout) collapse into a single shape — idle polling no longer
+  needs a linked `CancellationTokenSource` plus an
+  `OperationCanceledException` round-trip.
+
 ## v0.4.5.209 (2026-04-09)
 
 **Install rename-on-write fallback on Linux.**

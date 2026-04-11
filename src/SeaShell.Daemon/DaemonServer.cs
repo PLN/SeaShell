@@ -70,6 +70,11 @@ public sealed class DaemonServer : IAsyncDisposable
 		{
 			try
 			{
+				// Both always-on and idle-timeout modes share a single accept call.
+				// In idle mode, maxWait wakes us to recheck idle state without
+				// disturbing the listener pool (returns null on expiry); a real
+				// connection returns non-null and is dispatched.
+				TimeSpan? maxWait = null;
 				if (IdleTimeout > TimeSpan.Zero)
 				{
 					var lastActivity = new DateTime(Interlocked.Read(ref _lastActivityTicks), DateTimeKind.Utc);
@@ -81,29 +86,15 @@ public sealed class DaemonServer : IAsyncDisposable
 						return;
 					}
 
-					// Wait for connection, but wake periodically to recheck idle state
 					var wait = IdleTimeout - idle;
-					if (wait <= TimeSpan.Zero) wait = TimeSpan.FromSeconds(1);
-
-					using var idleCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-					idleCts.CancelAfter(wait);
-
-					try
-					{
-						var conn = await _server.AcceptAsync(idleCts.Token);
-						TouchActivity();
-						_ = HandleConnectionAsync(conn, ct);
-					}
-					catch (OperationCanceledException) when (!ct.IsCancellationRequested)
-					{
-						continue; // idle timer expired, loop to recheck
-					}
+					maxWait = wait < TimeSpan.FromSeconds(1) ? TimeSpan.FromSeconds(1) : wait;
 				}
-				else
-				{
-					var conn = await _server.AcceptAsync(ct);
-					_ = HandleConnectionAsync(conn, ct);
-				}
+
+				var conn = await _server.AcceptAsync(ct, maxWait);
+				if (conn == null) continue; // idle tick — recheck timeout
+
+				TouchActivity();
+				_ = HandleConnectionAsync(conn, ct);
 			}
 			catch (OperationCanceledException) when (ct.IsCancellationRequested)
 			{
