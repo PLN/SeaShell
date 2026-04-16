@@ -161,6 +161,10 @@ public sealed class ScriptCompiler
 			}
 
 			// Implicit usings + AssemblyDescription
+			var consoleAlias = resolved.Directives.Elevate
+				&& RuntimeInformation.IsOSPlatform(OSPlatform.Windows)
+				? "\n\t\t\t\tglobal using Console = SeaShell.SeaConsole;"
+				: "";
 			var metaSource = $$"""
 				global using System;
 				global using System.Collections.Generic;
@@ -169,7 +173,7 @@ public sealed class ScriptCompiler
 				global using System.Net.Http;
 				global using System.Threading;
 				global using System.Threading.Tasks;
-				global using SeaShell;
+				global using SeaShell;{{consoleAlias}}
 				[assembly: System.Reflection.AssemblyDescription(@"{{scriptPath.Replace("\"", "\"\"")}}")]
 				// Force Sea initialization — the script assembly is always loaded first,
 				// so this module initializer is guaranteed to run before Main.

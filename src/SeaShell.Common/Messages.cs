@@ -20,6 +20,8 @@ public enum MessageType : byte
 	HostMessage   = 6,
 	ScriptMessage = 7,
 	ScriptReloadRequest = 8,
+	ConsoleData    = 9,
+	ConsoleControl = 10,
 
 	// Daemon protocol (CLI ↔ daemon)
 	PingRequest     = 20,
@@ -63,6 +65,8 @@ public static class MessageTypeMap
 		[typeof(HostMessage)]     = MessageType.HostMessage,
 		[typeof(ScriptMessage)]   = MessageType.ScriptMessage,
 		[typeof(ScriptReloadRequest)] = MessageType.ScriptReloadRequest,
+		[typeof(ConsoleData)]     = MessageType.ConsoleData,
+		[typeof(ConsoleControl)]  = MessageType.ConsoleControl,
 		[typeof(PingRequest)]     = MessageType.PingRequest,
 		[typeof(PingResponse)]    = MessageType.PingResponse,
 		[typeof(StopRequest)]     = MessageType.StopRequest,
@@ -152,6 +156,21 @@ public sealed record ScriptMessage(byte[] Payload, string? Topic);
 
 /// <summary>Script → Launcher: script requests to be recompiled and reloaded.</summary>
 public sealed record ScriptReloadRequest(string? Reason, bool ClearCache = false);
+
+/// <summary>
+/// Relays console stream data over the script pipe when AttachConsole is unavailable.
+/// Stream: 0=stdout (script→CLI), 1=stderr (script→CLI), 2=stdin (bidirectional).
+/// For stdin: script sends empty Data as a read request; CLI sends back a line.
+/// </summary>
+public sealed record ConsoleData(byte Stream, byte[] Data);
+
+/// <summary>
+/// Relays console property operations (title, colors, cursor, etc.) over the script pipe.
+/// Op identifies the operation; Data carries the serialized argument or response.
+/// Fire-and-forget ops (set title, set color, clear, etc.) have no response.
+/// Request/response ops (get title, get buffer size, read key) block until the CLI replies.
+/// </summary>
+public sealed record ConsoleControl(byte Op, byte[] Data);
 
 // ── CLI → Daemon ────────────────────────────────────────────────────────
 

@@ -917,6 +917,16 @@ public sealed class ScriptInvoker
 						var sm = (ScriptMessage)msg.Value.Message;
 						try { connection.RaiseMessageReceived(sm.Payload, sm.Topic); } catch { }
 						break;
+
+					case MessageType.ConsoleData:
+						var cd = (ConsoleData)msg.Value.Message;
+						await HandleConsoleDataAsync(channel, cd, ct);
+						break;
+
+					case MessageType.ConsoleControl:
+						var cc = (ConsoleControl)msg.Value.Message;
+						await HandleConsoleControlAsync(channel, cc, ct);
+						break;
 				}
 			}
 		}
@@ -934,6 +944,127 @@ public sealed class ScriptInvoker
 		MessageChannel channel, CancellationToken ct)
 	{
 		return await ReceiveUntilExitOrStateAsync(channel, null, null, ct);
+	}
+
+	// ── Console proxy (CLI side) ────────────────────────────────────────
+
+	/// <summary>Handle ConsoleData from elevated script: stdout, stderr, stdin request.</summary>
+	private static async Task HandleConsoleDataAsync(MessageChannel channel, ConsoleData cd, CancellationToken ct)
+	{
+		switch (cd.Stream)
+		{
+			case 0: // stdout
+				Console.Out.Write(System.Text.Encoding.UTF8.GetString(cd.Data));
+				break;
+			case 1: // stderr
+				Console.Error.Write(System.Text.Encoding.UTF8.GetString(cd.Data));
+				break;
+			case 2: // stdin request — read a line and send it back
+				var line = Console.In.ReadLine() ?? "";
+				try { await channel.SendAsync(new ConsoleData(2, System.Text.Encoding.UTF8.GetBytes(line)), ct); }
+				catch { }
+				break;
+		}
+	}
+
+	/// <summary>Handle ConsoleControl from elevated script: execute console ops on the real terminal.</summary>
+	private static async Task HandleConsoleControlAsync(MessageChannel channel, ConsoleControl cc, CancellationToken ct)
+	{
+		byte[]? response = null;
+
+		try
+		{
+			switch (cc.Op)
+			{
+				// ── Fire-and-forget ops ──
+				case 0: // SetTitle
+					Console.Title = System.Text.Encoding.UTF8.GetString(cc.Data);
+					break;
+				case 2: // SetForegroundColor
+					if (cc.Data.Length > 0) Console.ForegroundColor = (ConsoleColor)cc.Data[0];
+					break;
+				case 4: // SetBackgroundColor
+					if (cc.Data.Length > 0) Console.BackgroundColor = (ConsoleColor)cc.Data[0];
+					break;
+				case 6: // ResetColor
+					Console.ResetColor();
+					break;
+				case 7: // SetCursorPosition
+					if (cc.Data.Length >= 8)
+					{
+						var left = BitConverter.ToInt32(cc.Data, 0);
+						var top  = BitConverter.ToInt32(cc.Data, 4);
+						Console.SetCursorPosition(left, top);
+					}
+					break;
+				case 10: // SetCursorVisible
+					if (cc.Data.Length > 0) Console.CursorVisible = cc.Data[0] != 0;
+					break;
+				case 15: // Clear
+					Console.Clear();
+					break;
+				case 16: // Beep
+					Console.Beep();
+					break;
+
+				// ── Request/response ops ──
+				case 1: // GetTitle
+					response = System.Text.Encoding.UTF8.GetBytes(
+						RuntimeInformation.IsOSPlatform(OSPlatform.Windows) ? Console.Title : "");
+					break;
+				case 3: // GetForegroundColor
+					response = new[] { (byte)Console.ForegroundColor };
+					break;
+				case 5: // GetBackgroundColor
+					response = new[] { (byte)Console.BackgroundColor };
+					break;
+				case 8: // GetCursorLeft
+					response = BitConverter.GetBytes(Console.CursorLeft);
+					break;
+				case 9: // GetCursorTop
+					response = BitConverter.GetBytes(Console.CursorTop);
+					break;
+				case 11: // GetBufferWidth
+					response = BitConverter.GetBytes(Console.BufferWidth);
+					break;
+				case 12: // GetBufferHeight
+					response = BitConverter.GetBytes(Console.BufferHeight);
+					break;
+				case 13: // GetWindowWidth
+					response = BitConverter.GetBytes(Console.WindowWidth);
+					break;
+				case 14: // GetWindowHeight
+					response = BitConverter.GetBytes(Console.WindowHeight);
+					break;
+				case 17: // ReadKey
+					var intercept = cc.Data.Length > 0 && cc.Data[0] != 0;
+					var key = Console.ReadKey(intercept);
+					response = new byte[]
+					{
+						(byte)(key.KeyChar & 0xFF), (byte)(key.KeyChar >> 8),
+						(byte)key.Key,
+						(byte)key.Modifiers,
+					};
+					break;
+				case 18: // KeyAvailable
+					response = new[] { Console.KeyAvailable ? (byte)1 : (byte)0 };
+					break;
+				case 19: // GetCursorVisible
+					response = new[] { Console.CursorVisible ? (byte)1 : (byte)0 };
+					break;
+			}
+		}
+		catch
+		{
+			// Console op failed (no console, etc.) — send empty response for request ops
+			response ??= Array.Empty<byte>();
+		}
+
+		if (response != null)
+		{
+			try { await channel.SendAsync(new ConsoleControl(cc.Op, response), ct); }
+			catch { }
+		}
 	}
 
 	/// <summary>Check whether the current process is running elevated (admin/root).</summary>

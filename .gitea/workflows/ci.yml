@@ -2,7 +2,6 @@ name: CI
 
 on:
   push:
-    branches: ['dev']
 
 defaults:
   run:
@@ -921,6 +920,10 @@ jobs:
           sea --status || true
           # Elevator may not connect in CI session — don't fail hard
 
+      # SeaConsole relay tests require UAC (elevator path). CI runner has UAC off,
+      # so //sea_elevate takes the direct path — relay is never exercised.
+      # These tests must be run manually on a machine with UAC enabled.
+
       - name: "Test: seaw Event Log error (malformed script)"
         if: matrix.os == 'windows'
         shell: powershell
@@ -1211,3 +1214,28 @@ jobs:
 
       - name: "Final: Smoke test (hello.cs)"
         run: sea test/hello.cs
+
+  # ── Release ──────────────────────────────────────────────────────────
+  # On master: publish packages to nuget.org after successful tests.
+
+  release:
+    needs: [version, test]
+    if: github.ref == 'refs/heads/master'
+    runs-on: linux-x64
+
+    steps:
+      - name: Download packages
+        uses: https://gitea.com/actions/download-artifact@v3
+        with:
+          name: packages
+          path: nupkg/
+
+      - name: Publish to nuget.org
+        run: |
+          for pkg in nupkg/*.nupkg; do
+            echo "Publishing $(basename "$pkg") to nuget.org..."
+            dotnet nuget push "$pkg" \
+              --source https://api.nuget.org/v3/index.json \
+              --api-key "${{ secrets.NUGET_API_KEY }}" \
+              --skip-duplicate
+          done
