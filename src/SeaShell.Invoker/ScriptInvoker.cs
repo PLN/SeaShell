@@ -8,6 +8,7 @@ using System.Text.Json;
 using System.Threading;
 using System.Threading.Channels;
 using System.Threading.Tasks;
+using SeaShell.Installer;
 using SeaShell.Ipc;
 using SeaShell.Protocol;
 
@@ -362,7 +363,7 @@ public sealed class ScriptInvoker
 	}
 
 	private static bool TryStartElevator() =>
-		ScheduledTasks.TryRunElevatorTask();
+		DaemonTasks.TryRunElevatorTask();
 
 	// ── Watch mode ──────────────────────────────────────────────────────
 

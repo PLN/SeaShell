@@ -249,16 +249,13 @@ public static class ScriptScheduler
 		var taskName = GetTaskName(stem);
 		var fullName = TaskFolder + taskName;
 
-		// Find seaw.exe in the same directory as this assembly, or in the install dir
+		// Find seaw.exe in the same directory as this assembly, or via the current junction
 		var binDir = Path.GetDirectoryName(typeof(ScriptScheduler).Assembly.Location) ?? ".";
 		var seawPath = Path.Combine(binDir, "seaw.exe");
 		if (!File.Exists(seawPath))
 		{
-			// Try install dir
-			var installDir = Path.Combine(
-				Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-				"seashell", "bin");
-			seawPath = Path.Combine(installDir, "seaw.exe");
+			// Use the current junction — scheduled tasks survive version upgrades
+			seawPath = Path.Combine(SeaShellPaths.CurrentBinDir, "seaw.exe");
 		}
 		if (!File.Exists(seawPath))
 		{

@@ -1,30 +1,32 @@
 using System;
+using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.IO.Compression;
 using System.Linq;
 using System.Reflection;
-using System.Collections.Generic;
 using System.Runtime.InteropServices;
-using System.Text.Json;
+using System.Threading.Tasks;
+using SeaShell;
+using SeaShell.Installer;
+using SeaShell.Protocol;
 
 // ── SeaShell Bootstrapper ───────────────────────────────────────────
 // Installed via: dotnet tool install -g SeaShell
 // Command:       seashell install | update | uninstall | status
 //
-// Extracts embedded per-RID archives to the local install directory,
-// adds sea/seaw to PATH, and registers daemon + file associations.
+// Extracts embedded per-RID archives to per-version directories,
+// manages a `current` junction, and registers daemon + file associations.
 
 var version = typeof(Program).Assembly.GetName().Version?.ToString(4) ?? "0.0.0";
 var isWindows = RuntimeInformation.IsOSPlatform(OSPlatform.Windows);
 var systemMode = args.Any(a => a is "--system");
 args = args.Where(a => a is not "--system").ToArray();
-var installDir = systemMode && isWindows
-	? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData), "seashell", "bin")
-	: GetInstallDir();
+var versionDir = SeaShellPaths.VersionDir(version);
+var binDir = SeaShellPaths.BinDir(version);
 
 if (args.Length == 0)
-	return Status();
+	return await Status();
 
 if (args[0] is "--help" or "-h")
 {
@@ -48,21 +50,21 @@ switch (args[0].ToLowerInvariant())
 {
 	case "install":
 	case "update":
-		return Install();
+		return await Install();
 
 	case "uninstall":
-		return Uninstall();
+		return await Uninstall();
 
 	case "status":
 	case "--version":
 	case "-v":
-		return Status();
+		return await Status();
 
 	case "start":
 		return StartDaemon();
 
 	case "stop":
-		return StopDaemon();
+		return await StopDaemon();
 
 	case "schedule":
 		return ScheduleCommand(args[1..]);
@@ -76,7 +78,7 @@ switch (args[0].ToLowerInvariant())
 
 // ── Install ─────────────────────────────────────────────────────────
 
-int Install()
+async Task<int> Install()
 {
 	if (systemMode && !IsElevatedOrRoot())
 	{
@@ -84,38 +86,27 @@ int Install()
 		return 1;
 	}
 
+	using var installLock = InstallLock.TryAcquire();
+	if (installLock == null)
+	{
+		Console.Error.WriteLine("seashell: another install or uninstall is in progress");
+		return 1;
+	}
+
 	Console.WriteLine($"{{~}} SeaShell Installer v{version}{(systemMode ? " (system)" : "")}");
 	Console.WriteLine();
 
-	// 1. Check .NET runtime
+	// 1. Platform info
 	Console.WriteLine($"  Platform:  {GetCurrentRid()}");
-	Console.WriteLine($"  Install:   {installDir}");
+	Console.WriteLine($"  Version:   {versionDir}");
 
-	// 2. Stop daemon gracefully (it runs from its own staging dir, not installDir)
-	var seaPathBefore = Path.Combine(installDir, isWindows ? "sea.exe" : "sea");
-	if (File.Exists(seaPathBefore))
-	{
-		Console.WriteLine("  Stopping running instances...");
-		try { RunProcess(seaPathBefore, "--daemon-stop"); } catch { }
-	}
+	// 2. Create version directory structure
+	Directory.CreateDirectory(binDir);
+	Directory.CreateDirectory(SeaShellPaths.CacheDir(version));
+	Console.WriteLine($"  Created version directory");
 
-	// 3. Clean up stamped .old.<ticks> files from previous hot upgrades (best-effort).
-	// Recursive: the extract loop writes to subdirectories of installDir, so locked
-	// files can end up anywhere. Still-locked stale files are left for next install —
-	// with stamped suffixes, their presence cannot collide with anything new.
-	if (Directory.Exists(installDir))
-	{
-		foreach (var oldFile in Directory.EnumerateFiles(installDir, "*.old.*", SearchOption.AllDirectories))
-		{
-			try { File.Delete(oldFile); }
-			catch { } // Still locked — leave for next install
-		}
-	}
-
-	// 4. Find and extract the matching archive
+	// 3. Find and extract the matching archive into bin/
 	var rid = GetCurrentRid();
-	var archiveName = $"archives.{rid}.zip";
-
 	var assembly = Assembly.GetExecutingAssembly();
 	var resourceName = assembly.GetManifestResourceNames()
 		.FirstOrDefault(n => n.Contains(rid, StringComparison.OrdinalIgnoreCase) && n.EndsWith(".zip"));
@@ -128,49 +119,28 @@ int Install()
 	}
 
 	Console.WriteLine($"  Extracting {rid} archive...");
-	Directory.CreateDirectory(installDir);
-
-	// Unique per-install stamp so the rename-aside path cannot collide with a
-	// .old file still held by a running process from a previous install.
-	var oldStamp = DateTime.UtcNow.Ticks.ToString();
-
 	using (var stream = assembly.GetManifestResourceStream(resourceName)!)
 	using (var zip = new ZipArchive(stream, ZipArchiveMode.Read))
 	{
 		var count = 0;
-		var renamedCount = 0;
 		foreach (var entry in zip.Entries)
 		{
 			if (entry.FullName.EndsWith('/')) continue;
-			var dest = Path.Combine(installDir, entry.FullName);
-			try
-			{
-				entry.ExtractToFile(dest, overwrite: true);
-			}
-			catch (IOException) when (File.Exists(dest))
-			{
-				// File is locked by a running process — rename aside with a unique
-				// stamp so we never collide with a .old file still held from a
-				// previous install. The old process keeps running from the renamed
-				// file; new processes use the newly extracted file.
-				var oldPath = $"{dest}.old.{oldStamp}";
-				File.Move(dest, oldPath);
-				entry.ExtractToFile(dest, overwrite: false);
-				renamedCount++;
-			}
+			var dest = Path.Combine(binDir, entry.FullName);
+			var destDir = Path.GetDirectoryName(dest);
+			if (destDir != null) Directory.CreateDirectory(destDir);
+			entry.ExtractToFile(dest, overwrite: true);
 			count++;
 		}
 		Console.WriteLine($"  Extracted {count} files.");
-		if (renamedCount > 0)
-			Console.WriteLine($"  Renamed {renamedCount} locked file(s) aside (.old.{oldStamp}).");
 	}
 
-	// 5. Set execute bits on Linux
+	// 4. Set execute bits on Linux
 	if (!isWindows)
 	{
 		foreach (var name in new[] { "sea", "seashell-daemon", "seashell-elevator" })
 		{
-			var path = Path.Combine(installDir, name);
+			var path = Path.Combine(binDir, name);
 			if (File.Exists(path))
 			{
 				try { File.SetUnixFileMode(path, File.GetUnixFileMode(path) | UnixFileMode.UserExecute); }
@@ -179,11 +149,41 @@ int Install()
 		}
 	}
 
-	// 6. Add to PATH
+	// 5. Write marker files
+	var daemonExe = Path.Combine(binDir, isWindows ? "seashell-daemon.exe" : "seashell-daemon");
+	var daemonDll = Path.Combine(binDir, "seashell-daemon.dll");
+	if (File.Exists(daemonExe))
+		MarkerFile.Write(versionDir, MarkerFile.DaemonPath, daemonExe);
+	else if (File.Exists(daemonDll))
+		MarkerFile.Write(versionDir, MarkerFile.DaemonPath, daemonDll);
+	Console.WriteLine($"  daemon.path: {(MarkerFile.Exists(versionDir, MarkerFile.DaemonPath) ? "ok" : "not found")}");
+
+	var elevatorExe = Path.Combine(binDir, isWindows ? "seashell-elevator.exe" : "seashell-elevator");
+	var elevatorDll = Path.Combine(binDir, "seashell-elevator.dll");
+	if (File.Exists(elevatorExe))
+		MarkerFile.Write(versionDir, MarkerFile.ElevatorPath, elevatorExe);
+	else if (File.Exists(elevatorDll))
+		MarkerFile.Write(versionDir, MarkerFile.ElevatorPath, elevatorDll);
+	Console.WriteLine($"  elevator.path: {(MarkerFile.Exists(versionDir, MarkerFile.ElevatorPath) ? "ok" : "not found")}");
+
+	// 6. Update `current` junction (create if missing, update if newer)
+	var currentVersion = VersionDiscovery.GetCurrentVersion();
+	var myVersion = System.Version.TryParse(version, out var mv) ? mv : null;
+	if (currentVersion == null || (myVersion != null && myVersion >= currentVersion))
+	{
+		JunctionHelper.CreateOrUpdate(SeaShellPaths.CurrentDir, versionDir);
+		Console.WriteLine($"  current -> v{version}");
+	}
+	else
+	{
+		Console.WriteLine($"  current -> v{currentVersion} (newer, kept)");
+	}
+
+	// 7. Add to PATH (User environment, using junction path)
 	AddToPath();
 
-	// 7. Verify
-	var seaPath = Path.Combine(installDir, isWindows ? "sea.exe" : "sea");
+	// 8. Verify
+	var seaPath = Path.Combine(binDir, isWindows ? "sea.exe" : "sea");
 	if (!File.Exists(seaPath))
 	{
 		Console.Error.WriteLine("  ERROR: sea not found after extraction.");
@@ -193,20 +193,17 @@ int Install()
 	var verResult = RunProcess(seaPath, "--version");
 	Console.WriteLine($"  {verResult.Trim()}");
 
-	// 8. Stage daemon + elevator binaries and write manifest
-	Console.WriteLine("  Staging daemon...");
-	StageBinariesAndWriteManifest(installDir);
-
 	// 9. Register scheduled tasks (Windows only, skip for --system)
+	Action<string> taskLog = msg => Console.WriteLine($"  {msg}");
 	if (isWindows && !systemMode)
 	{
 		Console.WriteLine("  Registering daemon...");
-		RunProcess(seaPath, "--install-daemon");
+		DaemonTasks.InstallDaemon(taskLog);
 
 		if (IsElevated())
 		{
 			Console.WriteLine("  Registering elevator (elevated)...");
-			RunProcess(seaPath, "--install-elevator");
+			DaemonTasks.InstallElevator(taskLog);
 
 			// Register Event Log source (requires elevation)
 			try
@@ -230,11 +227,14 @@ int Install()
 	if (isWindows && !systemMode)
 	{
 		Console.WriteLine("  Registering file associations...");
-		RunProcess(seaPath, "--associate .cs");
-		var seawPath = Path.Combine(installDir, "seaw.exe");
+		FileAssoc.Associate(".cs", seaPath, taskLog);
+		var seawPath = Path.Combine(binDir, "seaw.exe");
 		if (File.Exists(seawPath))
-			RunProcess(seawPath, "--associate .csw");
+			FileAssoc.Associate(".csw", seawPath, taskLog);
 	}
+
+	// 11. Clean up old versions
+	await CleanupOldVersionsAsync();
 
 	Console.WriteLine();
 	Console.WriteLine("  {~} Done! Run 'sea' to start.");
@@ -245,8 +245,8 @@ int Install()
 
 int StartDaemon()
 {
-	var seaPath = Path.Combine(installDir, isWindows ? "sea.exe" : "sea");
-	if (!File.Exists(seaPath))
+	var seaPath = FindSeaExe();
+	if (seaPath == null)
 	{
 		Console.Error.WriteLine("  Not installed. Run 'seashell install' first.");
 		return 1;
@@ -254,31 +254,15 @@ int StartDaemon()
 
 	if (isWindows)
 	{
-		// Try Task Scheduler first (preferred — starts as the registered task)
-		var daemonTask = FindTask("SeaShell Daemon");
-		if (daemonTask != null)
-		{
-			Console.WriteLine(RunSchedTask(daemonTask, "/Run")
-				? $"  daemon:   starting ({daemonTask})"
-				: "  daemon:   failed to start task");
-		}
+		if (DaemonTasks.TryRunDaemonTask())
+			Console.WriteLine("  daemon:   starting (task)");
 		else
-		{
-			// No task registered — fall back to direct daemon start
 			Console.WriteLine(RunProcess(seaPath, "--daemon-start").Trim());
-		}
 
-		var elevatorTask = FindTask("SeaShell Elevator");
-		if (elevatorTask != null)
-		{
-			Console.WriteLine(RunSchedTask(elevatorTask, "/Run")
-				? $"  elevator: starting ({elevatorTask})"
-				: "  elevator: failed to start task");
-		}
+		if (DaemonTasks.TryRunElevatorTask())
+			Console.WriteLine("  elevator: starting (task)");
 		else
-		{
 			Console.WriteLine("  elevator: no task registered");
-		}
 	}
 	else
 	{
@@ -287,35 +271,33 @@ int StartDaemon()
 	return 0;
 }
 
-int StopDaemon()
+async Task<int> StopDaemon()
 {
-	var seaPath = Path.Combine(installDir, isWindows ? "sea.exe" : "sea");
-	if (!File.Exists(seaPath))
+	var seaPath = FindSeaExe();
+	if (seaPath == null)
 	{
 		Console.Error.WriteLine("  Not installed.");
 		return 1;
 	}
 
-	// Stop daemon: try IPC first (works on all platforms), then task fallback
-	var daemonStopped = RunProcess(seaPath, "--daemon-stop").Trim();
-	var ipcOk = daemonStopped.Contains("stop requested", StringComparison.OrdinalIgnoreCase);
+	var daemonAddress = TransportEndpoint.GetDaemonAddress(
+		TransportEndpoint.CurrentUserIdentity, version);
+	var ipcOk = await DaemonIpc.StopAsync(daemonAddress);
 	Console.WriteLine($"  daemon:   {(ipcOk ? "stopped" : "not running")}");
 
 	if (isWindows)
 	{
-		// If IPC didn't work, try ending the daemon task
 		if (!ipcOk)
 		{
-			var daemonTask = FindTask("SeaShell Daemon");
-			if (daemonTask != null && RunSchedTask(daemonTask, "/End"))
+			var path = TaskQuery.FindByPrefix($"SeaShell Daemon ({Environment.UserName})");
+			if (path != null && TaskQuery.End(path))
 				Console.WriteLine("  daemon:   stopped (task)");
 		}
 
-		// Always try to end the elevator task
-		var elevatorTask = FindTask("SeaShell Elevator");
-		if (elevatorTask != null)
+		var elevPath = TaskQuery.FindByPrefix($"SeaShell Elevator ({Environment.UserName})");
+		if (elevPath != null)
 		{
-			Console.WriteLine(RunSchedTask(elevatorTask, "/End")
+			Console.WriteLine(TaskQuery.End(elevPath)
 				? "  elevator: stopped"
 				: "  elevator: not running");
 		}
@@ -331,8 +313,8 @@ int StopDaemon()
 
 int ScheduleCommand(string[] scheduleArgs)
 {
-	var seaPath = Path.Combine(installDir, isWindows ? "sea.exe" : "sea");
-	if (!File.Exists(seaPath))
+	var seaPath = FindSeaExe();
+	if (seaPath == null)
 	{
 		Console.Error.WriteLine("  Not installed. Run 'seashell install' first.");
 		return 1;
@@ -340,12 +322,10 @@ int ScheduleCommand(string[] scheduleArgs)
 
 	if (scheduleArgs.Length == 0)
 	{
-		// No args → list scheduled scripts
 		Console.WriteLine(RunProcess(seaPath, "--schedule-list").Trim());
 		return 0;
 	}
 
-	// schedule <script.cs> <timing...>
 	var allArgs = "--schedule " + string.Join(" ", scheduleArgs.Select(QuoteArg));
 	var output = RunProcess(seaPath, allArgs).Trim();
 	if (!string.IsNullOrEmpty(output))
@@ -355,8 +335,8 @@ int ScheduleCommand(string[] scheduleArgs)
 
 int UnscheduleCommand(string[] unschedArgs)
 {
-	var seaPath = Path.Combine(installDir, isWindows ? "sea.exe" : "sea");
-	if (!File.Exists(seaPath))
+	var seaPath = FindSeaExe();
+	if (seaPath == null)
 	{
 		Console.Error.WriteLine("  Not installed.");
 		return 1;
@@ -378,7 +358,7 @@ static string QuoteArg(string s) => s.Contains(' ') ? $"\"{s}\"" : s;
 
 // ── Uninstall ───────────────────────────────────────────────────────
 
-int Uninstall()
+async Task<int> Uninstall()
 {
 	if (systemMode && !IsElevatedOrRoot())
 	{
@@ -386,45 +366,88 @@ int Uninstall()
 		return 1;
 	}
 
+	using var installLock = InstallLock.TryAcquire();
+	if (installLock == null)
+	{
+		Console.Error.WriteLine("seashell: another install or uninstall is in progress");
+		return 1;
+	}
+
 	Console.WriteLine($"{{~}} SeaShell Uninstaller{(systemMode ? " (system)" : "")}");
 	Console.WriteLine();
 
-	StopExistingInstances();
+	await StopExistingInstancesAsync();
 
 	// Remove file associations (Windows, skip for --system)
 	if (isWindows && !systemMode)
 	{
-		var seaPath = Path.Combine(installDir, "sea.exe");
-		if (File.Exists(seaPath))
-		{
-			RunProcess(seaPath, "--unassociate .cs");
-			RunProcess(seaPath, "--unassociate .csw");
-		}
-	}
-
-	// Remove install dir
-	if (Directory.Exists(installDir))
-	{
-		Console.WriteLine($"  Removing {installDir}...");
-		try { Directory.Delete(installDir, true); }
-		catch (Exception ex) { Console.Error.WriteLine($"  Warning: {ex.Message}"); }
+		FileAssoc.Unassociate(".cs", msg => Console.WriteLine($"  {msg}"));
+		FileAssoc.Unassociate(".csw", msg => Console.WriteLine($"  {msg}"));
 	}
 
 	// Remove from PATH
 	RemoveFromPath();
 
-	// Remove staged daemon/cache
-	var dataDir = systemMode && isWindows
-		? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData), "seashell")
-		: isWindows
-			? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "seashell")
-			: Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".local", "share", "seashell");
+	// Remove scheduled tasks belonging to this user, across all installed versions.
+	// First via markers (precise), then sweep the \SeaShell\ folder for orphans
+	// (covers tasks left behind by a crashed prior uninstall).
+	if (isWindows && !systemMode)
+	{
+		foreach (var (ver, dir) in VersionDiscovery.EnumerateVersions())
+		{
+			foreach (var marker in new[] { MarkerFile.DaemonTask, MarkerFile.ElevatorTask })
+			{
+				var taskPath = MarkerFile.Read(dir, marker);
+				if (!string.IsNullOrEmpty(taskPath) && TaskQuery.Delete(taskPath))
+					Console.WriteLine($"  Removed task: {taskPath}");
+			}
+		}
 
+		var userPrefix = $"({Environment.UserName})";
+		foreach (var path in TaskQuery.EnumerateFolder().ToList())
+		{
+			var name = path.StartsWith(TaskQuery.Folder, StringComparison.Ordinal)
+				? path[TaskQuery.Folder.Length..]
+				: Path.GetFileName(path);
+			var isSeaShell = name.StartsWith("SeaShell Daemon ", StringComparison.OrdinalIgnoreCase)
+				|| name.StartsWith("SeaShell Elevator ", StringComparison.OrdinalIgnoreCase);
+			if (!isSeaShell) continue;
+			if (!name.Contains(userPrefix, StringComparison.Ordinal)) continue;
+
+			if (TaskQuery.Delete(path))
+				Console.WriteLine($"  Removed orphan task: {name}");
+		}
+	}
+
+	// Remove current junction
+	if (JunctionHelper.IsJunction(SeaShellPaths.CurrentDir))
+	{
+		try { Directory.Delete(SeaShellPaths.CurrentDir, false); }
+		catch { }
+		Console.WriteLine("  Removed current junction");
+	}
+
+	// Remove all version directories
+	var dataDir = SeaShellPaths.DataDir;
+	foreach (var (ver, dir) in VersionDiscovery.EnumerateVersions())
+	{
+		Console.WriteLine($"  Removing v{ver}...");
+		try { Directory.Delete(dir, true); }
+		catch (Exception ex) { Console.Error.WriteLine($"  Warning: {ex.Message}"); }
+	}
+
+	// Remove shared dirs
+	var snippetsDir = SeaShellPaths.SnippetsDir;
+	if (Directory.Exists(snippetsDir))
+	{
+		try { Directory.Delete(snippetsDir, true); } catch { }
+	}
+
+	// Remove data dir if empty
 	if (Directory.Exists(dataDir))
 	{
-		Console.WriteLine($"  Removing {dataDir}...");
-		try { Directory.Delete(dataDir, true); }
-		catch (Exception ex) { Console.Error.WriteLine($"  Warning: {ex.Message}"); }
+		try { Directory.Delete(dataDir, false); } // non-recursive: only if empty
+		catch { }
 	}
 
 	Console.WriteLine("  {~} Uninstalled.");
@@ -432,32 +455,116 @@ int Uninstall()
 	return 0;
 }
 
+// ── Version cleanup ────────────────────────────────────────────────
+
+async Task CleanupOldVersionsAsync()
+{
+	var myVersion = System.Version.TryParse(version, out var mv) ? mv : null;
+	if (myVersion == null) return;
+
+	var uninstallable = new List<(System.Version ver, string dir)>();
+	foreach (var (ver, dir) in VersionDiscovery.EnumerateVersions())
+	{
+		if (ver >= myVersion) continue; // never touch newer or current
+		uninstallable.Add((ver, dir));
+	}
+	if (uninstallable.Count == 0) return;
+	uninstallable.Sort((a, b) => a.ver.CompareTo(b.ver)); // oldest first
+
+	Console.WriteLine();
+	Console.WriteLine("  Cleaning up old versions:");
+
+	foreach (var (ver, dir) in uninstallable)
+	{
+		Console.Write($"    v{ver}: ");
+
+		// Step a: delete daemon.path and elevator.path markers — permanent.
+		// With markers gone, BinaryDiscovery no longer returns this version
+		// and new sea invocations can't start its daemon. If cleanup aborts
+		// partway through (daemon still in use), the directory lingers until
+		// the next install pass retries.
+		MarkerFile.Delete(dir, MarkerFile.DaemonPath);
+		MarkerFile.Delete(dir, MarkerFile.ElevatorPath);
+
+		// Step b: probe the daemon. If reachable with ActiveScripts > 0, skip.
+		var pipe = MarkerFile.Read(dir, MarkerFile.DaemonPipe);
+		if (!string.IsNullOrEmpty(pipe))
+		{
+			var ping = await DaemonIpc.PingAsync(pipe);
+			if (ping != null)
+			{
+				if (ping.ActiveScripts > 0)
+				{
+					Console.WriteLine($"in use ({ping.ActiveScripts} active), skipped");
+					continue;
+				}
+				// Idle — ask politely.
+				await DaemonIpc.StopAsync(pipe);
+			}
+			else
+			{
+				// Pipe marker present but unreachable — if the PID is still
+				// alive, it's a hung daemon; kill it.
+				var pidStr = MarkerFile.Read(dir, MarkerFile.DaemonPid);
+				if (pidStr != null && int.TryParse(pidStr, out var pid))
+				{
+					try { Process.GetProcessById(pid).Kill(); } catch { }
+				}
+			}
+		}
+
+		// Step c: remove scheduled tasks registered for this version.
+		if (isWindows)
+		{
+			var daemonTask = MarkerFile.Read(dir, MarkerFile.DaemonTask);
+			if (!string.IsNullOrEmpty(daemonTask))
+			{
+				TaskQuery.End(daemonTask);
+				TaskQuery.Delete(daemonTask);
+			}
+			var elevatorTask = MarkerFile.Read(dir, MarkerFile.ElevatorTask);
+			if (!string.IsNullOrEmpty(elevatorTask))
+			{
+				TaskQuery.End(elevatorTask);
+				TaskQuery.Delete(elevatorTask);
+			}
+		}
+
+		// Step d: remove version directory.
+		try
+		{
+			Directory.Delete(dir, true);
+			Console.WriteLine("removed");
+		}
+		catch (Exception ex)
+		{
+			Console.WriteLine($"failed ({ex.Message})");
+		}
+	}
+}
+
 // ── Status ──────────────────────────────────────────────────────────
 
-int Status()
+async Task<int> Status()
 {
 	Console.WriteLine($"{{~}} SeaShell{(systemMode ? " (system)" : "")}");
 	Console.WriteLine();
 
-	var seaPath = Path.Combine(installDir, isWindows ? "sea.exe" : "sea");
-	var seawPath = Path.Combine(installDir, isWindows ? "seaw.exe" : "");
-	var installed = File.Exists(seaPath);
+	var currentVersion = VersionDiscovery.GetCurrentVersion();
+	var seaPath = FindSeaExe();
+	var installed = seaPath != null;
 
-	// Installation
 	string? installedVersion = null;
 	if (installed)
 	{
-		var verOutput = RunProcess(seaPath, "--version").Trim();
-		// Extract version from "{~} SeaShell v0.3.17" → "0.3.17"
+		var verOutput = RunProcess(seaPath!, "--version").Trim();
 		installedVersion = verOutput.Contains('v')
 			? verOutput[(verOutput.LastIndexOf('v') + 1)..].Trim()
 			: verOutput;
 
 		Console.WriteLine($"  Installed    v{installedVersion}");
-		Console.WriteLine($"  Location     {installDir}");
+		Console.WriteLine($"  Current      {SeaShellPaths.CurrentDir} -> v{currentVersion}");
 		Console.WriteLine($"  Platform     {GetCurrentRid()}");
-		if (isWindows && File.Exists(seawPath))
-			Console.WriteLine($"  Window mode  seaw.exe");
 	}
 	else
 	{
@@ -468,93 +575,49 @@ int Status()
 	Console.WriteLine($"  Bootstrapper v{version}");
 	Console.WriteLine();
 
-	// Daemon / elevator status
 	if (installed)
 	{
 		if (systemMode && isWindows)
 		{
-			// System-mode: don't shell out to `sea --status` — that invocation always
-			// probes the *current user's* pipe (identity = Environment.UserName), which
-			// is the wrong pipe for system-install diagnostics.
-			//
-			// Instead, enumerate \\.\pipe\ for any `seashell-*` pipes, filter out pipes
-			// belonging to the current user, and probe each remaining pipe for
-			// reachability. This approach is identity-agnostic: it doesn't matter whether
-			// a SYSTEM-context daemon uses "system", "{machine}$", or something else —
-			// we just report what's actually there.
 			var currentUser = Environment.UserName.ToLowerInvariant();
-			var foundDaemons = new List<(string ident, string version, string state)>();
-			var foundElevators = new List<(string ident, string version, string state)>();
+			var foundDaemons = new List<(string ident, string ver, string state)>();
+			var foundElevators = new List<(string ident, string ver, string state)>();
 			var anyAclBlocked = false;
 
-			foreach (var pipe in EnumerateSeashellPipes())
+			foreach (var ep in TransportEndpoint.EnumerateAllSeashellEndpoints())
 			{
-				// Pipe name shape: seashell-{version}-{identity}  or  seashell-elevated-{version}-{identity}
-				var isElevator = pipe.StartsWith("seashell-elevated-", StringComparison.Ordinal);
-				var rest = isElevator
-					? pipe["seashell-elevated-".Length..]
-					: pipe["seashell-".Length..];
-
-				// Split version and identity at the LAST hyphen. Versions are dotted
-				// (e.g. 0.4.6.211), so the last hyphen separates version from identity.
-				var lastDash = rest.LastIndexOf('-');
-				if (lastDash < 0) continue;  // not our shape (e.g. internal GUID-named pipes)
-				var ver = rest[..lastDash];
-				var ident = rest[(lastDash + 1)..];
-
-				// Skip pipes owned by the current principal — that's the "user daemon"
-				// section of the status output, not a "system" daemon from this caller's
-				// perspective. Note: under .NET 10 running as LocalSystem this evaluates
-				// to "{MachineName}$" (not "system"), which is also what such a daemon
-				// uses when it constructs its own listening address — so the filter is
-				// self-consistent across principal contexts.
-				if (ident == currentUser) continue;
-
-				var state = ProbeSystemPipe(pipe);
+				if (ep.Identity == currentUser) continue;
+				var state = ProbeSystemPipe(ep.Address);
 				if (state.Contains("ACL", StringComparison.Ordinal)) anyAclBlocked = true;
-
-				(isElevator ? foundElevators : foundDaemons).Add((ident, ver, state));
+				(ep.IsElevator ? foundElevators : foundDaemons).Add((ep.Identity, ep.Version, state));
 			}
 
-			if (foundDaemons.Count == 0)
-				Console.WriteLine("  daemon       not running");
-			else
-				foreach (var (ident, ver, state) in foundDaemons)
-					Console.WriteLine($"  daemon       v{ver} ({ident}) — {state}");
+			if (foundDaemons.Count == 0) Console.WriteLine("  daemon       not running");
+			else foreach (var (ident, ver, state) in foundDaemons)
+				Console.WriteLine($"  daemon       v{ver} ({ident}) — {state}");
 
-			if (foundElevators.Count == 0)
-				Console.WriteLine("  elevator     not running");
-			else
-				foreach (var (ident, ver, state) in foundElevators)
-					Console.WriteLine($"  elevator     v{ver} ({ident}) — {state}");
+			if (foundElevators.Count == 0) Console.WriteLine("  elevator     not running");
+			else foreach (var (ident, ver, state) in foundElevators)
+				Console.WriteLine($"  elevator     v{ver} ({ident}) — {state}");
 
-			if (anyAclBlocked)
-				Console.WriteLine("  (re-run under gsudo for full details)");
+			if (anyAclBlocked) Console.WriteLine("  (re-run under gsudo for full details)");
 		}
 		else
 		{
-			var statusOutput = RunProcess(seaPath, "--status").Trim();
+			var statusOutput = RunProcess(seaPath!, "--status").Trim();
 			if (!string.IsNullOrEmpty(statusOutput))
 			{
-				// Check if daemon reported as running (output contains "up ")
 				var daemonRunning = statusOutput.Contains(", up ");
 				foreach (var line in statusOutput.Split('\n'))
 				{
 					var trimmed = line.Trim();
-					if (trimmed.Length > 0)
-						Console.WriteLine($"  {trimmed}");
+					if (trimmed.Length > 0) Console.WriteLine($"  {trimmed}");
 				}
 
-				// If daemon isn't running, check task state directly
 				if (!daemonRunning && isWindows)
 				{
-					var elevatorTask = FindTask("SeaShell Elevator");
-					if (elevatorTask != null)
-					{
-						var state = QueryTaskState(elevatorTask);
-						if (state != null)
-							Console.WriteLine($"  elevator: task {state.ToLowerInvariant()}");
-					}
+					var elevState = DaemonTasks.QueryElevatorTaskState();
+					if (elevState != null) Console.WriteLine($"  elevator: task {elevState.ToLowerInvariant()}");
 				}
 			}
 		}
@@ -565,47 +628,22 @@ int Status()
 		Console.WriteLine("  elevator     -");
 	}
 
-	// Registered versions from seashell.json
-	var manifestPath = Path.Combine(GetDataDir(), "seashell.json");
-	if (File.Exists(manifestPath))
+	var versions = VersionDiscovery.EnumerateVersions();
+	if (versions.Count > 0)
 	{
-		try
+		Console.WriteLine();
+		Console.WriteLine("  Versions:");
+		foreach (var (ver, dir) in versions)
 		{
-			var manifestJson = JsonDocument.Parse(File.ReadAllText(manifestPath));
-			if (manifestJson.RootElement.TryGetProperty("installations", out var installations))
-			{
-				var entries = new List<(string ver, string line)>();
-				foreach (var prop in installations.EnumerateObject())
-				{
-					var ver = prop.Name;
-					var installedAt = prop.Value.TryGetProperty("installedAt", out var at) ? at.GetString() : null;
-					var daemonStatus = CheckComponentHealth(prop.Value, "daemon", "seashell-daemon");
-					var elevatorStatus = CheckComponentHealth(prop.Value, "elevator", "seashell-elevator");
-					var datePart = installedAt != null ? $"  {installedAt}" : "";
-					entries.Add((ver, $"    v{ver}{datePart}  {daemonStatus}  {elevatorStatus}"));
-				}
-
-				if (entries.Count > 0)
-				{
-					Console.WriteLine();
-					Console.WriteLine("  Versions:");
-					entries.Sort((a, b) =>
-					{
-						var av = Version.TryParse(a.ver, out var va) ? va : new Version(0, 0);
-						var bv = Version.TryParse(b.ver, out var vb) ? vb : new Version(0, 0);
-						return bv.CompareTo(av);
-					});
-					foreach (var entry in entries)
-						Console.WriteLine(entry.line);
-				}
-			}
+			var isCurrent = currentVersion != null && ver == currentVersion ? " *" : "";
+			var daemon = MarkerFile.Exists(dir, MarkerFile.DaemonPath) ? "daemon: ok" : "daemon: -";
+			var elevator = MarkerFile.Exists(dir, MarkerFile.ElevatorPath) ? "elevator: ok" : "elevator: -";
+			Console.WriteLine($"    v{ver}{isCurrent}  {daemon}  {elevator}");
 		}
-		catch { /* manifest parse failure — skip versions section */ }
 	}
 
 	Console.WriteLine();
 
-	// Update availability
 	if (installed && installedVersion != null && installedVersion != version)
 		Console.WriteLine($"  Update: v{installedVersion} -> v{version}  (run 'seashell update')");
 	else if (installed)
@@ -613,323 +651,25 @@ int Status()
 	else
 		Console.WriteLine("  Run 'seashell install' to get started");
 
+	await Task.CompletedTask;
 	return 0;
-}
-
-// ── Daemon staging ─────────────────────────────────────────────────
-// Stage daemon + elevator from the install directory to versioned
-// data directories, and write seashell.json manifest so the Invoker
-// can find the correct daemon by version lookup.
-
-void StageBinariesAndWriteManifest(string sourceDir)
-{
-	var dataDir = GetDataDir(); // matches SeaShellPaths.DataDir logic
-	var manifestPath = Path.Combine(dataDir, "seashell.json");
-	Directory.CreateDirectory(dataDir);
-
-	// Stage daemon
-	string? daemonStagedDir = null;
-	string? daemonHash = null;
-	var daemonExe = Path.Combine(sourceDir, isWindows ? "seashell-daemon.exe" : "seashell-daemon");
-	var daemonDll = Path.Combine(sourceDir, "seashell-daemon.dll");
-	if (File.Exists(daemonExe) || File.Exists(daemonDll))
-	{
-		(daemonStagedDir, daemonHash) = StageBinary(sourceDir, "daemon", dataDir);
-		Console.WriteLine($"  Daemon staged: {daemonHash[..8]}");
-	}
-
-	// Stage elevator
-	string? elevatorStagedDir = null;
-	string? elevatorHash = null;
-	var elevatorExe = Path.Combine(sourceDir, isWindows ? "seashell-elevator.exe" : "seashell-elevator");
-	var elevatorDll = Path.Combine(sourceDir, "seashell-elevator.dll");
-	if (File.Exists(elevatorExe) || File.Exists(elevatorDll))
-	{
-		(elevatorStagedDir, elevatorHash) = StageBinary(sourceDir, "elevator", dataDir);
-		Console.WriteLine($"  Elevator staged: {elevatorHash[..8]}");
-	}
-
-	// Read existing manifest
-	var manifest = ReadManifest(manifestPath);
-
-	// Installs are additive with respect to old staged binaries. We deliberately
-	// do NOT remove prior-version entries or their staged dirs here:
-	//   - The old "stale-version cleanup" loop read a predicted daemon.address
-	//     field from the manifest and probed it to decide whether an old-version
-	//     daemon was still running. The prediction was frequently wrong (the
-	//     installer's identity doesn't necessarily match the daemon's runtime
-	//     identity), and IsSocketResponding on Windows additionally returned
-	//     false unconditionally — so the probe would routinely claim a live
-	//     daemon was dead and delete its staged dir, yanking DLLs out from
-	//     under it.
-	//   - The proper replacement (explicit `seashell gc` / `seashell uninstall
-	//     --version X` with multi-identity liveness checks) is tracked in
-	//     doc/TODO.md — see "SeaShell: uninstall/cleanup + --system task
-	//     registration + scheduled-task identity".
-	//   - The orphan-dir cleanup below is kept: it only deletes <hash> dirs
-	//     that no manifest entry references, a narrower (and safer) condition.
-
-	// Clean orphaned staged directories not referenced by any manifest entry
-	var referencedPaths = new System.Collections.Generic.HashSet<string>(StringComparer.OrdinalIgnoreCase);
-	if (daemonStagedDir != null) referencedPaths.Add(daemonStagedDir);
-	if (elevatorStagedDir != null) referencedPaths.Add(elevatorStagedDir);
-	foreach (var kvp in manifest)
-	{
-		if (kvp.Value.TryGetValue("daemon.path", out var dp) && dp != null) referencedPaths.Add(dp);
-		if (kvp.Value.TryGetValue("elevator.path", out var ep) && ep != null) referencedPaths.Add(ep);
-	}
-	foreach (var component in new[] { "daemon", "elevator" })
-	{
-		var componentDir = Path.Combine(dataDir, component);
-		if (!Directory.Exists(componentDir)) continue;
-		foreach (var dir in Directory.GetDirectories(componentDir))
-		{
-			if (!referencedPaths.Contains(dir))
-			{
-				try { Directory.Delete(dir, true); } catch { }
-			}
-		}
-	}
-
-	// Write current version entry.
-	// daemon.address is intentionally NOT written — it is a runtime property
-	// (see TransportEndpoint.EnumerateDaemonEndpoints in SeaShell.Protocol).
-	// An install-time prediction is unsound when the installer and the
-	// daemon-launcher run under different principals.
-	var entry2 = new System.Collections.Generic.Dictionary<string, string?>
-	{
-		["installedAt"] = DateTime.Now.ToString("yyyy.MMdd.HHmm"),
-		["rid"] = GetCurrentRid(),
-	};
-	if (daemonStagedDir != null)
-	{
-		entry2["daemon.hash"] = daemonHash;
-		entry2["daemon.path"] = daemonStagedDir;
-	}
-	if (elevatorStagedDir != null)
-	{
-		entry2["elevator.hash"] = elevatorHash;
-		entry2["elevator.path"] = elevatorStagedDir;
-	}
-	manifest[version] = entry2;
-
-	WriteManifest(manifestPath, manifest);
-}
-
-(string stagedDir, string hash) StageBinary(string sourceDir, string componentName, string dataDir)
-{
-	var hash = ComputeDirHash(sourceDir);
-	var stageDir = Path.Combine(dataDir, componentName, hash);
-
-	if (!Directory.Exists(stageDir))
-	{
-		Directory.CreateDirectory(stageDir);
-		foreach (var file in Directory.GetFiles(sourceDir))
-		{
-			var dest = Path.Combine(stageDir, Path.GetFileName(file));
-			try { File.Copy(file, dest); } catch { }
-		}
-
-		// Set execute bits on Linux
-		if (!isWindows)
-		{
-			var apphost = Path.Combine(stageDir, componentName == "daemon" ? "seashell-daemon" : "seashell-elevator");
-			if (File.Exists(apphost))
-				try { File.SetUnixFileMode(apphost, File.GetUnixFileMode(apphost) | UnixFileMode.UserExecute); } catch { }
-		}
-
-		// Generate .runtimeconfig.dev.json with NuGet probing path
-		var nugetCache = Path.Combine(
-			Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".nuget", "packages");
-		foreach (var rc in Directory.GetFiles(stageDir, "*.runtimeconfig.json"))
-		{
-			var devJson = Path.ChangeExtension(rc, null) + ".dev.json";
-			if (!File.Exists(devJson))
-			{
-				var content = $$"""
-				{
-				  "runtimeOptions": {
-				    "additionalProbingPaths": [
-				      "{{nugetCache.Replace("\\", "\\\\")}}"
-				    ]
-				  }
-				}
-				""";
-				File.WriteAllText(devJson, content);
-			}
-		}
-	}
-
-	return (stageDir, hash);
-}
-
-string ComputeDirHash(string dir)
-{
-	var sb = new System.Text.StringBuilder();
-	try
-	{
-		foreach (var f in Directory.GetFiles(dir, "*.dll").OrderBy(f => f))
-		{
-			var name = System.Reflection.AssemblyName.GetAssemblyName(f);
-			sb.Append(name.FullName);
-		}
-	}
-	catch { }
-	var bytes = System.Security.Cryptography.SHA256.HashData(
-		System.Text.Encoding.UTF8.GetBytes(sb.ToString()));
-	return Convert.ToHexString(bytes)[..16].ToLowerInvariant();
-}
-
-// ── Manifest I/O (standalone — bootstrapper doesn't reference Invoker) ──
-
-System.Collections.Generic.Dictionary<string, System.Collections.Generic.Dictionary<string, string?>> ReadManifest(string path)
-{
-	var result = new System.Collections.Generic.Dictionary<string, System.Collections.Generic.Dictionary<string, string?>>();
-	if (!File.Exists(path)) return result;
-
-	try
-	{
-		var json = System.Text.Json.JsonDocument.Parse(File.ReadAllText(path));
-		if (json.RootElement.TryGetProperty("installations", out var installations))
-		{
-			foreach (var prop in installations.EnumerateObject())
-			{
-				var entry = new System.Collections.Generic.Dictionary<string, string?>();
-				FlattenJson(prop.Value, "", entry);
-				result[prop.Name] = entry;
-			}
-		}
-	}
-	catch { }
-	return result;
-}
-
-void FlattenJson(System.Text.Json.JsonElement element, string prefix, System.Collections.Generic.Dictionary<string, string?> dict)
-{
-	if (element.ValueKind == System.Text.Json.JsonValueKind.Object)
-	{
-		foreach (var prop in element.EnumerateObject())
-		{
-			var key = string.IsNullOrEmpty(prefix) ? prop.Name : $"{prefix}.{prop.Name}";
-			FlattenJson(prop.Value, key, dict);
-		}
-	}
-	else
-	{
-		dict[prefix] = element.ToString();
-	}
-}
-
-void WriteManifest(string path, System.Collections.Generic.Dictionary<string, System.Collections.Generic.Dictionary<string, string?>> manifest)
-{
-	// Write in the same nested JSON format that ServiceManifest expects
-	var options = new System.Text.Json.JsonWriterOptions { Indented = true };
-	using var stream = File.Create(path);
-	using var writer = new System.Text.Json.Utf8JsonWriter(stream, options);
-
-	writer.WriteStartObject();
-	writer.WritePropertyName("installations");
-	writer.WriteStartObject();
-
-	foreach (var (ver, entries) in manifest)
-	{
-		writer.WritePropertyName(ver);
-		writer.WriteStartObject();
-
-		// Group flat keys into nested objects
-		var written = new System.Collections.Generic.HashSet<string>();
-		foreach (var (key, value) in entries)
-		{
-			var parts = key.Split('.', 2);
-			if (parts.Length == 2)
-			{
-				var objName = parts[0];
-				if (written.Add(objName))
-				{
-					writer.WritePropertyName(objName);
-					writer.WriteStartObject();
-					// Write all keys under this object
-					foreach (var (k2, v2) in entries)
-					{
-						if (k2.StartsWith(objName + "."))
-						{
-							writer.WritePropertyName(k2[(objName.Length + 1)..]);
-							if (v2 == null) writer.WriteNullValue();
-							else writer.WriteStringValue(v2);
-						}
-					}
-					writer.WriteEndObject();
-				}
-			}
-			else
-			{
-				writer.WritePropertyName(key);
-				if (value == null) writer.WriteNullValue();
-				else writer.WriteStringValue(value);
-			}
-		}
-
-		writer.WriteEndObject();
-	}
-
-	writer.WriteEndObject();
-	writer.WriteEndObject();
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────
 
-string GetDataDir()
+string? FindSeaExe()
 {
-	// Must match SeaShellPaths.DataDir logic exactly
-	var env = Environment.GetEnvironmentVariable("SEASHELL_DATA");
-	if (!string.IsNullOrEmpty(env)) return env;
-
-	if (isWindows)
-	{
-		// --system → ProgramData; SYSTEM/LocalService/NetworkService → ProgramData; user → LocalAppData
-		if (systemMode)
-			return Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData), "seashell");
-		try
-		{
-			using var identity = System.Security.Principal.WindowsIdentity.GetCurrent();
-			var sid = identity.User?.Value;
-			if (sid is "S-1-5-18" or "S-1-5-19" or "S-1-5-20")
-				return Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData), "seashell");
-		}
-		catch { }
-		return Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "seashell");
-	}
-
-	// Linux: root → /var/lib/seashell, user → ~/.local/share/seashell
-	try
-	{
-		[DllImport("libc", EntryPoint = "geteuid")]
-		static extern uint GetEuid();
-		if (GetEuid() == 0) return "/var/lib/seashell";
-	}
-	catch { }
-
-	var xdg = Environment.GetEnvironmentVariable("XDG_DATA_HOME");
-	if (!string.IsNullOrEmpty(xdg)) return Path.Combine(xdg, "seashell");
-	return Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".local", "share", "seashell");
-}
-
-string GetInstallDir()
-{
-	if (isWindows)
-		return Path.Combine(
-			Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-			"seashell", "bin");
-
-	return Path.Combine(
-		Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
-		".local", "share", "seashell", "bin");
+	var name = isWindows ? "sea.exe" : "sea";
+	var path = Path.Combine(binDir, name);
+	if (File.Exists(path)) return path;
+	path = Path.Combine(SeaShellPaths.CurrentBinDir, name);
+	if (File.Exists(path)) return path;
+	return null;
 }
 
 string GetCurrentRid()
 {
 	if (isWindows) return "win-x64";
-	// Check for musl (Alpine)
 	try
 	{
 		var lddOutput = RunProcess("ldd", "--version");
@@ -940,18 +680,18 @@ string GetCurrentRid()
 	return "linux-x64";
 }
 
-void StopExistingInstances()
+async Task StopExistingInstancesAsync()
 {
-	var seaPath = Path.Combine(installDir, isWindows ? "sea.exe" : "sea");
-	if (File.Exists(seaPath))
+	// Try graceful stop via IPC against every installed version.
+	foreach (var (ver, _) in VersionDiscovery.EnumerateVersions())
 	{
-		Console.WriteLine("  Stopping running instances...");
-		try { RunProcess(seaPath, "--daemon-stop"); } catch { }
+		var address = TransportEndpoint.GetDaemonAddress(
+			TransportEndpoint.CurrentUserIdentity, ver.ToString());
+		await DaemonIpc.StopAsync(address);
 	}
 
 	if (isWindows)
 	{
-		// Kill any remaining
 		try
 		{
 			foreach (var p in Process.GetProcessesByName("seashell-daemon"))
@@ -970,33 +710,33 @@ void StopExistingInstances()
 
 void AddToPath()
 {
+	var pathDir = SeaShellPaths.CurrentBinDir;
+
 	if (isWindows)
 	{
-		var target = systemMode ? EnvironmentVariableTarget.Machine : EnvironmentVariableTarget.User;
-		var label = systemMode ? "machine" : "user";
+		var target = EnvironmentVariableTarget.User;
 		var existingPath = Environment.GetEnvironmentVariable("PATH", target) ?? "";
-		if (!existingPath.Contains(installDir, StringComparison.OrdinalIgnoreCase))
+		if (!existingPath.Contains(pathDir, StringComparison.OrdinalIgnoreCase))
 		{
-			Environment.SetEnvironmentVariable("PATH", $"{installDir};{existingPath}", target);
-			Console.WriteLine($"  Added {installDir} to {label} PATH");
+			Environment.SetEnvironmentVariable("PATH", $"{pathDir};{existingPath}", target);
+			Console.WriteLine($"  Added {pathDir} to user PATH");
 			Console.WriteLine("  NOTE: Restart your terminal for PATH changes to take effect.");
 		}
 	}
 	else
 	{
-		// Symlink into ~/.local/bin (typically already on PATH)
-		var binDir = Path.Combine(
+		var localBin = Path.Combine(
 			Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
 			".local", "bin");
-		Directory.CreateDirectory(binDir);
+		Directory.CreateDirectory(localBin);
 
-		var seaLink = Path.Combine(binDir, "sea");
-		var seaTarget = Path.Combine(installDir, "sea");
+		var seaLink = Path.Combine(localBin, "sea");
+		var seaTarget = Path.Combine(pathDir, "sea");
 		try
 		{
 			if (File.Exists(seaLink)) File.Delete(seaLink);
 			File.CreateSymbolicLink(seaLink, seaTarget);
-			Console.WriteLine($"  Symlinked sea → {binDir}/sea");
+			Console.WriteLine($"  Symlinked sea -> {localBin}/sea");
 		}
 		catch (Exception ex) { Console.Error.WriteLine($"  Warning: symlink failed: {ex.Message}"); }
 	}
@@ -1004,19 +744,20 @@ void AddToPath()
 
 void RemoveFromPath()
 {
+	var pathDir = SeaShellPaths.CurrentBinDir;
+
 	if (isWindows)
 	{
-		var target = systemMode ? EnvironmentVariableTarget.Machine : EnvironmentVariableTarget.User;
-		var label = systemMode ? "machine" : "user";
+		var target = EnvironmentVariableTarget.User;
 		var existingPath = Environment.GetEnvironmentVariable("PATH", target) ?? "";
 		var parts = existingPath.Split(';')
-			.Where(p => !p.Equals(installDir, StringComparison.OrdinalIgnoreCase))
+			.Where(p => !p.Equals(pathDir, StringComparison.OrdinalIgnoreCase))
 			.ToArray();
 		var newPath = string.Join(';', parts);
 		if (newPath != existingPath)
 		{
 			Environment.SetEnvironmentVariable("PATH", newPath, target);
-			Console.WriteLine($"  Removed from {label} PATH");
+			Console.WriteLine("  Removed from user PATH");
 		}
 	}
 	else
@@ -1056,39 +797,6 @@ bool IsElevatedOrRoot()
 	catch { return false; }
 }
 
-// Enumerate named pipes matching `seashell-*`. Windows exposes the named pipe
-// namespace at `\\.\pipe\` as a pseudo-filesystem that can be enumerated
-// without requiring connect rights on individual pipes. Returns an empty list
-// on non-Windows platforms.
-//
-// This is a Bootstrapper-local copy of the canonical enumeration in
-// SeaShell.Protocol.TransportEndpoint.EnumerateDaemonEndpoints — duplicated
-// deliberately so the Bootstrapper assembly doesn't take a dependency on
-// SeaShell.Protocol (same rationale as GetDataDir() replicating
-// SeaShellPaths.DataDir). The shape of what this helper yields is
-// intentionally simpler than the Protocol version: it returns raw pipe names
-// without parsing them into (version, identity) tuples, because `seashell
-// status --system` has its own parser that uses different filter semantics
-// (it wants pipes whose identity does NOT match the current user, whereas
-// the Protocol helper filters by a specific identity). If the two helpers
-// ever diverge on pipe-name conventions, keep them in sync by hand.
-IEnumerable<string> EnumerateSeashellPipes()
-{
-	if (!isWindows) yield break;
-	string[] entries;
-	try { entries = Directory.GetFiles(@"\\.\pipe\", "seashell-*"); }
-	catch { yield break; }
-	foreach (var entry in entries)
-	{
-		// Directory.GetFiles returns fully-qualified paths like `\\.\pipe\seashell-{ver}-{identity}`.
-		// Strip the namespace prefix so callers see just the pipe name.
-		var name = entry.StartsWith(@"\\.\pipe\", StringComparison.Ordinal)
-			? entry[@"\\.\pipe\".Length..]
-			: Path.GetFileName(entry);
-		yield return name;
-	}
-}
-
 // Probe a named pipe without speaking the protocol. Returns a human-readable
 // state: "reachable", "present (ACL-blocked)", or "not running". Used by
 // `seashell status --system` to classify each enumerated pipe.
@@ -1099,7 +807,7 @@ string ProbeSystemPipe(string pipeName)
 	{
 		using var client = new System.IO.Pipes.NamedPipeClientStream(
 			".", pipeName, System.IO.Pipes.PipeDirection.InOut);
-		client.Connect(200);  // 200ms: local pipe, fast fail
+		client.Connect(200);
 		return "reachable";
 	}
 	catch (TimeoutException)                 { return "not running"; }
@@ -1127,144 +835,4 @@ string RunProcess(string exe, string args)
 		return output + error;
 	}
 	catch { return ""; }
-}
-
-// ── Task Scheduler helpers ─────────────────────────────────────────
-
-/// <summary>
-/// Check health of a daemon/elevator staging directory.
-/// Returns a summary like "daemon: ok" or "daemon: BROKEN (missing 3 files)".
-/// </summary>
-string CheckComponentHealth(JsonElement versionEntry, string componentName, string binaryBaseName)
-{
-	var label = componentName;
-	if (!versionEntry.TryGetProperty(componentName, out var comp))
-		return $"{label}: -";
-
-	var path = comp.TryGetProperty("path", out var p) ? p.GetString() : null;
-	if (path == null || !Directory.Exists(path))
-		return $"{label}: not staged";
-
-	// Critical files that must exist for the component to start
-	var required = componentName == "daemon"
-		? new[] { $"{binaryBaseName}.dll", $"{binaryBaseName}.runtimeconfig.json",
-		          $"{binaryBaseName}.deps.json", "SeaShell.Engine.dll", "SeaShell.Common.dll", "Serilog.dll" }
-		: new[] { $"{binaryBaseName}.dll", $"{binaryBaseName}.runtimeconfig.json" };
-
-	var missing = required.Count(f => !File.Exists(Path.Combine(path, f)));
-	if (missing > 0)
-	{
-		var taskField = comp.TryGetProperty("scheduledTask", out var t) ? t.GetString() : null;
-		var taskNote = taskField != null ? " task: stale" : "";
-		return $"{label}: BROKEN (missing {missing} files){taskNote}";
-	}
-
-	return $"{label}: ok";
-}
-
-/// <summary>
-/// Find a SeaShell task by component prefix (e.g. "SeaShell Daemon").
-/// Returns the full task path or null if not found.
-/// Matches the current user's tasks regardless of version.
-/// </summary>
-string? FindTask(string componentPrefix)
-{
-	if (!isWindows) return null;
-	try
-	{
-		var psi = new ProcessStartInfo
-		{
-			FileName = "schtasks.exe",
-			UseShellExecute = false,
-			RedirectStandardOutput = true,
-			RedirectStandardError = true,
-			CreateNoWindow = true,
-		};
-		psi.ArgumentList.Add("/Query");
-		psi.ArgumentList.Add("/TN");
-		psi.ArgumentList.Add("\\SeaShell\\");
-		psi.ArgumentList.Add("/FO");
-		psi.ArgumentList.Add("CSV");
-		psi.ArgumentList.Add("/NH");
-
-		using var proc = Process.Start(psi)!;
-		var output = proc.StandardOutput.ReadToEnd();
-		proc.WaitForExit(5_000);
-		if (proc.ExitCode != 0) return null;
-
-		var user = Environment.UserName;
-		var prefix = $"{componentPrefix} ({user})";
-
-		foreach (var line in output.Split('\n', StringSplitOptions.RemoveEmptyEntries))
-		{
-			var parts = line.Split(',');
-			if (parts.Length < 1) continue;
-			var taskPath = parts[0].Trim('"', ' ', '\r');
-			var taskName = taskPath.StartsWith("\\SeaShell\\")
-				? taskPath["\\SeaShell\\".Length..]
-				: taskPath;
-
-			if (taskName.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
-				return taskPath;
-		}
-		return null;
-	}
-	catch { return null; }
-}
-
-/// <summary>Run a schtasks action (/Run or /End) on a task by full path.</summary>
-bool RunSchedTask(string taskPath, string action)
-{
-	try
-	{
-		var psi = new ProcessStartInfo
-		{
-			FileName = "schtasks.exe",
-			UseShellExecute = false,
-			RedirectStandardOutput = true,
-			RedirectStandardError = true,
-			CreateNoWindow = true,
-		};
-		psi.ArgumentList.Add(action);
-		psi.ArgumentList.Add("/TN");
-		psi.ArgumentList.Add(taskPath);
-
-		using var proc = Process.Start(psi)!;
-		proc.WaitForExit(5_000);
-		return proc.ExitCode == 0;
-	}
-	catch { return false; }
-}
-
-/// <summary>Query task state (e.g. "Running", "Ready"). Returns null if task not found.</summary>
-string? QueryTaskState(string taskPath)
-{
-	try
-	{
-		var psi = new ProcessStartInfo
-		{
-			FileName = "schtasks.exe",
-			UseShellExecute = false,
-			RedirectStandardOutput = true,
-			RedirectStandardError = true,
-			CreateNoWindow = true,
-		};
-		psi.ArgumentList.Add("/Query");
-		psi.ArgumentList.Add("/TN");
-		psi.ArgumentList.Add(taskPath);
-		psi.ArgumentList.Add("/FO");
-		psi.ArgumentList.Add("CSV");
-		psi.ArgumentList.Add("/NH");
-
-		using var proc = Process.Start(psi)!;
-		var stdout = proc.StandardOutput.ReadToEnd();
-		proc.WaitForExit(5_000);
-		if (proc.ExitCode != 0) return null;
-
-		var parts = stdout.Trim().Split(',');
-		if (parts.Length >= 3)
-			return parts[2].Trim('"', ' ', '\r', '\n');
-		return null;
-	}
-	catch { return null; }
 }

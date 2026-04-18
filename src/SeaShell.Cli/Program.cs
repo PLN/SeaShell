@@ -2,6 +2,7 @@ using System;
 using System.Diagnostics;
 using System.IO;
 using System.Runtime.InteropServices;
+using SeaShell.Installer;
 using SeaShell.Protocol;
 using SeaShell.Invoker;
 using SeaShell.Cli;
@@ -63,18 +64,10 @@ if (args.Length > 0 && args[0] is "--help" or "-h")
 	Console.WriteLine("       sea -i [packages...]      REPL with NuGet packages");
 	Console.WriteLine();
 	Console.WriteLine("  --status              Show daemon and elevator status");
+	Console.WriteLine("  --start               Start daemon and elevator");
+	Console.WriteLine("  --stop                Stop daemon and elevator");
 	Console.WriteLine();
-	Console.WriteLine("  Task Scheduler (Windows):");
-	Console.WriteLine("  --install-daemon      Register daemon task (limited privileges)");
-	Console.WriteLine("  --install-elevator    Register elevator task (requires elevation)");
-	Console.WriteLine("  --uninstall-daemon    Remove daemon task");
-	Console.WriteLine("  --uninstall-elevator  Remove elevator task");
-	Console.WriteLine("  --start               Start registered tasks");
-	Console.WriteLine("  --stop                Stop registered tasks");
-	Console.WriteLine();
-	Console.WriteLine("  File association (Windows):");
-	Console.WriteLine("  --associate [.ext]    Associate extension with sea (default: .cs)");
-	Console.WriteLine("  --unassociate [.ext]  Remove association");
+	Console.WriteLine("  Install / uninstall: use the 'seashell' tool, not 'sea'.");
 	Console.WriteLine();
 	Console.WriteLine("  Dev/debug:");
 	Console.WriteLine("  -V, --verbose         Show daemon lifecycle messages");
@@ -130,12 +123,12 @@ switch (args[0])
 			ExitDelayIfNeeded();
 			return 0;
 		}
-		var daemonTaskState = ScheduledTasks.QueryDaemonTaskState();
+		var daemonTaskState = DaemonTasks.QueryDaemonTaskState();
 		Console.WriteLine(daemonTaskState != null
 			? $"  daemon:   not running (task: {daemonTaskState.ToLowerInvariant()})"
 			: "  daemon:   not running");
 
-		var elevatorTaskState = ScheduledTasks.QueryElevatorTaskState();
+		var elevatorTaskState = DaemonTasks.QueryElevatorTaskState();
 		Console.WriteLine(elevatorTaskState != null
 			? $"  elevator: task {elevatorTaskState.ToLowerInvariant()}"
 			: "  elevator: not running");
@@ -151,19 +144,11 @@ switch (args[0])
 	case "--daemon-start":
 		return DaemonManager.StartDaemon(logErr, logErr);
 
-	// ── Task management (via Invoker) ──────────────────────────────
+	// ── Daemon/elevator task lifecycle ─────────────────────────────
 	case "--start":
-		return ScheduledTasks.Start(log);
+		return DaemonTasks.Start(log);
 	case "--stop":
-		return await ScheduledTasks.Stop(log);
-	case "--install-daemon":
-		return ScheduledTasks.InstallDaemon(log);
-	case "--install-elevator":
-		return ScheduledTasks.InstallElevator(log);
-	case "--uninstall-daemon":
-		return ScheduledTasks.UninstallDaemon(log);
-	case "--uninstall-elevator":
-		return ScheduledTasks.UninstallElevator(log);
+		return await DaemonTasks.Stop(log);
 
 	// ── Script scheduling (via Invoker) ───────────────────────────
 	case "--schedule":
@@ -174,14 +159,6 @@ switch (args[0])
 		return ScriptScheduler.Unschedule(Path.GetFullPath(args[1]), log);
 	case "--schedule-list":
 		return ScriptScheduler.List(log);
-
-	// ── File association (CLI-only) ────────────────────────────────
-	case "--associate":
-		var ext = args.Length > 1 ? args[1] : ".cs";
-		return FileAssoc.Associate(ext);
-	case "--unassociate":
-		var uext = args.Length > 1 ? args[1] : ".cs";
-		return FileAssoc.Unassociate(uext);
 }
 
 // ── Run script ──────────────────────────────────────────────────────────

@@ -20,17 +20,26 @@ public static class SeaShellPaths
 	/// <summary>Root data directory for SeaShell runtime data.</summary>
 	public static string DataDir { get; } = ResolveDataDir();
 
-	/// <summary>Compiled script artifacts (DLL + runtimeconfig + deps.json per script hash).</summary>
-	public static string CacheDir { get; } = Path.Combine(DataDir, "cache");
-
-	/// <summary>Staged daemon binaries (one subdirectory per hash).</summary>
-	public static string DaemonDir { get; } = Path.Combine(DataDir, "daemon");
-
-	/// <summary>Staged elevator binaries (one subdirectory per hash).</summary>
-	public static string ElevatorDir { get; } = Path.Combine(DataDir, "elevator");
-
 	/// <summary>Temporary snippet files for ScriptHost.RunSnippetAsync.</summary>
 	public static string SnippetsDir { get; } = Path.Combine(DataDir, "snippets");
+
+	/// <summary>Junction/symlink to the active version directory.</summary>
+	public static string CurrentDir { get; } = Path.Combine(DataDir, "current");
+
+	/// <summary>Bin directory under the <see cref="CurrentDir"/> junction (for PATH and user-scheduled tasks).</summary>
+	public static string CurrentBinDir { get; } = Path.Combine(CurrentDir, "bin");
+
+	// ── Version-specific paths ─────────────────────────────────────────
+
+	/// <summary>Per-version root directory: <c>DataDir/v{version}/</c></summary>
+	public static string VersionDir(string version) => Path.Combine(DataDir, $"v{version}");
+
+	/// <summary>Binaries directory for a specific version.</summary>
+	public static string BinDir(string version) => Path.Combine(VersionDir(version), "bin");
+
+	/// <summary>Compiled script cache for a specific version.</summary>
+	public static string CacheDir(string version) => Path.Combine(VersionDir(version), "cache");
+
 
 	private static string ResolveDataDir()
 	{

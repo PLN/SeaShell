@@ -230,7 +230,6 @@ public sealed record PingResponse(
 	int UptimeSeconds,
 	int ActiveScripts,
 	int Pid = 0,
-	string? DaemonHash = null,
 	int IdleSeconds = 0,
 	int IdleTimeoutSeconds = 0,
 	string? ElevatorVersion = null,

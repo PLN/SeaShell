@@ -28,9 +28,10 @@ public sealed class ScriptCompiler
 	// Track last resolved source list per script (for watch mode file list)
 	private readonly Dictionary<string, string[]> _lastSourcesByScript = new(StringComparer.OrdinalIgnoreCase);
 
-	public ScriptCompiler()
+	public ScriptCompiler(string? cacheDir = null)
 	{
-		_cacheDir = SeaShellPaths.CacheDir;
+		var version = typeof(ScriptCompiler).Assembly.GetName().Version?.ToString(4) ?? "0.0.0";
+		_cacheDir = cacheDir ?? SeaShellPaths.CacheDir(version);
 		Directory.CreateDirectory(_cacheDir);
 
 		// Secure the data root on Linux — owner-only access

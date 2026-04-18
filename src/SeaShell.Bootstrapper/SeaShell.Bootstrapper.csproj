@@ -13,6 +13,11 @@
 	<ItemGroup>
 		<None Include="..\..\README.md" Pack="true" PackagePath="/" />
 	</ItemGroup>
+	<ItemGroup>
+		<ProjectReference Include="..\SeaShell.Common\SeaShell.Common.csproj" />
+		<ProjectReference Include="..\SeaShell.Protocol\SeaShell.Protocol.csproj" />
+		<ProjectReference Include="..\SeaShell.Installer\SeaShell.Installer.csproj" />
+	</ItemGroup>
 	<!--
 	Archives are embedded at pack time by pipeline-package.cs, which copies
 	the per-RID zips into archives/ before running 'dotnet pack'.

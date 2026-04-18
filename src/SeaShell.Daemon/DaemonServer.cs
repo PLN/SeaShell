@@ -58,11 +58,21 @@ public sealed class DaemonServer : IAsyncDisposable
 		var addr = TransportEndpoint.GetDaemonAddress(TransportEndpoint.CurrentUserIdentity, TransportEndpoint.CurrentVersion);
 		_log.Information("Listening on {Address}", addr);
 
+		// Write marker files so installers/tools can discover this daemon
+		var versionDir = SeaShellPaths.VersionDir(Version);
+		MarkerFile.Write(versionDir, MarkerFile.DaemonPid, Environment.ProcessId.ToString());
+		MarkerFile.Write(versionDir, MarkerFile.DaemonPipe, addr);
+		_log.Information("Marker files written to {VersionDir}", versionDir);
+
 		if (IdleTimeout > TimeSpan.Zero)
 			_log.Information("Idle timeout: {IdleTimeout}", IdleTimeout);
 
 		// Background NuGet update check — every 8 hours
 		_ = RunUpdateLoopAsync(ct);
+
+		// Background cache freshness: touch our version's cache dir periodically
+		// so CleanupCaches knows it's in active use.
+		_ = RunCacheTouchLoopAsync(ct);
 
 		Interlocked.Exchange(ref _lastActivityTicks, DateTime.UtcNow.Ticks);
 
@@ -259,6 +269,27 @@ public sealed class DaemonServer : IAsyncDisposable
 		}
 	}
 
+	/// <summary>
+	/// Periodically touch the version's cache directory while the daemon is alive.
+	/// This keeps LastWriteTime fresh so CleanupCaches won't remove active caches.
+	/// </summary>
+	private async Task RunCacheTouchLoopAsync(CancellationToken ct)
+	{
+		var cacheDir = SeaShellPaths.CacheDir(Version);
+		while (!ct.IsCancellationRequested)
+		{
+			try { await Task.Delay(TimeSpan.FromMinutes(30), ct); }
+			catch (OperationCanceledException) { return; }
+
+			try
+			{
+				if (Directory.Exists(cacheDir))
+					Directory.SetLastWriteTimeUtc(cacheDir, DateTime.UtcNow);
+			}
+			catch { }
+		}
+	}
+
 	// ── Watch mode ──────────────────────────────────────────────────────
 
 	private async Task HandleWatchMode(TransportStream conn, RunRequest request, CancellationToken ct)
@@ -329,7 +360,7 @@ public sealed class DaemonServer : IAsyncDisposable
 					pendingClearCache = false;
 					_compiler.NuGetResolver.InvalidateCache();
 					CompilationCache.ClearScript(
-						SeaShellPaths.CacheDir,
+						SeaShellPaths.CacheDir(Version),
 						Path.GetFileNameWithoutExtension(request.ScriptPath));
 				}
 
@@ -414,8 +445,6 @@ public sealed class DaemonServer : IAsyncDisposable
 
 	// ── Request handlers ────────────────────────────────────────────────
 
-	private static readonly string? _daemonHash = ComputeSelfHash();
-
 	private PingResponse MakePingResponse()
 	{
 		var now = DateTime.UtcNow;
@@ -427,27 +456,8 @@ public sealed class DaemonServer : IAsyncDisposable
 		var elevIdle = _elevatorConnectedTime.HasValue
 			? (int)((now.Ticks - Interlocked.Read(ref _elevatorLastActivityTicks)) / TimeSpan.TicksPerSecond) : 0;
 		return new PingResponse(Version, false, _elevator != null, uptime, _activeConnections,
-			Environment.ProcessId, _daemonHash, idle, timeout, _elevatorVersion,
+			Environment.ProcessId, idle, timeout, _elevatorVersion,
 			elevUptime, elevIdle);
-	}
-
-	/// <summary>Compute hash of our own directory — must match DaemonManager.ComputeDirHash.</summary>
-	private static string? ComputeSelfHash()
-	{
-		try
-		{
-			var sb = new System.Text.StringBuilder();
-			foreach (var f in System.Linq.Enumerable.OrderBy(
-				Directory.GetFiles(AppContext.BaseDirectory, "*.dll", SearchOption.AllDirectories), f => f))
-			{
-				var name = System.Reflection.AssemblyName.GetAssemblyName(f);
-				sb.Append(name.FullName);
-			}
-			var bytes = System.Security.Cryptography.SHA256.HashData(
-				System.Text.Encoding.UTF8.GetBytes(sb.ToString()));
-			return Convert.ToHexString(bytes)[..16].ToLowerInvariant();
-		}
-		catch { return null; }
 	}
 
 	private RunResponse HandleRun(RunRequest request)
@@ -459,7 +469,7 @@ public sealed class DaemonServer : IAsyncDisposable
 			_log.Information("Clearing cache for {ScriptName}", Path.GetFileNameWithoutExtension(request.ScriptPath));
 			_compiler.NuGetResolver.InvalidateCache();
 			CompilationCache.ClearScript(
-				SeaShellPaths.CacheDir,
+				SeaShellPaths.CacheDir(Version),
 				Path.GetFileNameWithoutExtension(request.ScriptPath));
 		}
 
@@ -574,5 +584,10 @@ public sealed class DaemonServer : IAsyncDisposable
 		if (_elevator != null)
 			await _elevator.DisposeAsync();
 		await _server.DisposeAsync();
+
+		// Clean up marker files
+		var versionDir = SeaShellPaths.VersionDir(Version);
+		MarkerFile.Delete(versionDir, MarkerFile.DaemonPid);
+		MarkerFile.Delete(versionDir, MarkerFile.DaemonPipe);
 	}
 }
