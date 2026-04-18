@@ -1,5 +1,83 @@
 # History
 
+## v0.5.0 (2026-04-18)
+
+**Side-by-side versioning, proper `--system` install, Installer assembly
+extracted, sweeping cleanup of pre-0.5.0 layouts.**
+
+- **Side-by-side per-version directories.** Each installed version lives
+  under `{DataDir}/v{version}/` with its own `bin/`, `cache/`, and marker
+  files. A `current/` junction (or symlink on Linux) points at the active
+  version; PATH always goes through the junction so it survives upgrades.
+  Upgrading no longer replaces a single shared install — newer versions
+  install alongside, the junction is repointed, and older versions are
+  cleaned up only after a liveness check confirms no active clients.
+- **Marker-based daemon/elevator discovery replaces `ServiceManifest`.**
+  `daemon.path` / `elevator.path` / `daemon.pipe` / `daemon.pid` are plain
+  text files in the version directory, written by the installer (paths)
+  and by the daemon/elevator itself at startup (pid/pipe).
+  `BinaryDiscovery.FindDaemon(version)` reads the marker and validates the
+  target exists, with fallback to the newest installed version ≥ the
+  requested one (covers host-embedded scenarios where the caller's pinned
+  version may have been uninstalled). The old manifest-based address
+  lookup, staged-binary hashing, and daemon-hash-mismatch restart loop are
+  all gone.
+- **`seashell install --system` installs under SYSTEM's own user profile.**
+  Previously `--system` routed to `%ProgramData%\seashell\` (a
+  machine-wide location) and baked the invoking elevated user's identity
+  into task XML + marker content. With `Environment.UserName` returning
+  `{MachineName}$` on .NET 10 under LocalSystem (and more exotic strings
+  on domain-joined hosts), that baked-in identity then mismatched what the
+  daemon reported at runtime. The new model: `--system` registers a
+  transient one-shot scheduled task with principal `S-1-5-18`, which runs
+  a plain `seashell install` as SYSTEM. Every identity-derived value
+  (pipe name, task UserIds, DataDir) resolves under the same identity the
+  daemon will later see. SYSTEM's install lands in
+  `%SystemRoot%\System32\config\systemprofile\AppData\Local\seashell\`,
+  and its daemon task uses a `BootTrigger` so Windows services running as
+  SYSTEM can find a warm daemon at boot.
+- **`SeaShell.Installer` assembly.** Task-Scheduler integration
+  (`DaemonTasks`, `TaskQuery`), file-association registration
+  (`FileAssoc`), the SYSTEM-op bootstrap (`SystemOpRunner`), and the
+  pre-0.5.0 layout sweep (`LegacyCleanup`) all live here now, referenced
+  by both the Bootstrapper and the CLI. Installer depends only on
+  `SeaShell.Common` + `SeaShell.Protocol` — no Roslyn or scripting
+  surface. The CLI's `--install-daemon`, `--install-elevator`,
+  `--uninstall-daemon`, `--uninstall-elevator`, `--associate`, and
+  `--unassociate` flags are removed; install lifecycle lives entirely in
+  the `seashell` command now.
+- **Pre-0.5.0 layout cleanup on upgrade.** `seashell install` detects the
+  flat pre-versioning layout (`{DataDir}/bin/`, `cache/`, `daemon/`,
+  `elevator/`, `seashell.json`) and wipes it before creating the new
+  version directory. Uses rename-then-delete so locked binaries on
+  Windows can't block the upgrade — a locked `bin/` is moved aside as
+  `bin.remove-{timestamp}/` and cleaned up on the next install pass once
+  the lock releases.
+- **Post-install verification block.** Every `seashell install` ends with
+  a verification pass: marker files exist and point at real binaries,
+  `current` junction resolves to the version dir, `sea --version` reports
+  the expected version, scheduled tasks are registered, file associations
+  point at the per-version exe. Fails the install with exit code 1 if
+  anything's off — catches the kind of silent drift where an install
+  "succeeded" but produced a non-working tool.
+- **Per-user install mutex.** `seashell install` and `seashell uninstall`
+  acquire a Windows kernel mutex (`SeaShell_install_u{user}`) or a Linux
+  exclusive file lock (`$DataDir/install.lock`) for the duration of the
+  operation. Concurrent runs under the same identity fail fast with a
+  clear message instead of racing on the filesystem.
+- **Daemon hash removed.** `PingResponse.DaemonHash` and the
+  `ComputeSelfHash` / `ComputeDirHash` pair are gone. Side-by-side pipe
+  names encode the version directly, so a daemon and client on the same
+  pipe are guaranteed to match — hash-based validation was dead code.
+- **`ProgramData` no longer used.** `SeaShellPaths` always resolves to
+  `LocalAppData` on Windows. SYSTEM's `LocalAppData` lives under its own
+  user profile, which keeps a SYSTEM install per-user (just for the
+  SYSTEM user) rather than machine-wide.
+- **Installer scripts removed.** The pre-0.5.0 `install.ps1` and
+  `install.sh` curl/iex one-liners are gone — `dotnet tool install -g
+  SeaShell` is now the only install path. Offline / archive-based
+  installs use `--add-source <dir>` on the same command.
+
 ## v0.4.7.213 (2026-04-11)
 
 **Runtime daemon discovery, install cleanup, locked-file install robustness.**

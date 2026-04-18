@@ -9,8 +9,8 @@
 		<!-- Shared NuGet metadata -->
 		<Authors>PLN;Claude (Anthropic)</Authors>
 		<PackageLicenseExpression>MIT</PackageLicenseExpression>
-		<PackageProjectUrl>https://github.com/PLN/SeaShell</PackageProjectUrl>
-		<RepositoryUrl>https://github.com/PLN/SeaShell</RepositoryUrl>
+		<PackageProjectUrl>https://codeberg.org/PLN/SeaShell</PackageProjectUrl>
+		<RepositoryUrl>https://codeberg.org/PLN/SeaShell</RepositoryUrl>
 		<RepositoryType>git</RepositoryType>
 	</PropertyGroup>
 	<ItemGroup>

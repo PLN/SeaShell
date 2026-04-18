@@ -15,23 +15,23 @@ On Windows, run elevated (`gsudo seashell install`) to also register the
 elevator task for UAC-free `//sea_elevate` scripts and the Windows Event Log
 source. Without elevation the daemon is registered but the elevator is skipped.
 
-For a system-wide install (SYSTEM/root), use `--system` with elevation:
+For an install under the SYSTEM user (so Windows services running as
+LocalSystem can use SeaShell), use `--system` with elevation:
 ```
 gsudo seashell install --system      # Windows
 sudo seashell install --system       # Linux
 ```
-This installs to `%ProgramData%\seashell\bin` (Windows) or root's standard
-location (Linux), adds to machine PATH, and skips Task Scheduler registration
-— the daemon starts lazily on first `sea` invocation.
+On Windows this installs under SYSTEM's own user profile
+(`%SystemRoot%\System32\config\systemprofile\AppData\Local\seashell\`) and
+registers the daemon task with a boot trigger running as SYSTEM. The install
+is performed by a transient one-shot scheduled task running as SYSTEM — the
+binaries, markers, pipe names, and scheduled tasks are all created under
+SYSTEM's identity rather than the invoking user's. On Linux, `--system`
+installs to root's standard location (`/var/lib/seashell/`).
 
 Run `seashell` with no arguments to see a dashboard with version, platform,
 daemon/elevator state, and idle time. Use `seashell start` / `seashell stop`
 to manage daemon lifecycle.
-
-**Alternative** — standalone scripts (no dotnet tool):
-
-Windows: `iex (irm https://raw.githubusercontent.com/PLN/SeaShell/main/install.ps1)`
-Linux: `curl -fsSL https://raw.githubusercontent.com/PLN/SeaShell/main/install.sh | sh`
 
 ## Quick Start
 
@@ -42,7 +42,6 @@ sea script.vb                   Run a VB.NET script
 sea myapp.dll                   Run a pre-compiled .NET assembly
 sea myapp.exe                   Run a single-file .exe
 sea -i Humanizer.Core           REPL with NuGet packages preloaded
-sea --associate .cs             Associate .cs files with SeaShell
 seaw script.csw                 Run a window-mode script (no console)
 seaw script.cs                  Run any script without a console window
 ```
@@ -360,23 +359,15 @@ Supported init systems (auto-detected): Windows Service, systemd, runit, OpenRC,
 
 ## Task Scheduler (Windows)
 
-Register the daemon and optionally the elevator for automatic startup. Each is a separate, explicit registration:
+`seashell install` registers scheduled tasks automatically:
 
-```
-sea --install-daemon              Register daemon (limited privileges)
-sea --install-elevator            Register elevator (requires elevation once)
-sea --uninstall-daemon            Remove daemon task
-sea --uninstall-elevator          Remove elevator task
-sea --start                       Start registered tasks
-sea --stop                        Stop daemon and elevator
-sea --status                      Show daemon and elevator status
-```
+- `SeaShell Daemon ({user}) {version}` — LogonTrigger, LeastPrivilege. Auto-starts the daemon at user logon.
+- `SeaShell Elevator ({user}) {version}` — LogonTrigger, HighestAvailable. Only registered when `seashell install` runs elevated.
+- `SeaShell Daemon (SYSTEM) {version}` — BootTrigger, HighestAvailable. Only registered by `seashell install --system`.
 
-The daemon starts automatically on first `sea` invocation even without Task Scheduler. When a task is registered, `sea` prefers starting it over spawning a separate process — this keeps the daemon under Task Scheduler management.
+Use `sea --start` / `sea --stop` / `sea --status` (or `seashell start`/`stop`/`status`) for lifecycle and state. `sea --stop` uses IPC first (works on Linux too), then ends Task Scheduler tasks. The daemon also starts lazily on first `sea` invocation if no task is registered.
 
-`--stop` uses IPC first (works for any running daemon, including on Linux), then ends Task Scheduler tasks. It reports actual state — no misleading output when nothing is running.
-
-The elevator is optional — without it, elevated scripts fall back to `gsudo sea script.cs`. When the elevator task is registered but not running, `sea` auto-starts it on demand when an `//sea_elevate` script is run.
+The elevator is optional — without it, `//sea_elevate` scripts fall back to `gsudo sea script.cs`. When the elevator task is registered but not running, `sea` auto-starts it on demand.
 
 ## Bootstrapper Commands
 
@@ -422,16 +413,14 @@ See [doc/ARCHITECTURE.md](doc/ARCHITECTURE.md) for the full architecture,
 
 ## File Association (Windows)
 
-Register `.cs` files to open with SeaShell when double-clicked:
+`seashell install` registers `.cs` and `.csw` per-user (HKCU), pointing at
+the per-version `sea.exe` / `seaw.exe` via the `current` junction so the
+association survives updates. Double-click a `.cs` file in Explorer to run
+it with SeaShell; `.csw` files are run by `seaw.exe` in Windows subsystem
+mode (no console flash).
 
-```
-sea --associate              Associate .cs (default)
-sea --associate .vb          Associate .vb
-sea --unassociate .cs        Remove association
-```
-
-Per-user registration via HKCU — no elevation needed. The SeaShell icon appears on
-associated files in Explorer.
+Associations are removed by `seashell uninstall`. No separate registration
+commands — they're part of the install flow.
 
 ## Building
 
@@ -463,13 +452,20 @@ All runtime data lives in a persistent per-user directory (not temp):
 | Context | Path |
 |---------|------|
 | Windows user | `%LOCALAPPDATA%\seashell\` |
-| Windows SYSTEM | `%ProgramData%\seashell\` |
+| Windows SYSTEM | `%SystemRoot%\System32\config\systemprofile\AppData\Local\seashell\` |
 | Linux user | `~/.local/share/seashell/` |
 | Linux root | `/var/lib/seashell/` |
 
-Override with `SEASHELL_DATA` environment variable. Contains: `cache/` (compiled scripts), `daemon/` (staged daemon), `elevator/` (staged elevator), `snippets/` (REPL temp files).
+Override with `SEASHELL_DATA` environment variable. Layout under each:
+`v{version}/bin/` (per-version binaries), `v{version}/cache/` (compiled
+scripts), `v{version}/daemon.path`/`daemon.pid`/`daemon.pipe` (markers),
+`current/` (junction to the active version), `snippets/` (shared REPL temp
+files).
 
-The daemon and elevator binaries are staged to this directory before launching. This eliminates DLL lock conflicts — `dotnet build` always succeeds, even while the daemon is running.
+Side-by-side versioning: each installed version has its own directory; the
+`current` junction points at whichever version `PATH` should resolve to.
+`seashell install` of a newer version updates the junction and cleans up
+older ones only after the running daemon confirms no active clients.
 
 ### Compilation Cache
 
@@ -522,7 +518,7 @@ When a script has `//sea_elevate`, the CLI resolves it in order:
 1. Already elevated? (e.g., `gsudo sea script.cs`) — spawn directly
 2. Elevator worker connected to daemon? — delegate to it (no UAC prompt)
 3. Elevator task registered but not running? — auto-start it, wait for it to connect (up to 15s), then delegate
-4. None of the above — error with a helpful message suggesting `gsudo` or `sea --install-elevator`
+4. None of the above — error with a helpful message suggesting `gsudo` or an elevated `seashell install`
 
 On Linux, `//sea_elevate` is silently ignored.
 
