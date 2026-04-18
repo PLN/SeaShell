@@ -1,0 +1,9 @@
+<Project Sdk="Microsoft.NET.Sdk">
+	<PropertyGroup>
+		<IsPackable>false</IsPackable>
+	</PropertyGroup>
+	<ItemGroup>
+		<ProjectReference Include="..\SeaShell.Common\SeaShell.Common.csproj" />
+		<ProjectReference Include="..\SeaShell.Protocol\SeaShell.Protocol.csproj" />
+	</ItemGroup>
+</Project>

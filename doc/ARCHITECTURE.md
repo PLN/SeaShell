@@ -308,15 +308,18 @@ pipe `seashell-attach-{identity}`. Blocked callers connect instead of exiting. T
 `Sea.Attached` event fires for each client with an `AttachContext` that provides the
 caller's args, working directory, and bidirectional `Send`/`Receive`/`Close` methods.
 
-## Daemon Hash & Version Check
+## Version Matching
 
-The daemon computes a self-hash using SHA256 of all assembly `FullName` strings (ordered)
-in its base directory. `DaemonManager.ComputeDirHash()` uses the same algorithm on the
-staged binary directory. On script run, the CLI pings the daemon and compares hashes —
-a mismatch triggers automatic restart.
+Side-by-side versioning makes hash-based daemon-vs-installation matching unnecessary:
+each version has its own directory, its own daemon binary, and its own named pipe (the
+version is part of the pipe name). The invoker picks the daemon to talk to by looking up
+the `daemon.path` marker in the per-version directory — if the marker is missing, the
+version is considered uninstalled. The CLI/Invoker and the daemon share a 4-part version;
+a daemon built against a different version will bind a different pipe, so there's no way
+for mismatched CLI and daemon to end up on the same connection.
 
-`PingResponse` carries: `Version` (4-part), `Pid`, `DaemonHash`, `UptimeSeconds`,
-`ActiveScripts`, `IdleSeconds`, `IdleTimeoutSeconds`, `ElevatorVersion`.
+`PingResponse` carries: `Version` (4-part), `Pid`, `UptimeSeconds`, `ActiveScripts`,
+`IdleSeconds`, `IdleTimeoutSeconds`, `ElevatorVersion`.
 
 ## Handle Inheritance
 

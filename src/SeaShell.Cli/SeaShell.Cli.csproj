@@ -11,5 +11,6 @@
 	<ItemGroup>
 		<ProjectReference Include="..\SeaShell.Protocol\SeaShell.Protocol.csproj" />
 		<ProjectReference Include="..\SeaShell.Invoker\SeaShell.Invoker.csproj" />
+		<ProjectReference Include="..\SeaShell.Installer\SeaShell.Installer.csproj" />
 	</ItemGroup>
 </Project>

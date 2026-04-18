@@ -4,14 +4,16 @@ using System.IO;
 using System.Linq;
 using System.Runtime.InteropServices;
 using System.Threading.Tasks;
+using SeaShell.Installer;
 using SeaShell.Ipc;
 using SeaShell.Protocol;
 
 namespace SeaShell.Invoker;
 
 /// <summary>
-/// Daemon lifecycle management: start, stop, status, binary staging, version checking.
+/// Daemon lifecycle management: start, stop, status.
 /// Console-free — returns structured results. Accepts log callbacks for progress.
+/// Uses marker files (daemon.path) for binary discovery instead of the old manifest.
 /// </summary>
 public static class DaemonManager
 {
@@ -39,7 +41,7 @@ public static class DaemonManager
 			var ping = (PingResponse)reply.Value.Message;
 			return new DaemonStatus(
 				ping.Version, ping.UptimeSeconds, ping.ActiveScripts,
-				ping.ElevatorConnected, ping.Pid, ping.DaemonHash,
+				ping.ElevatorConnected, ping.Pid,
 				ping.IdleSeconds, ping.IdleTimeoutSeconds, ping.ElevatorVersion,
 				ping.ElevatorUptimeSeconds, ping.ElevatorIdleSeconds);
 		}
@@ -69,76 +71,31 @@ public static class DaemonManager
 
 	// ── Start ───────────────────────────────────────────────────────────
 
-	/// <summary>Start the daemon process. Stages binary via manifest to avoid DLL locks.</summary>
+	/// <summary>Start the daemon process. Finds binary via marker file.</summary>
 	public static int StartDaemon(Action<string>? log = null, Action<string>? verboseLog = null)
 	{
 		// Prefer Task Scheduler if the daemon is registered as a task
-		if (ScheduledTasks.TryRunDaemonTask())
+		if (DaemonTasks.TryRunDaemonTask())
 		{
 			verboseLog?.Invoke("daemon starting (task)");
 			return 0;
 		}
 
-		// Find daemon via manifest (stages if needed)
-		var stagedDir = ServiceManifest.GetOrStageDaemon(Version, verboseLog);
-		if (stagedDir == null)
+		// Find daemon binary via marker file. Escalate diagnostic to the top-level
+		// log when discovery fails so users see *why* without needing verbose mode.
+		string? discoveryDetail = null;
+		var daemonBinary = BinaryDiscovery.FindDaemon(Version, msg =>
 		{
-			log?.Invoke("daemon not found");
+			verboseLog?.Invoke(msg);
+			discoveryDetail = msg;
+		});
+		if (daemonBinary == null)
+		{
+			log?.Invoke($"daemon not found — {discoveryDetail ?? "no marker in any version directory"} (run 'seashell install')");
 			return 1;
 		}
 
-		var stagedDll = Path.Combine(stagedDir, "seashell-daemon.dll");
-		var stagedExe = Path.Combine(stagedDir,
-			RuntimeInformation.IsOSPlatform(OSPlatform.Windows) ? "seashell-daemon.exe" : "seashell-daemon");
-
-		var nugetCache = Path.Combine(
-			Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".nuget", "packages");
-
-		ProcessStartInfo psi;
-		if (File.Exists(stagedExe))
-		{
-			psi = new ProcessStartInfo
-			{
-				FileName = stagedExe,
-				UseShellExecute = false,
-				CreateNoWindow = true,
-				// Redirect stdin/stdout/stderr so the daemon gets new pipes instead
-				// of inheriting the caller's handles. Streams are closed immediately
-				// after Start (see below). This prevents the daemon from holding open
-				// the caller's stdout — which would block SSH sessions, pipe readers,
-				// and test harnesses from detecting EOF.
-				RedirectStandardOutput = true,
-				RedirectStandardError = true,
-				RedirectStandardInput = true,
-			};
-		}
-		else if (File.Exists(stagedDll))
-		{
-			var depsJson = Path.Combine(stagedDir, "seashell-daemon.deps.json");
-			psi = new ProcessStartInfo
-			{
-				FileName = "dotnet",
-				UseShellExecute = false,
-				CreateNoWindow = true,
-				RedirectStandardOutput = true,
-				RedirectStandardError = true,
-				RedirectStandardInput = true,
-			};
-			psi.ArgumentList.Add("exec");
-			if (File.Exists(depsJson))
-			{
-				psi.ArgumentList.Add("--depsfile");
-				psi.ArgumentList.Add(depsJson);
-			}
-			psi.ArgumentList.Add("--additionalprobingpath");
-			psi.ArgumentList.Add(nugetCache);
-			psi.ArgumentList.Add(stagedDll);
-		}
-		else
-		{
-			log?.Invoke($"staged daemon not found in {stagedDir}");
-			return 1;
-		}
+		var psi = BuildDaemonStartInfo(daemonBinary);
 
 		try
 		{
@@ -175,136 +132,57 @@ public static class DaemonManager
 		}
 	}
 
-	// ── Binary staging ─────────────────────────────────────────────────
+	// ── ProcessStartInfo builder ───────────────────────────────────────
 
 	/// <summary>
-	/// Copy a daemon or elevator binary and its dependencies to a stable data directory.
-	/// Returns (stagedDir, hash). Reuses existing staging if hash matches.
+	/// Build a ProcessStartInfo for launching a daemon or elevator binary.
+	/// Handles both native exe and dotnet exec (.dll) cases.
 	/// </summary>
-	public static (string stagedDir, string hash) StageBinary(string sourceDir, string binaryName, Action<string>? log = null)
+	internal static ProcessStartInfo BuildDaemonStartInfo(string binaryPath)
 	{
-		var hash = ComputeDirHash(sourceDir);
-		var stageDir = Path.Combine(SeaShellPaths.DataDir, binaryName, hash);
+		ProcessStartInfo psi;
 
-		if (Directory.Exists(stageDir))
-			return (stageDir, hash);
-
-		Directory.CreateDirectory(stageDir);
-		CopyDirectory(sourceDir, stageDir, log);
-
-		// Generate .runtimeconfig.dev.json with NuGet probing path
-		var nugetCache = Path.Combine(
-			Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".nuget", "packages");
-		foreach (var rc in Directory.GetFiles(stageDir, "*.runtimeconfig.json"))
+		if (binaryPath.EndsWith(".dll", StringComparison.OrdinalIgnoreCase))
 		{
-			var devJson = Path.ChangeExtension(rc, null);
-			devJson = devJson + ".dev.json";
-			if (!File.Exists(devJson))
+			var binDir = Path.GetDirectoryName(binaryPath)!;
+			var baseName = Path.GetFileNameWithoutExtension(binaryPath);
+			var depsJson = Path.Combine(binDir, baseName + ".deps.json");
+			var nugetCache = Path.Combine(
+				Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".nuget", "packages");
+
+			psi = new ProcessStartInfo
 			{
-				var content = $$"""
-				{
-				  "runtimeOptions": {
-				    "additionalProbingPaths": [
-				      "{{nugetCache.Replace("\\", "\\\\")}}"
-				    ]
-				  }
-				}
-				""";
-				File.WriteAllText(devJson, content);
-			}
-		}
-
-		return (stageDir, hash);
-	}
-
-	private static void CopyDirectory(string source, string destination, Action<string>? log = null)
-	{
-		foreach (var file in Directory.GetFiles(source))
-		{
-			var dest = Path.Combine(destination, Path.GetFileName(file));
-			try { File.Copy(file, dest); }
-			catch (Exception ex) { log?.Invoke($"copy failed: {Path.GetFileName(file)}: {ex.Message}"); }
-		}
-		foreach (var dir in Directory.GetDirectories(source))
-		{
-			var destDir = Path.Combine(destination, Path.GetFileName(dir));
-			Directory.CreateDirectory(destDir);
-			CopyDirectory(dir, destDir, log);
-		}
-	}
-
-	public static string ComputeDirHash(string dir)
-	{
-		var sb = new System.Text.StringBuilder();
-		try
-		{
-			foreach (var f in Directory.GetFiles(dir, "*.dll", SearchOption.AllDirectories).OrderBy(f => f))
+				FileName = "dotnet",
+				UseShellExecute = false,
+				CreateNoWindow = true,
+				RedirectStandardOutput = true,
+				RedirectStandardError = true,
+				RedirectStandardInput = true,
+			};
+			psi.ArgumentList.Add("exec");
+			if (File.Exists(depsJson))
 			{
-				var name = System.Reflection.AssemblyName.GetAssemblyName(f);
-				sb.Append(name.FullName);
+				psi.ArgumentList.Add("--depsfile");
+				psi.ArgumentList.Add(depsJson);
 			}
+			psi.ArgumentList.Add("--additionalprobingpath");
+			psi.ArgumentList.Add(nugetCache);
+			psi.ArgumentList.Add(binaryPath);
 		}
-		catch { }
-
-		var bytes = System.Security.Cryptography.SHA256.HashData(
-			System.Text.Encoding.UTF8.GetBytes(sb.ToString()));
-		return Convert.ToHexString(bytes)[..16].ToLowerInvariant();
-	}
-
-	// ── Version-check running daemon ───────────────────────────────────
-
-	/// <summary>
-	/// Check if a running daemon matches the expected hash. If not, stop it.
-	/// Returns true if the daemon was stopped (or wasn't running).
-	/// </summary>
-	public static async Task<bool> EnsureDaemonMatchesAsync(
-		string daemonAddress, string expectedHash, Action<string>? log = null)
-	{
-		try
+		else
 		{
-			await using var conn = await TransportClient.ConnectAsync(daemonAddress, timeoutMs: 2000);
-			await conn.Channel.SendAsync(new PingRequest());
-			var reply = await conn.Channel.ReceiveAsync();
-			if (reply == null) return true;
-
-			var ping = (PingResponse)reply.Value.Message;
-			if (ping.DaemonHash == expectedHash)
-				return false; // same version, don't restart
-
-			log?.Invoke($"daemon version mismatch (running={ping.DaemonHash?[..8] ?? "?"}, staged={expectedHash[..Math.Min(8, expectedHash.Length)]}), restarting...");
-
-			try
+			psi = new ProcessStartInfo
 			{
-				await using var stopConn = await TransportClient.ConnectAsync(daemonAddress, timeoutMs: 2000);
-				await stopConn.Channel.SendAsync(new StopRequest());
-				await stopConn.Channel.ReceiveAsync();
-			}
-			catch { }
-
-			for (int i = 0; i < 6; i++)
-			{
-				await Task.Delay(500);
-				if (!await TransportClient.ProbeAsync(daemonAddress))
-					return true;
-			}
-
-			if (ping.Pid > 0)
-			{
-				try
-				{
-					var proc = Process.GetProcessById(ping.Pid);
-					proc.Kill();
-					log?.Invoke($"killed stale daemon (pid {ping.Pid})");
-				}
-				catch { }
-			}
-
-			return true;
+				FileName = binaryPath,
+				UseShellExecute = false,
+				CreateNoWindow = true,
+				RedirectStandardOutput = true,
+				RedirectStandardError = true,
+				RedirectStandardInput = true,
+			};
 		}
-		catch
-		{
-			return true;
-		}
+
+		return psi;
 	}
 
 	/// <summary>Ask the daemon to spawn a process via the Elevator.</summary>
@@ -329,7 +207,7 @@ public static class DaemonManager
 /// <summary>Structured daemon status returned by <see cref="DaemonManager.StatusAsync"/>.</summary>
 public sealed record DaemonStatus(
 	string Version, int UptimeSeconds, int ActiveScripts,
-	bool ElevatorConnected, int Pid, string? DaemonHash,
+	bool ElevatorConnected, int Pid,
 	int IdleSeconds = 0, int IdleTimeoutSeconds = 0,
 	string? ElevatorVersion = null,
 	int ElevatorUptimeSeconds = 0, int ElevatorIdleSeconds = 0);

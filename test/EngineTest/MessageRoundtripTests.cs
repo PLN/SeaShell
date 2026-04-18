@@ -102,7 +102,7 @@ public class MessageRoundtripTests
 	{
 		var resp = new PingResponse(
 			"1.0.0", false, true, 300, 2,
-			1234, "abc", 10, 600, "1.0.0",
+			1234, 10, 600, "1.0.0",
 			ElevatorUptimeSeconds: 250, ElevatorIdleSeconds: 5);
 
 		var bytes = MessagePackSerializer.Serialize(resp, Opts);
@@ -119,7 +119,7 @@ public class MessageRoundtripTests
 	{
 		// Simulate old PingResponse without elevator metrics
 		var old = new PingResponse("1.0.0", false, true, 300, 2,
-			1234, "abc", 10, 600, "1.0.0");
+			1234, 10, 600, "1.0.0");
 
 		var bytes = MessagePackSerializer.Serialize(old, Opts);
 		var result = MessagePackSerializer.Deserialize<PingResponse>(bytes, Opts);

@@ -2,7 +2,6 @@ name: CI
 
 on:
   push:
-    branches: ['dev']
 
 defaults:
   run:
@@ -18,7 +17,7 @@ jobs:
       counter: ${{ steps.bump.outputs.COUNTER }}
       version: ${{ steps.bump.outputs.VERSION }}
     steps:
-      - uses: https://gitea.com/actions/checkout@v4
+      - uses: http://gitea:3000/actions/checkout@v4
 
       - name: Bump version counter
         id: bump
@@ -60,7 +59,7 @@ jobs:
     runs-on: ${{ matrix.runner }}
 
     steps:
-      - uses: https://gitea.com/actions/checkout@v4
+      - uses: http://gitea:3000/actions/checkout@v4
 
       - name: Set version
 
@@ -96,7 +95,7 @@ jobs:
         run: cp -f publish/seaw-tmp/seaw.* publish/win-x64/ && rm -rf publish/seaw-tmp
 
       - name: Upload binaries
-        uses: https://gitea.com/actions/upload-artifact@v3
+        uses: http://gitea:3000/actions/upload-artifact@v3
         with:
           name: binaries-${{ matrix.rid }}
           path: publish/${{ matrix.rid }}/
@@ -109,7 +108,7 @@ jobs:
     runs-on: win-x64
 
     steps:
-      - uses: https://gitea.com/actions/checkout@v4
+      - uses: http://gitea:3000/actions/checkout@v4
 
       - name: Set version
 
@@ -119,19 +118,19 @@ jobs:
           echo "Packaging version $VERSION"
 
       - name: Download Windows binaries
-        uses: https://gitea.com/actions/download-artifact@v3
+        uses: http://gitea:3000/actions/download-artifact@v3
         with:
           name: binaries-win-x64
           path: publish/win-x64/
 
       - name: Download Linux binaries
-        uses: https://gitea.com/actions/download-artifact@v3
+        uses: http://gitea:3000/actions/download-artifact@v3
         with:
           name: binaries-linux-x64
           path: publish/linux-x64/
 
       - name: Download Alpine binaries
-        uses: https://gitea.com/actions/download-artifact@v3
+        uses: http://gitea:3000/actions/download-artifact@v3
         with:
           name: binaries-linux-musl-x64
           path: publish/linux-musl-x64/
@@ -234,13 +233,13 @@ jobs:
           done
 
       - name: Upload packages
-        uses: https://gitea.com/actions/upload-artifact@v3
+        uses: http://gitea:3000/actions/upload-artifact@v3
         with:
           name: packages
           path: nupkg/
 
       - name: Upload dist archives
-        uses: https://gitea.com/actions/upload-artifact@v3
+        uses: http://gitea:3000/actions/upload-artifact@v3
         with:
           name: dist
           path: dist/
@@ -265,10 +264,10 @@ jobs:
     runs-on: ${{ matrix.runner }}
 
     steps:
-      - uses: https://gitea.com/actions/checkout@v4
+      - uses: http://gitea:3000/actions/checkout@v4
 
       - name: Download packages
-        uses: https://gitea.com/actions/download-artifact@v3
+        uses: http://gitea:3000/actions/download-artifact@v3
         with:
           name: packages
           path: nupkg/
@@ -301,25 +300,22 @@ jobs:
         if: matrix.os == 'windows'
         shell: powershell
         run: |
-          $dataDir = "$env:LOCALAPPDATA\seashell"
-          foreach ($sub in @('cache', 'daemon', 'elevator')) {
-            $dir = Join-Path $dataDir $sub
-            if (Test-Path $dir) { Remove-Item $dir -Recurse -Force -ErrorAction SilentlyContinue }
-          }
-          Remove-Item "$dataDir\seashell.json" -Force -ErrorAction SilentlyContinue
-          # System-level caches (best effort, no gsudo in CI)
-          Remove-Item "C:\ProgramData\seashell\cache" -Recurse -Force -ErrorAction SilentlyContinue
-          Remove-Item "C:\ProgramData\seashell\daemon" -Recurse -Force -ErrorAction SilentlyContinue
-          Remove-Item "C:\ProgramData\seashell\elevator" -Recurse -Force -ErrorAction SilentlyContinue
-          Remove-Item "C:\ProgramData\seashell\seashell.json" -Force -ErrorAction SilentlyContinue
+          # Wipe entire SeaShell data dirs to remove legacy-layout bins, v* dirs,
+          # and current junctions left behind by previous CI runs. The installer
+          # will recreate everything fresh.
+          Remove-Item "$env:LOCALAPPDATA\seashell" -Recurse -Force -ErrorAction SilentlyContinue
+          Remove-Item "C:\ProgramData\seashell" -Recurse -Force -ErrorAction SilentlyContinue
 
       - name: "Install: Clear caches (Linux)"
         if: matrix.os == 'linux'
 
         run: |
-          DATA_DIR="$HOME/.local/share/seashell"
-          rm -rf "$DATA_DIR/cache" "$DATA_DIR/daemon" "$DATA_DIR/elevator" "$DATA_DIR/seashell.json"
-          sudo rm -rf /var/lib/seashell/cache /var/lib/seashell/daemon /var/lib/seashell/elevator /var/lib/seashell/seashell.json
+          # Wipe entire SeaShell data dirs (legacy bin/, v*/, current) — installer recreates.
+          rm -rf "$HOME/.local/share/seashell"
+          sudo rm -rf /var/lib/seashell
+          # Drop the user-PATH symlink from the legacy layout if present.
+          rm -f "$HOME/.local/bin/sea"
+          sudo rm -f /root/.local/bin/sea
 
       - name: "Install: dotnet tool + seashell install"
 
@@ -329,11 +325,12 @@ jobs:
           dotnet tool uninstall -g SeaShell 2>/dev/null || true
           dotnet tool install -g SeaShell --add-source "$(pwd)/nupkg"
           seashell install
-          # Add sea to PATH for subsequent steps
+          # Add sea to PATH for subsequent steps. The new layout uses the
+          # `current` junction/symlink so PATH stays stable across version bumps.
           if [ "${{ matrix.os }}" = "windows" ]; then
-            SEA_BIN="$LOCALAPPDATA/seashell/bin"
+            SEA_BIN="$LOCALAPPDATA/seashell/current/bin"
           else
-            SEA_BIN="$HOME/.local/share/seashell/bin"
+            SEA_BIN="$HOME/.local/share/seashell/current/bin"
           fi
           echo "$SEA_BIN" >> $GITHUB_PATH
           echo "$HOME/.dotnet/tools" >> $GITHUB_PATH
@@ -902,13 +899,11 @@ jobs:
           Write-Host 'seaw console mode OK'
 
       # ── Elevated install tests (Windows only) ──────────────────────
-
-      - name: "Test: elevated seashell install (elevator + Event Log)"
-        if: matrix.os == 'windows'
-
-        run: |
-          sea --install-elevator
-          sea --version
+      # Elevator task + Event Log source registration is handled by
+      # `seashell install` when run elevated (see earlier step); the
+      # VerifyInstallation block there confirms the elevator task is
+      # registered. No separate `sea --install-elevator` step needed —
+      # that flag was removed when install logic moved from sea to seashell.
 
       - name: "Test: elevator connects to daemon"
         if: matrix.os == 'windows'
@@ -920,6 +915,10 @@ jobs:
           sleep 3
           sea --status || true
           # Elevator may not connect in CI session — don't fail hard
+
+      # SeaConsole relay tests require UAC (elevator path). CI runner has UAC off,
+      # so //sea_elevate takes the direct path — relay is never exercised.
+      # These tests must be run manually on a machine with UAC enabled.
 
       - name: "Test: seaw Event Log error (malformed script)"
         if: matrix.os == 'windows'
@@ -1211,3 +1210,28 @@ jobs:
 
       - name: "Final: Smoke test (hello.cs)"
         run: sea test/hello.cs
+
+  # ── Release ──────────────────────────────────────────────────────────
+  # On master: publish packages to nuget.org after successful tests.
+
+  release:
+    needs: [version, test]
+    if: github.ref == 'refs/heads/master'
+    runs-on: linux-x64
+
+    steps:
+      - name: Download packages
+        uses: http://gitea:3000/actions/download-artifact@v3
+        with:
+          name: packages
+          path: nupkg/
+
+      - name: Publish to nuget.org
+        run: |
+          for pkg in nupkg/*.nupkg; do
+            echo "Publishing $(basename "$pkg") to nuget.org..."
+            dotnet nuget push "$pkg" \
+              --source https://api.nuget.org/v3/index.json \
+              --api-key "${{ secrets.NUGET_API_KEY }}" \
+              --skip-duplicate
+          done

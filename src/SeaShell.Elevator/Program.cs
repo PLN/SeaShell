@@ -4,6 +4,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using Serilog;
 using Serilog.Events;
+using SeaShell;
 using SeaShell.Elevator;
 
 // ── Logging (same pattern as Daemon) ────────────────────────────────────
@@ -51,6 +52,10 @@ _ = Task.Run(async () =>
 	}
 }, cts.Token);
 
+var version = typeof(ElevatorWorker).Assembly.GetName().Version?.ToString(4) ?? "0.0.0";
+var versionDir = SeaShellPaths.VersionDir(version);
+MarkerFile.Write(versionDir, MarkerFile.ElevatorPid, Environment.ProcessId.ToString());
+
 var worker = new ElevatorWorker();
 
 try
@@ -62,6 +67,7 @@ catch (OperationCanceledException)
 	// clean shutdown
 }
 
+MarkerFile.Delete(versionDir, MarkerFile.ElevatorPid);
 Log.Information("SeaShell elevator stopped");
 Log.CloseAndFlush();
 return 0;

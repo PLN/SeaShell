@@ -4,13 +4,13 @@
 		<LangVersion>latest</LangVersion>
 		<Nullable>enable</Nullable>
 		<ImplicitUsings>disable</ImplicitUsings>
-		<Version>0.4.7.213</Version>
+		<Version>0.5.0.213</Version>
 
 		<!-- Shared NuGet metadata -->
 		<Authors>PLN;Claude (Anthropic)</Authors>
 		<PackageLicenseExpression>MIT</PackageLicenseExpression>
-		<PackageProjectUrl>https://github.com/PLN/SeaShell</PackageProjectUrl>
-		<RepositoryUrl>https://github.com/PLN/SeaShell</RepositoryUrl>
+		<PackageProjectUrl>https://codeberg.org/PLN/SeaShell</PackageProjectUrl>
+		<RepositoryUrl>https://codeberg.org/PLN/SeaShell</RepositoryUrl>
 		<RepositoryType>git</RepositoryType>
 	</PropertyGroup>
 	<ItemGroup>

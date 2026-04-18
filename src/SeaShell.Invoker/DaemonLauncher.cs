@@ -29,38 +29,26 @@ public static class DaemonLauncher
 
 		// 1. Probe our exact version's address
 		if (await TransportClient.ProbeAsync(daemonAddress, ct))
-		{
-			// Daemon is running at our exact version — check if it matches our staged version.
-			var stagedDir = ServiceManifest.GetOrStageDaemon(DaemonManager.Version, verboseLog);
-			if (stagedDir != null)
-			{
-				var expectedHash = DaemonManager.ComputeDirHash(stagedDir);
-				if (await DaemonManager.EnsureDaemonMatchesAsync(daemonAddress, expectedHash, verboseLog))
-				{
-					// Daemon was stopped due to mismatch — start the new one.
-					// The new daemon may listen at a different version's address.
-					if (StartDaemon(log, verboseLog) != 0)
-						return null;
-
-					return await PollForDaemonAsync(daemonAddress, requestedVersion, ct);
-				}
-			}
 			return daemonAddress;
-		}
 
-		// 2. Exact-version probe failed — check manifest for compatible running daemon
-		var compatibleAddresses = ServiceManifest.GetCompatibleDaemonAddresses(requestedVersion);
-		foreach (var candidate in compatibleAddresses)
+		// 2. Exact-version probe failed — check for compatible running daemon
+		//    (enumerate live pipes/sockets, not manifest)
+		var identity = TransportEndpoint.CurrentUserIdentity;
+		var endpoints = TransportEndpoint.EnumerateDaemonEndpoints(identity);
+		foreach (var (version, address) in endpoints)
 		{
-			if (await TransportClient.ProbeAsync(candidate, ct))
+			if (string.Compare(version, requestedVersion, StringComparison.Ordinal) <= 0)
+				continue; // only accept strictly newer
+
+			if (await TransportClient.ProbeAsync(address, ct))
 			{
-				verboseLog?.Invoke($"found compatible daemon at {candidate}");
-				return candidate;
+				verboseLog?.Invoke($"found compatible daemon at {address}");
+				return address;
 			}
 		}
 
 		// 3. No daemon found anywhere — cold start
-		if (StartDaemon(log, verboseLog) != 0)
+		if (DaemonManager.StartDaemon(log, verboseLog) != 0)
 			return null;
 
 		return await PollForDaemonAsync(daemonAddress, requestedVersion, ct);
@@ -83,7 +71,7 @@ public static class DaemonLauncher
 	private static async Task<string?> PollForDaemonAsync(
 		string primaryAddress, string requestedVersion, CancellationToken ct)
 	{
-		var compatibleAddresses = ServiceManifest.GetCompatibleDaemonAddresses(requestedVersion);
+		var identity = TransportEndpoint.CurrentUserIdentity;
 
 		for (int i = 0; i < 20; i++)
 		{
@@ -92,19 +80,16 @@ public static class DaemonLauncher
 			if (await TransportClient.ProbeAsync(primaryAddress, ct))
 				return primaryAddress;
 
-			foreach (var candidate in compatibleAddresses)
+			// Also check compatible higher-version daemons
+			foreach (var (version, address) in TransportEndpoint.EnumerateDaemonEndpoints(identity))
 			{
-				if (await TransportClient.ProbeAsync(candidate, ct))
-					return candidate;
+				if (string.Compare(version, requestedVersion, StringComparison.Ordinal) <= 0)
+					continue;
+				if (await TransportClient.ProbeAsync(address, ct))
+					return address;
 			}
 		}
 
 		return null;
 	}
-
-	/// <summary>
-	/// Start the daemon. Delegates to DaemonManager.StartDaemon.
-	/// </summary>
-	private static int StartDaemon(Action<string>? log, Action<string>? verboseLog = null) =>
-		DaemonManager.StartDaemon(log, verboseLog);
 }

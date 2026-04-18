@@ -34,6 +34,7 @@
 			<_ScriptDlls Include="@(ReferenceCopyLocalPaths)"
 			             Condition="%(Filename) == 'SeaShell.Script' or %(Filename) == 'SeaShell.Common'
 			                     or %(Filename) == 'SeaShell.Protocol' or %(Filename) == 'SeaShell.Invoker'
+			                     or %(Filename) == 'SeaShell.Installer'
 			                     or %(Filename) == 'MessagePack' or %(Filename) == 'MessagePack.Annotations'" />
 		</ItemGroup>
 		<ItemGroup>

@@ -15,6 +15,9 @@
 		<Reference Include="SeaShell.Invoker"
 		           HintPath="$(MSBuildThisFileDirectory)SeaShell.Invoker.dll"
 		           Private="true" />
+		<Reference Include="SeaShell.Installer"
+		           HintPath="$(MSBuildThisFileDirectory)SeaShell.Installer.dll"
+		           Private="true" />
 		<None Include="$(MSBuildThisFileDirectory)MessagePack.dll"
 		      CopyToOutputDirectory="PreserveNewest" Link="MessagePack.dll" />
 		<None Include="$(MSBuildThisFileDirectory)MessagePack.Annotations.dll"

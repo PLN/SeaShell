@@ -110,6 +110,34 @@ public static class TransportEndpoint
 	/// </param>
 	public static IReadOnlyList<(string Version, string Address)> EnumerateDaemonEndpoints(string identity)
 	{
+		var matches = new List<(string Version, string Address)>();
+		foreach (var ep in EnumerateAll())
+		{
+			if (ep.IsElevator) continue;
+			if (!string.Equals(ep.Identity, identity, StringComparison.Ordinal)) continue;
+			matches.Add((ep.Version, ep.Address));
+		}
+		matches.Sort((a, b) =>
+		{
+			var av = System.Version.TryParse(a.Version, out var pa) ? pa : new System.Version(0, 0);
+			var bv = System.Version.TryParse(b.Version, out var pb) ? pb : new System.Version(0, 0);
+			return bv.CompareTo(av);
+		});
+		return matches;
+	}
+
+	/// <summary>
+	/// Enumerate every SeaShell endpoint (daemon and elevator, every identity, every version)
+	/// currently present on the host. Unlike <see cref="EnumerateDaemonEndpoints(string)"/>,
+	/// this does not filter by identity and includes elevator pipes, distinguished by
+	/// <c>IsElevator</c>. Used by <c>seashell status --system</c>.
+	/// Same snapshot caveat: probe each entry before assuming it's reachable.
+	/// </summary>
+	public static IReadOnlyList<(string Version, string Identity, string Address, bool IsElevator)> EnumerateAllSeashellEndpoints() =>
+		EnumerateAll();
+
+	private static List<(string Version, string Identity, string Address, bool IsElevator)> EnumerateAll()
+	{
 		string[] entries;
 		try
 		{
@@ -127,27 +155,16 @@ public static class TransportEndpoint
 		}
 		catch
 		{
-			return Array.Empty<(string, string)>();
+			return new List<(string, string, string, bool)>();
 		}
 
-		var matches = new List<(string Version, string Address)>();
+		var result = new List<(string Version, string Identity, string Address, bool IsElevator)>();
 		foreach (var entry in entries)
 		{
-			if (TryParseDaemonEntry(entry) is not { } parsed) continue;
-			if (!string.Equals(parsed.Identity, identity, StringComparison.Ordinal)) continue;
-			matches.Add((parsed.Version, parsed.Address));
+			if (TryParseAnyEntry(entry) is not { } parsed) continue;
+			result.Add(parsed);
 		}
-
-		// Sort newest-version-first. Unparseable versions sink to the end —
-		// matches the ordering used in ServiceManifest.GetCompatibleDaemonAddresses.
-		matches.Sort((a, b) =>
-		{
-			var av = System.Version.TryParse(a.Version, out var pa) ? pa : new System.Version(0, 0);
-			var bv = System.Version.TryParse(b.Version, out var pb) ? pb : new System.Version(0, 0);
-			return bv.CompareTo(av);
-		});
-
-		return matches;
+		return result;
 	}
 
 	/// <summary>
@@ -165,9 +182,9 @@ public static class TransportEndpoint
 	/// dotted version.
 	/// </para>
 	/// </summary>
-	private static (string Version, string Identity, string Address)? TryParseDaemonEntry(string rawEntry)
+	private static (string Version, string Identity, string Address, bool IsElevator)? TryParseAnyEntry(string rawEntry)
 	{
-		string name;     // parseable basename: "seashell-{version}-{identity}"
+		string name;     // parseable basename: "seashell-{version}-{identity}" or "seashell-elevated-{version}-{identity}"
 		string address;  // value to hand to TransportClient.ConnectAsync
 
 		if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
@@ -175,21 +192,32 @@ public static class TransportEndpoint
 			const string prefix = @"\\.\pipe\";
 			if (!rawEntry.StartsWith(prefix, StringComparison.Ordinal)) return null;
 			name = rawEntry[prefix.Length..];
-			address = name; // Windows client connects by pipe name, not path
+			address = name;
 		}
 		else
 		{
 			var fileName = Path.GetFileName(rawEntry);
 			if (!fileName.EndsWith(".sock", StringComparison.Ordinal)) return null;
 			name = fileName[..^".sock".Length];
-			address = rawEntry; // Linux client connects by full socket path
+			address = rawEntry;
 		}
 
-		// Exclude elevator endpoints — consumers that need those should enumerate separately.
-		if (name.StartsWith("seashell-elevated-", StringComparison.Ordinal)) return null;
-
-		if (!name.StartsWith("seashell-", StringComparison.Ordinal)) return null;
-		var rest = name["seashell-".Length..];
+		bool isElevator;
+		string rest;
+		if (name.StartsWith("seashell-elevated-", StringComparison.Ordinal))
+		{
+			isElevator = true;
+			rest = name["seashell-elevated-".Length..];
+		}
+		else if (name.StartsWith("seashell-", StringComparison.Ordinal))
+		{
+			isElevator = false;
+			rest = name["seashell-".Length..];
+		}
+		else
+		{
+			return null;
+		}
 
 		var lastDash = rest.LastIndexOf('-');
 		if (lastDash <= 0 || lastDash >= rest.Length - 1) return null;
@@ -197,7 +225,7 @@ public static class TransportEndpoint
 		var version = rest[..lastDash];
 		var ident = rest[(lastDash + 1)..];
 
-		return (version, ident, address);
+		return (version, ident, address, isElevator);
 	}
 }
 

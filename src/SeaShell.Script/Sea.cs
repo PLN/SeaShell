@@ -265,18 +265,10 @@ public static class Sea
 
 		IsElevated = CheckElevation();
 
-		// Elevated scripts spawned by the Elevator: attach to the CLI's console
-		// so Console.Title, stdout, stderr all target the correct window.
 		var cliPidStr = Environment.GetEnvironmentVariable("SEASHELL_CLI_PID");
-		if (int.TryParse(cliPidStr, out var cliPid) && cliPid > 0
-			&& RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
-		{
-			FreeConsole();
-			if (!AttachConsole((uint)cliPid))
-				AllocConsole(); // fallback: at least get a console
-		}
+		int.TryParse(cliPidStr, out var cliPid);
 
-		// Create pipe server — the launcher (CLI or Host) connects as client.
+		// 1. Pipe setup FIRST — needed before console relay can be established.
 		var pipeName = Environment.GetEnvironmentVariable("SEASHELL_PIPE");
 		if (!string.IsNullOrEmpty(pipeName))
 		{
@@ -298,7 +290,7 @@ public static class Sea
 					catch { }
 				};
 
-				// Background receive loop for ScriptReload/ScriptStop
+				// Background receive loop for ScriptReload/ScriptStop/ConsoleData/ConsoleControl
 				_receiveThread = new Thread(ReceiveLoop)
 				{
 					IsBackground = true,
@@ -311,6 +303,12 @@ public static class Sea
 				// Pipe connection failed — script runs without launcher communication.
 			}
 		}
+
+		// 2. Elevated scripts spawned by the elevator: relay console I/O through
+		//    the pipe. SEASHELL_CLI_PID is set only on the elevator path — handles
+		//    are not inherited, so we must relay through the pipe to the CLI.
+		if (cliPid > 0 && _channel != null)
+			SeaConsole.EnableRelay(_channel);
 	}
 
 	// ── Receive loop ────────────────────────────────────────────────────
@@ -343,6 +341,17 @@ public static class Sea
 					case MessageType.HostMessage:
 						var hm = (HostMessage)result.Value.Message;
 						try { MessageReceived?.Invoke(hm.Payload, hm.Topic); } catch { }
+						break;
+
+					case MessageType.ConsoleData:
+						var cd = (ConsoleData)result.Value.Message;
+						if (cd.Stream == 2) // stdin response from CLI
+							SeaConsole.DeliverStdinLine(cd.Data);
+						break;
+
+					case MessageType.ConsoleControl:
+						var cc = (ConsoleControl)result.Value.Message;
+						SeaConsole.DeliverControlResponse(cc.Data);
 						break;
 				}
 			}
@@ -474,12 +483,4 @@ public static class Sea
 	[DllImport("libc", EntryPoint = "geteuid", SetLastError = true)]
 	private static extern uint GetEuid();
 
-	[DllImport("kernel32.dll", SetLastError = true)]
-	private static extern bool FreeConsole();
-
-	[DllImport("kernel32.dll", SetLastError = true)]
-	private static extern bool AttachConsole(uint dwProcessId);
-
-	[DllImport("kernel32.dll", SetLastError = true)]
-	private static extern bool AllocConsole();
 }
