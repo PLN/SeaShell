@@ -19,3 +19,4 @@ test/SmokeApp/publish/
 
 # SeaShell temp/cache
 /tmp/
+src/SeaShell.Bootstrapper/archives/
