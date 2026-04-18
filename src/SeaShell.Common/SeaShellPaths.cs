@@ -1,17 +1,20 @@
 using System;
 using System.IO;
 using System.Runtime.InteropServices;
-using System.Security.Principal;
 
 namespace SeaShell;
 
 /// <summary>
 /// Canonical paths for SeaShell runtime data: compilation cache, staged binaries, snippets.
 ///
-/// Per-user by default, system-wide for service accounts. SEASHELL_DATA env var overrides.
+/// Strictly per-user, even under SYSTEM — on Windows we always resolve to
+/// <c>%LocalAppData%</c>, which for SYSTEM is
+/// <c>C:\Windows\System32\config\systemprofile\AppData\Local\</c>. That keeps
+/// a SYSTEM install contained to the SYSTEM user profile rather than the
+/// shared <c>%ProgramData%</c>. SEASHELL_DATA env var overrides.
 ///
 ///   Windows user:    %LOCALAPPDATA%\seashell\
-///   Windows SYSTEM:  %ProgramData%\seashell\
+///   Windows SYSTEM:  %SystemRoot%\System32\config\systemprofile\AppData\Local\seashell\
 ///   Linux user:      $XDG_DATA_HOME/seashell/  (or ~/.local/share/seashell/)
 ///   Linux root:      /var/lib/seashell/
 /// </summary>
@@ -50,9 +53,11 @@ public static class SeaShellPaths
 
 		if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
 		{
-			return IsWindowsSystemAccount()
-				? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData), "seashell")
-				: Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "seashell");
+			// Always LocalAppData — SYSTEM's LocalAppData lives under its own
+			// user profile at %SystemRoot%\System32\config\systemprofile\, so
+			// a SYSTEM install stays contained there. No ProgramData: that's
+			// shared-state territory, which is not what we want.
+			return Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "seashell");
 		}
 
 		// Linux / macOS
@@ -64,27 +69,6 @@ public static class SeaShellPaths
 			return Path.Combine(xdg, "seashell");
 
 		return Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".local", "share", "seashell");
-	}
-
-	[System.Runtime.Versioning.SupportedOSPlatform("windows")]
-	private static bool IsWindowsSystemAccount()
-	{
-		if (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
-			return false;
-
-		try
-		{
-			using var identity = WindowsIdentity.GetCurrent();
-			var sid = identity.User;
-			if (sid == null) return false;
-
-			// S-1-5-18 = SYSTEM, S-1-5-19 = LocalService, S-1-5-20 = NetworkService
-			return sid.Value is "S-1-5-18" or "S-1-5-19" or "S-1-5-20";
-		}
-		catch
-		{
-			return false;
-		}
 	}
 
 	[DllImport("libc", EntryPoint = "geteuid", SetLastError = true)]

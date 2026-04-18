@@ -22,6 +22,7 @@ var version = typeof(Program).Assembly.GetName().Version?.ToString(4) ?? "0.0.0"
 var isWindows = RuntimeInformation.IsOSPlatform(OSPlatform.Windows);
 var systemMode = args.Any(a => a is "--system");
 args = args.Where(a => a is not "--system").ToArray();
+
 var versionDir = SeaShellPaths.VersionDir(version);
 var binDir = SeaShellPaths.BinDir(version);
 
@@ -84,6 +85,20 @@ async Task<int> Install()
 	{
 		Console.Error.WriteLine("  ERROR: --system requires elevation (gsudo on Windows, sudo on Linux).");
 		return 1;
+	}
+
+	// On Windows, --system install runs as SYSTEM via a transient scheduled
+	// task — that's the only way to bind the install to SYSTEM's identity
+	// (pipe naming, LocalAppData resolution) rather than qd's. The helper
+	// handles staging, polling, cleanup.
+	if (systemMode && isWindows)
+	{
+		Console.WriteLine($"{{~}} SeaShell Installer v{version} (system)");
+		Console.WriteLine();
+		return await SeaShell.Bootstrapper.SystemOps.InstallAsync(
+			version,
+			msg => Console.WriteLine(msg),
+			msg => Console.Error.WriteLine(msg));
 	}
 
 	using var installLock = InstallLock.TryAcquire();
@@ -199,9 +214,26 @@ async Task<int> Install()
 		return 1;
 	}
 
-	// 9. Register scheduled tasks (Windows only, skip for --system)
+	// 9. Register scheduled tasks (Windows only)
 	Action<string> taskLog = msg => Console.WriteLine($"  {msg}");
-	if (isWindows && !systemMode)
+	var runningAsSystem = isWindows && IsSystemAccount();
+	if (isWindows && runningAsSystem)
+	{
+		Console.WriteLine("  Registering daemon (SYSTEM, boot trigger)...");
+		DaemonTasks.InstallSystemDaemon(taskLog);
+
+		// Event Log source (SYSTEM can always register).
+		try
+		{
+			if (!System.Diagnostics.EventLog.SourceExists("SeaShell"))
+			{
+				System.Diagnostics.EventLog.CreateEventSource("SeaShell", "Application");
+				Console.WriteLine("  Registered Event Log source: SeaShell");
+			}
+		}
+		catch { }
+	}
+	else if (isWindows)
 	{
 		Console.WriteLine("  Registering daemon...");
 		DaemonTasks.InstallDaemon(taskLog);
@@ -229,8 +261,8 @@ async Task<int> Install()
 		}
 	}
 
-	// 10. File associations (Windows, skip for --system)
-	if (isWindows && !systemMode)
+	// 10. File associations — user-context only. SYSTEM's HKCU isn't useful.
+	if (isWindows && !runningAsSystem)
 	{
 		Console.WriteLine("  Registering file associations...");
 		FileAssoc.Associate(".cs", seaPath, taskLog);
@@ -246,7 +278,7 @@ async Task<int> Install()
 	//     junction points where we expect, sea binary reports our version,
 	//     scheduled tasks and file associations wired up correctly.
 	Console.WriteLine();
-	if (!VerifyInstallation(seaPath))
+	if (!VerifyInstallation(seaPath, runningAsSystem))
 		return 1;
 
 	Console.WriteLine();
@@ -256,7 +288,7 @@ async Task<int> Install()
 
 // ── Verification ───────────────────────────────────────────────────
 
-bool VerifyInstallation(string seaPath)
+bool VerifyInstallation(string seaPath, bool runningAsSystem)
 {
 	Console.WriteLine("  Verifying installation...");
 	var ok = true;
@@ -289,7 +321,17 @@ bool VerifyInstallation(string seaPath)
 		ok = false;
 	}
 
-	if (isWindows && !systemMode)
+	if (isWindows && runningAsSystem)
+	{
+		var sysDaemonState = DaemonTasks.QuerySystemDaemonTaskState();
+		if (sysDaemonState != null)
+			Console.WriteLine($"    daemon task (SYSTEM) → OK ({sysDaemonState})");
+		else
+			Console.Error.WriteLine("    daemon task (SYSTEM) → FAIL (not registered)");
+		ok &= sysDaemonState != null;
+		// No elevator and no file associations under SYSTEM — nothing else to check.
+	}
+	else if (isWindows)
 	{
 		var daemonState = DaemonTasks.QueryDaemonTaskState();
 		if (daemonState != null)
@@ -483,6 +525,16 @@ async Task<int> Uninstall()
 		return 1;
 	}
 
+	// See Install: --system uninstall also runs as SYSTEM (pipe DACLs require it).
+	if (systemMode && isWindows)
+	{
+		Console.WriteLine($"{{~}} SeaShell Uninstaller (system)");
+		Console.WriteLine();
+		return await SeaShell.Bootstrapper.SystemOps.UninstallAsync(
+			msg => Console.WriteLine(msg),
+			msg => Console.Error.WriteLine(msg));
+	}
+
 	using var installLock = InstallLock.TryAcquire();
 	if (installLock == null)
 	{
@@ -668,6 +720,18 @@ async Task CleanupOldVersionsAsync()
 
 async Task<int> Status()
 {
+	// --system status: ask SYSTEM. Pipe DACLs block cross-user probes, so
+	// the local qd can't sensibly query SYSTEM's daemon — dispatch via the
+	// transient task helper.
+	if (systemMode && isWindows)
+	{
+		Console.WriteLine("{~} SeaShell (system)");
+		Console.WriteLine();
+		return await SeaShell.Bootstrapper.SystemOps.StatusAsync(
+			msg => Console.WriteLine(msg),
+			msg => Console.Error.WriteLine(msg));
+	}
+
 	Console.WriteLine($"{{~}} SeaShell{(systemMode ? " (system)" : "")}");
 	Console.WriteLine();
 
@@ -936,6 +1000,19 @@ bool IsElevated()
 		using var identity = System.Security.Principal.WindowsIdentity.GetCurrent();
 		var principal = new System.Security.Principal.WindowsPrincipal(identity);
 		return principal.IsInRole(System.Security.Principal.WindowsBuiltInRole.Administrator);
+	}
+	catch { return false; }
+}
+
+bool IsSystemAccount()
+{
+	if (!isWindows) return false;
+	try
+	{
+		using var identity = System.Security.Principal.WindowsIdentity.GetCurrent();
+		// S-1-5-18 = LocalSystem. LocalService/NetworkService are S-1-5-19/20 —
+		// we're intentionally NOT treating those as "SYSTEM" for the install flow.
+		return identity.User?.Value == "S-1-5-18";
 	}
 	catch { return false; }
 }
