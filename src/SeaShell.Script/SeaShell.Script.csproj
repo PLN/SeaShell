@@ -10,4 +10,7 @@
 	<ItemGroup>
 		<ProjectReference Include="..\SeaShell.Common\SeaShell.Common.csproj" />
 	</ItemGroup>
+	<ItemGroup>
+		<InternalsVisibleTo Include="EngineTest" />
+	</ItemGroup>
 </Project>

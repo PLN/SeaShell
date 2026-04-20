@@ -124,6 +124,7 @@ async Task<int> Install()
 	{
 		StripWindowsPathEntries(new[] { Path.Combine(SeaShellPaths.DataDir, "bin") });
 	}
+	LegacyCommonInstallCleanup();
 
 	// 3. Create version directory structure
 	Directory.CreateDirectory(binDir);
@@ -206,6 +207,14 @@ async Task<int> Install()
 
 	// 8. Add to PATH (User environment, using junction path)
 	AddToPath();
+
+	// 8b. Refresh baked-in paths in user-scheduled tasks / crontab entries so
+	//     schedules created under a prior layout keep pointing at the current
+	//     install. Skip for SYSTEM — it doesn't own user-scoped schedules.
+	if (isWindows && !IsSystemAccount())
+		TaskPathRefresher.RefreshWindows(msg => Console.WriteLine($"  {msg}"));
+	else if (!isWindows)
+		TaskPathRefresher.RefreshLinux(msg => Console.WriteLine($"  {msg}"));
 
 	var seaPath = Path.Combine(binDir, isWindows ? "sea.exe" : "sea");
 	if (!File.Exists(seaPath))
@@ -978,18 +987,103 @@ void RemoveFromPath()
 }
 
 void StripWindowsPathEntries(string[] unwanted)
+	=> StripWindowsPathEntriesWhere(EnvironmentVariableTarget.User,
+		p => unwanted.Any(u => p.Equals(u, StringComparison.OrdinalIgnoreCase)));
+
+void StripWindowsPathEntriesWhere(EnvironmentVariableTarget target, Func<string, bool> isUnwanted)
 {
-	var target = EnvironmentVariableTarget.User;
-	var existingPath = Environment.GetEnvironmentVariable("PATH", target) ?? "";
-	var parts = existingPath.Split(';')
-		.Where(p => !unwanted.Any(u => p.Equals(u, StringComparison.OrdinalIgnoreCase)))
-		.ToArray();
+	string existingPath;
+	try { existingPath = Environment.GetEnvironmentVariable("PATH", target) ?? ""; }
+	catch (System.Security.SecurityException)
+	{
+		Console.WriteLine($"  PATH ({target}): access denied, skipping");
+		return;
+	}
+
+	var parts = existingPath.Split(';').Where(p => !isUnwanted(p)).ToArray();
 	var newPath = string.Join(';', parts);
-	if (newPath != existingPath)
+	if (newPath == existingPath) return;
+
+	try
 	{
 		Environment.SetEnvironmentVariable("PATH", newPath, target);
-		Console.WriteLine("  Removed stale PATH entries");
+		Console.WriteLine($"  Removed stale PATH entries ({target})");
 	}
+	catch (System.Security.SecurityException)
+	{
+		Console.WriteLine($"  PATH ({target}): write denied, skipping");
+	}
+}
+
+// Remove leftover pre-0.5.0 common-install state: C:\ProgramData\seashell on
+// Windows, /etc/profile.d/seashell.sh on Linux. PATH entries are scrubbed
+// from user scope always; from machine scope only when elevated. The on-disk
+// directory/file is removed only when we can — otherwise just log.
+void LegacyCommonInstallCleanup()
+{
+	if (isWindows)
+	{
+		StripWindowsPathEntriesWhere(EnvironmentVariableTarget.User, IsUnderProgramDataSeashell);
+		var legacyDir = Path.Combine(
+			Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData),
+			"seashell");
+
+		if (IsElevated())
+		{
+			StripWindowsPathEntriesWhere(EnvironmentVariableTarget.Machine, IsUnderProgramDataSeashell);
+			if (Directory.Exists(legacyDir))
+			{
+				try
+				{
+					Directory.Delete(legacyDir, recursive: true);
+					Console.WriteLine($"  Removed legacy installation: {legacyDir}");
+				}
+				catch (Exception ex)
+				{
+					Console.WriteLine($"  Warning: could not remove {legacyDir}: {ex.Message}");
+				}
+			}
+		}
+		else if (Directory.Exists(legacyDir))
+		{
+			Console.WriteLine($"  NOTE: {legacyDir} still exists; re-run elevated to remove.");
+		}
+	}
+	else
+	{
+		const string sysProfile = "/etc/profile.d/seashell.sh";
+		if (!File.Exists(sysProfile)) return;
+		if (IsElevatedOrRoot())
+		{
+			try
+			{
+				File.Delete(sysProfile);
+				Console.WriteLine($"  Removed legacy: {sysProfile}");
+			}
+			catch (Exception ex)
+			{
+				Console.WriteLine($"  Warning: could not remove {sysProfile}: {ex.Message}");
+			}
+		}
+		else
+		{
+			Console.WriteLine($"  NOTE: {sysProfile} exists; re-run with sudo to remove.");
+		}
+	}
+}
+
+static bool IsUnderProgramDataSeashell(string pathEntry)
+{
+	if (string.IsNullOrWhiteSpace(pathEntry)) return false;
+	string expanded;
+	try { expanded = Environment.ExpandEnvironmentVariables(pathEntry); }
+	catch { expanded = pathEntry; }
+	var programData = Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData);
+	if (string.IsNullOrEmpty(programData)) return false;
+	var root = Path.Combine(programData, "seashell");
+	var trimmed = expanded.TrimEnd('\\', '/');
+	return trimmed.Equals(root, StringComparison.OrdinalIgnoreCase)
+		|| trimmed.StartsWith(root + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase);
 }
 
 bool IsElevated()

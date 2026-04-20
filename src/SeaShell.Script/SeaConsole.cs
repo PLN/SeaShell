@@ -70,6 +70,13 @@ public static class SeaConsole
 		_relayOut = new RelayTextWriter(channel, 0);
 		_relayErr = new RelayTextWriter(channel, 1);
 		_relayIn  = new RelayTextReader(channel);
+
+		// Also redirect System.Console so pre-compiled libraries (Serilog,
+		// M.E.L.Console, etc.) are relayed — the `global using Console = SeaConsole`
+		// alias is source-level and doesn't reach library IL.
+		System.Console.SetOut(_relayOut);
+		System.Console.SetError(_relayErr);
+		System.Console.SetIn(_relayIn);
 	}
 
 	/// <summary>Deliver a response from the CLI (called by Sea.ReceiveLoop).</summary>
