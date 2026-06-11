@@ -76,9 +76,14 @@ public static class TransportEndpoint
 		return Path.Combine(runtimeDir, $"{name}.sock");
 	}
 
-	/// <summary>The identity string for the current user.</summary>
+	/// <summary>
+	/// The identity token for the current user: lowercase SID on Windows, uid on
+	/// Unix (see <see cref="SeaShellIdentity"/>). Canonical and locale-independent —
+	/// in particular, stable under LocalSystem where <see cref="Environment.UserName"/>
+	/// returns <c>{MachineName}$</c> on .NET 10.
+	/// </summary>
 	public static string CurrentUserIdentity =>
-		Environment.UserName.ToLowerInvariant();
+		SeaShellIdentity.Current.Token;
 
 	/// <summary>4-part version of the Protocol assembly, used as the side-by-side key.
 	/// Includes the build number so each pipeline build gets its own daemon instance —
@@ -170,16 +175,15 @@ public static class TransportEndpoint
 	/// <summary>
 	/// Parse an enumerated entry (a pipe path on Windows, a socket file path on
 	/// Linux) into (version, identity, address). Returns null for entries that
-	/// don't match the <c>seashell-{version}-{identity}</c> shape — elevator
-	/// pipes, internal handshake pipes with GUID-shaped names, etc.
+	/// don't match the <c>seashell-{version}-{identity}</c> shape — script pipes
+	/// with GUID-shaped names, attach pipes, etc.
 	/// <para>
-	/// The identity string is whatever follows the LAST hyphen in the base name.
-	/// This handles identities with special characters like <c>$</c> (e.g. the
-	/// <c>{MachineName}$</c> form that .NET 10 <see cref="Environment.UserName"/>
-	/// returns under LocalSystem), but would break for an identity that itself
-	/// contains a hyphen. No such identity exists in any known SeaShell
-	/// deployment; if one turns up, switch to a regex anchored on a 4-part
-	/// dotted version.
+	/// The version is everything up to the FIRST hyphen (versions are dotted and
+	/// never contain hyphens, and must parse as <see cref="System.Version"/>);
+	/// the identity token is the remainder. This handles identity tokens that
+	/// themselves contain hyphens — SID strings like <c>s-1-5-18</c> — and parses
+	/// pre-0.6.0 username-based names identically, since those contain no hyphen
+	/// after the version either.
 	/// </para>
 	/// </summary>
 	private static (string Version, string Identity, string Address, bool IsElevator)? TryParseAnyEntry(string rawEntry)
@@ -219,11 +223,16 @@ public static class TransportEndpoint
 			return null;
 		}
 
-		var lastDash = rest.LastIndexOf('-');
-		if (lastDash <= 0 || lastDash >= rest.Length - 1) return null;
+		var firstDash = rest.IndexOf('-');
+		if (firstDash <= 0 || firstDash >= rest.Length - 1) return null;
 
-		var version = rest[..lastDash];
-		var ident = rest[(lastDash + 1)..];
+		var version = rest[..firstDash];
+		var ident = rest[(firstDash + 1)..];
+
+		// A real daemon/elevator entry always carries a dotted version. This
+		// filters GUID-named script pipes ("seashell-{guid}") and attach pipes
+		// ("seashell-attach-{hash}") that share the prefix.
+		if (!System.Version.TryParse(version, out _)) return null;
 
 		return (version, ident, address, isElevator);
 	}
@@ -294,6 +303,15 @@ public sealed class TransportServer : IAsyncDisposable
 		security.AddAccessRule(new PipeAccessRule(
 			WindowsIdentity.GetCurrent().User!,
 			PipeAccessRights.FullControl,
+			AccessControlType.Allow));
+		// Administrators get ReadWrite so an elevated installer can ping/stop
+		// daemons of other identities gracefully — most importantly SYSTEM's
+		// daemon during `seashell install --system`. Non-elevated members of
+		// the Administrators group carry a deny-only group SID, so this grants
+		// nothing without elevation.
+		security.AddAccessRule(new PipeAccessRule(
+			new SecurityIdentifier(WellKnownSidType.BuiltinAdministratorsSid, null),
+			PipeAccessRights.ReadWrite,
 			AccessControlType.Allow));
 		return security;
 	}

@@ -14,6 +14,7 @@ namespace SeaShell.Invoker;
 public sealed class ScriptMutex : IDisposable
 {
 	private Mutex? _winMutex;
+	private Mutex? _winLegacyMutex;
 	private FileStream? _lockFile;
 
 	private ScriptMutex() { }
@@ -43,29 +44,52 @@ public sealed class ScriptMutex : IDisposable
 	{
 		// Windows kernel object naming: only Global\ and Local\ are valid prefix
 		// separators. After the prefix, the name must be a flat string (no backslashes).
+		// User scope is Global\ + SID token: cross-session (one instance per user
+		// regardless of RDP/console session) and stable under LocalSystem.
 		var name = scope switch
 		{
 			DirectiveScanner.MutexScope.Session =>
 				$"Local\\SeaShell_{identity}_s{Process.GetCurrentProcess().SessionId}",
 			DirectiveScanner.MutexScope.User =>
-				$"SeaShell_{identity}_u{Environment.UserName.ToLowerInvariant()}",
+				$"Global\\SeaShell_{identity}_u{SeaShellIdentity.Current.Token}",
 			DirectiveScanner.MutexScope.System =>
 				$"Global\\SeaShell_{identity}",
 			_ => throw new ArgumentException($"Invalid mutex scope: {scope}")
 		};
 
+		Mutex? legacy = null;
 		try
 		{
+			if (scope == DirectiveScanner.MutexScope.User)
+			{
+				// Transition shim — remove in 0.7: pre-0.6.0 versions name the
+				// user-scope mutex by Environment.UserName, unprefixed (session-local
+				// namespace). Hold BOTH names so old and new versions exclude each
+				// other while both are installed. Acquire order is fixed
+				// (legacy first) in every version, so concurrent starters can't
+				// deadlock by acquiring in opposite orders.
+				legacy = new Mutex(false,
+					$"SeaShell_{identity}_u{Environment.UserName.ToLowerInvariant()}",
+					out var legacyNew);
+				if (!legacyNew)
+				{
+					legacy.Dispose();
+					return null;
+				}
+			}
+
 			var mutex = new Mutex(false, name, out var createdNew);
 			if (!createdNew)
 			{
 				mutex.Dispose();
+				legacy?.Dispose();
 				return null;
 			}
-			return new ScriptMutex { _winMutex = mutex };
+			return new ScriptMutex { _winMutex = mutex, _winLegacyMutex = legacy };
 		}
 		catch (Exception ex)
 		{
+			legacy?.Dispose();
 			log?.Invoke($"mutex acquire failed: {ex.Message}");
 			return null;
 		}
@@ -123,6 +147,13 @@ public sealed class ScriptMutex : IDisposable
 			try { _winMutex.ReleaseMutex(); } catch { }
 			_winMutex.Dispose();
 			_winMutex = null;
+		}
+
+		if (_winLegacyMutex != null)
+		{
+			try { _winLegacyMutex.ReleaseMutex(); } catch { }
+			_winLegacyMutex.Dispose();
+			_winLegacyMutex = null;
 		}
 
 		if (_lockFile != null)

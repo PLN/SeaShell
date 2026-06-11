@@ -19,13 +19,13 @@ public static class JunctionHelper
 	public static void CreateOrUpdate(string junctionPath, string targetPath)
 	{
 		// Remove existing junction/symlink (not a recursive directory delete —
-		// just the reparse point / symlink entry itself).
+		// just the reparse point / symlink entry itself). Also handles orphaned
+		// links whose target no longer exists.
 		if (IsJunction(junctionPath))
 		{
-			if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
-				Directory.Delete(junctionPath, false);
-			else
-				Directory.Delete(junctionPath, false);
+			try { Directory.Delete(junctionPath, false); }
+			catch (DirectoryNotFoundException) { }
+			catch (IOException) { File.Delete(junctionPath); } // dangling symlink on Unix
 		}
 		else if (Directory.Exists(junctionPath))
 		{
@@ -42,17 +42,19 @@ public static class JunctionHelper
 	}
 
 	/// <summary>
-	/// Read the target of a junction/symlink. Returns null if the path is not a junction
-	/// or does not exist.
+	/// Read the target of a junction/symlink. Returns null if the path is not a junction,
+	/// does not exist, or points at a target that no longer exists — an orphaned link
+	/// reads as "no current version" so discovery falls back instead of trusting it.
 	/// </summary>
 	public static string? ReadTarget(string path)
 	{
 		try
 		{
-			var info = new DirectoryInfo(path);
-			if (!info.Exists) return null;
-			var target = info.ResolveLinkTarget(returnFinalTarget: false);
-			return target?.FullName;
+			var target = new DirectoryInfo(path).LinkTarget;
+			if (target == null) return null;
+			// LinkTarget may be relative to the link's directory.
+			var resolved = Path.GetFullPath(target, Path.GetDirectoryName(Path.GetFullPath(path)) ?? target);
+			return Directory.Exists(resolved) ? resolved : null;
 		}
 		catch
 		{
@@ -62,15 +64,14 @@ public static class JunctionHelper
 
 	/// <summary>
 	/// Check whether the path is a junction (Windows) or symlink (Linux).
-	/// Returns false if the path does not exist.
+	/// Returns false if the path does not exist. True even when the link's
+	/// target is gone — the entry itself is what's being asked about.
 	/// </summary>
 	public static bool IsJunction(string path)
 	{
 		try
 		{
-			var info = new DirectoryInfo(path);
-			if (!info.Exists) return false;
-			return info.Attributes.HasFlag(FileAttributes.ReparsePoint);
+			return new DirectoryInfo(path).LinkTarget != null;
 		}
 		catch
 		{

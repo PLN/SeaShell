@@ -18,11 +18,11 @@ public class SystemInstallTaskXmlTests
 	private static readonly MethodInfo BuildTaskXml = DaemonTasks.GetMethod(
 		"BuildTaskXml", BindingFlags.NonPublic | BindingFlags.Static)!;
 
-	private static string Build(string principal, string trigger, string runLevel, string desc = "test")
+	private static string Build(string principal, string trigger, string runLevel, string desc = "test", string? userSid = null)
 	{
 		var p = Enum.Parse(TaskPrincipal, principal);
 		var t = Enum.Parse(TaskTrigger, trigger);
-		return (string)BuildTaskXml.Invoke(null, new object?[] { "cmd.exe", null, p, t, runLevel, desc })!;
+		return (string)BuildTaskXml.Invoke(null, new object?[] { "cmd.exe", null, p, t, runLevel, desc, userSid })!;
 	}
 
 	private static XDocument Parse(string xml) => XDocument.Parse(xml);
@@ -62,22 +62,36 @@ public class SystemInstallTaskXmlTests
 	}
 
 	[Fact]
-	public void CurrentUser_Principal_UsesInteractiveToken()
+	public void CurrentUser_Principal_UsesInteractiveTokenAndExplicitSid()
+	{
+		var doc = Parse(Build("CurrentUser", "Logon", "LeastPrivilege",
+			userSid: "S-1-5-21-1111111111-2222222222-3333333333-1001"));
+		var principal = doc.Descendants(Ns + "Principal").Single();
+
+		Assert.Equal("InteractiveToken", principal.Element(Ns + "LogonType")!.Value);
+		Assert.Equal("S-1-5-21-1111111111-2222222222-3333333333-1001",
+			principal.Element(Ns + "UserId")!.Value);
+	}
+
+	[Fact]
+	public void CurrentUser_LogonTrigger_BindsSameSidAsPrincipal()
+	{
+		var doc = Parse(Build("CurrentUser", "Logon", "LeastPrivilege",
+			userSid: "S-1-5-21-1111111111-2222222222-3333333333-1001"));
+		var logon = doc.Descendants(Ns + "LogonTrigger").Single();
+
+		Assert.Equal("S-1-5-21-1111111111-2222222222-3333333333-1001",
+			logon.Element(Ns + "UserId")!.Value);
+	}
+
+	[Fact]
+	public void CurrentUser_WithoutExplicitSid_FallsBackToAmbientToken()
 	{
 		var doc = Parse(Build("CurrentUser", "Logon", "LeastPrivilege"));
 		var principal = doc.Descendants(Ns + "Principal").Single();
 
-		Assert.Equal("InteractiveToken", principal.Element(Ns + "LogonType")!.Value);
-		Assert.Contains(Environment.UserName, principal.Element(Ns + "UserId")!.Value);
-	}
-
-	[Fact]
-	public void CurrentUser_LogonTrigger_BindsUserId()
-	{
-		var doc = Parse(Build("CurrentUser", "Logon", "LeastPrivilege"));
-		var logon = doc.Descendants(Ns + "LogonTrigger").Single();
-
-		Assert.Contains(Environment.UserName, logon.Element(Ns + "UserId")!.Value);
+		Assert.Equal(SeaShell.SeaShellIdentity.Current.Token.ToUpperInvariant(),
+			principal.Element(Ns + "UserId")!.Value);
 	}
 
 	[Fact]

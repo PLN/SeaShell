@@ -55,7 +55,7 @@ plus a bootstrapper for installation:
 
 | Project | Role |
 |---|---|
-| **SeaShell.Bootstrapper** | Dotnet tool (`seashell` command). Extracts per-RID archives, registers daemon/elevator tasks, manages PATH and file associations. `--system` flag for system-wide installs. `schedule`/`unschedule` for Task Scheduler script management. |
+| **SeaShell.Bootstrapper** | Dotnet tool (`seashell` command). Extracts per-RID archives, registers daemon/elevator tasks, manages PATH and file associations. `--system` installs for the LocalSystem target directly from an elevated console (no SYSTEM-context execution); `--all` does user + elevator + SYSTEM behind one UAC prompt. `schedule`/`unschedule` for Task Scheduler script management. |
 | **SeaShell.Cli** | CLI entry point (sea.exe / seaw.exe). Argument parsing, REPL client, exit delay, file association. Thin wrapper around Invoker. |
 | **SeaShell.Invoker** | Shared execution engine. `ScriptInvoker` (compile, execute, watch, reload, restart, mutex, attach, elevate), `DaemonLauncher`, `DaemonManager`, `ScheduledTasks`, `DirectiveScanner`, `ScriptMutex`. Used by CLI, Host, and ServiceHost. |
 | **SeaShell.Daemon** | Compilation server. Listens for `RunRequest`, compiles via Engine, returns artifact paths. Holds Elevator connection. Runs `ScriptWatcher` for hot-swap. |
@@ -297,8 +297,12 @@ before contacting the daemon. `ScriptMutex.TryAcquire()` is called pre-compilati
 | Scope | Windows | Linux |
 |---|---|---|
 | System | `Global\SeaShell_{identity}` (named kernel mutex) | flock in `/tmp/` |
-| User | `SeaShell_{identity}_u{username}` (named kernel mutex) | flock in `~/.local/share/seashell/` |
+| User | `Global\SeaShell_{identity}_u{sid}` (named kernel mutex) | flock in `~/.local/share/seashell/` |
 | Session | `Local\SeaShell_{identity}_s{sessionId}` (named kernel mutex) | flock in `$XDG_RUNTIME_DIR/` |
+
+User scope additionally holds the pre-0.6.0 name (`SeaShell_{identity}_u{username}`,
+session-local namespace) during the 0.6.x transition so mixed versions exclude
+each other; the shim is removed in 0.7.
 
 The identity is an FNV-1a hash of the normalized script path, so the same script always
 gets the same mutex name regardless of how it's invoked (relative vs absolute path).
@@ -307,6 +311,28 @@ When `//sea_mutex_attach` is active, the running instance starts an `AttachServe
 pipe `seashell-attach-{identity}`. Blocked callers connect instead of exiting. The
 `Sea.Attached` event fires for each client with an `AttachContext` that provides the
 caller's args, working directory, and bidirectional `Send`/`Receive`/`Close` methods.
+
+## Identity
+
+All identity-derived values (pipe/socket names, data directories, task
+principals, lock names) are computed from `SeaShellIdentity`, never from
+ambient `Environment.UserName` — whose value is unpredictable under
+LocalSystem (`{MachineName}$` on .NET 10) and locale-dependent for well-known
+accounts. The canonical token is the lowercase SID string on Windows
+(`s-1-5-18` for SYSTEM) and the numeric uid on Unix.
+
+The key property: a target identity is computable from a different security
+context. `SeaShellIdentity.LocalSystem` gives an elevated administrator every
+value of a SYSTEM install (well-known SID, `systemprofile` data dir) without
+any code running as SYSTEM — which is what lets `seashell install --system`
+run directly in the elevated bootstrapper.
+
+Endpoint names are `seashell-{version}-{token}`; the version is everything up
+to the first hyphen (versions never contain one), the token is the remainder,
+so SID tokens with hyphens parse cleanly and pre-0.6.0 username-based names
+parse identically. `SeaShellIdentity.LegacyToken` preserves the pre-0.6.0
+username form so installers still recognize (and stop) old daemons during
+migration.
 
 ## Version Matching
 
@@ -338,7 +364,7 @@ When spawning the daemon, `DaemonManager` prevents handle inheritance through tw
 | Daemon transport | Named pipes | Unix domain sockets |
 | Script pipe | Named pipes (async) | Named pipes (async) |
 | Attach pipe | Named pipes | Named pipes |
-| Pipe permissions | ACL (current user SID) | File mode 0600 |
+| Pipe permissions | ACL (current user SID + Administrators RW) | File mode 0600 |
 | Mutex | Named kernel mutex (Global/Local) | flock |
 | Elevation | Elevator via Task Scheduler | Ignored (`//sea_elevate` is a no-op) |
 | Window mode | seaw.exe (WinExe subsystem) | N/A |

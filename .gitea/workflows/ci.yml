@@ -982,7 +982,8 @@ jobs:
 
         run: |
           XDG_DIR="${XDG_RUNTIME_DIR:-/tmp}"
-          IDENTITY=$(whoami | tr '[:upper:]' '[:lower:]')
+          # 0.6.0+: the identity token in socket names is the uid, not the username
+          IDENTITY=$(id -u)
           SOCKET=$(ls "$XDG_DIR"/seashell-*-"$IDENTITY".sock 2>/dev/null | head -1)
 
           if [ -z "$SOCKET" ]; then

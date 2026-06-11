@@ -35,13 +35,32 @@ public static class SeaShellPaths
 	// ── Version-specific paths ─────────────────────────────────────────
 
 	/// <summary>Per-version root directory: <c>DataDir/v{version}/</c></summary>
-	public static string VersionDir(string version) => Path.Combine(DataDir, $"v{version}");
+	public static string VersionDir(string version) => VersionDirIn(DataDir, version);
 
 	/// <summary>Binaries directory for a specific version.</summary>
-	public static string BinDir(string version) => Path.Combine(VersionDir(version), "bin");
+	public static string BinDir(string version) => BinDirIn(DataDir, version);
 
 	/// <summary>Compiled script cache for a specific version.</summary>
-	public static string CacheDir(string version) => Path.Combine(VersionDir(version), "cache");
+	public static string CacheDir(string version) => CacheDirIn(DataDir, version);
+
+	// ── Target-rooted variants ─────────────────────────────────────────
+	// Same layout under an explicit data dir — used by the installer when the
+	// target identity (e.g. SeaShellIdentity.LocalSystem) is not the ambient one.
+
+	/// <summary>Junction/symlink to the active version under an explicit data dir.</summary>
+	public static string CurrentDirIn(string dataDir) => Path.Combine(dataDir, "current");
+
+	/// <summary>Bin directory under the <c>current</c> junction of an explicit data dir.</summary>
+	public static string CurrentBinDirIn(string dataDir) => Path.Combine(CurrentDirIn(dataDir), "bin");
+
+	/// <summary>Per-version root under an explicit data dir.</summary>
+	public static string VersionDirIn(string dataDir, string version) => Path.Combine(dataDir, $"v{version}");
+
+	/// <summary>Binaries directory under an explicit data dir.</summary>
+	public static string BinDirIn(string dataDir, string version) => Path.Combine(VersionDirIn(dataDir, version), "bin");
+
+	/// <summary>Compiled script cache under an explicit data dir.</summary>
+	public static string CacheDirIn(string dataDir, string version) => Path.Combine(VersionDirIn(dataDir, version), "cache");
 
 
 	private static string ResolveDataDir()

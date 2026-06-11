@@ -34,10 +34,11 @@ public static class DaemonLauncher
 		// 2. Exact-version probe failed — check for compatible running daemon
 		//    (enumerate live pipes/sockets, not manifest)
 		var identity = TransportEndpoint.CurrentUserIdentity;
+		var requested = Version.Parse(requestedVersion);
 		var endpoints = TransportEndpoint.EnumerateDaemonEndpoints(identity);
 		foreach (var (version, address) in endpoints)
 		{
-			if (string.Compare(version, requestedVersion, StringComparison.Ordinal) <= 0)
+			if (!Version.TryParse(version, out var v) || v <= requested)
 				continue; // only accept strictly newer
 
 			if (await TransportClient.ProbeAsync(address, ct))
@@ -72,6 +73,7 @@ public static class DaemonLauncher
 		string primaryAddress, string requestedVersion, CancellationToken ct)
 	{
 		var identity = TransportEndpoint.CurrentUserIdentity;
+		var requested = Version.Parse(requestedVersion);
 
 		for (int i = 0; i < 20; i++)
 		{
@@ -83,7 +85,7 @@ public static class DaemonLauncher
 			// Also check compatible higher-version daemons
 			foreach (var (version, address) in TransportEndpoint.EnumerateDaemonEndpoints(identity))
 			{
-				if (string.Compare(version, requestedVersion, StringComparison.Ordinal) <= 0)
+				if (!Version.TryParse(version, out var v) || v <= requested)
 					continue;
 				if (await TransportClient.ProbeAsync(address, ct))
 					return address;

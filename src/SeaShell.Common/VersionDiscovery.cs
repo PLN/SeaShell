@@ -16,14 +16,30 @@ public static class VersionDiscovery
 	/// Enumerate all installed version directories, sorted newest-first.
 	/// Each entry contains the parsed <see cref="Version"/> and the full directory path.
 	/// </summary>
-	public static IReadOnlyList<(Version Version, string Directory)> EnumerateVersions()
+	public static IReadOnlyList<(Version Version, string Directory)> EnumerateVersions() =>
+		EnumerateVersions(SeaShellPaths.DataDir);
+
+	/// <summary>
+	/// Enumerate installed versions under an explicit data dir (e.g. a target
+	/// identity's). Returns empty on access denied rather than throwing — a
+	/// non-elevated caller probing SYSTEM's data dir just sees nothing.
+	/// </summary>
+	public static IReadOnlyList<(Version Version, string Directory)> EnumerateVersions(string dataDir)
 	{
-		var dataDir = SeaShellPaths.DataDir;
-		if (!Directory.Exists(dataDir))
+		string[] dirs;
+		try
+		{
+			if (!Directory.Exists(dataDir))
+				return Array.Empty<(Version, string)>();
+			dirs = Directory.GetDirectories(dataDir, "v*");
+		}
+		catch
+		{
 			return Array.Empty<(Version, string)>();
+		}
 
 		var results = new List<(Version Version, string Directory)>();
-		foreach (var dir in Directory.GetDirectories(dataDir, "v*"))
+		foreach (var dir in dirs)
 		{
 			var dirName = Path.GetFileName(dir);
 			if (ParseVersionDir(dirName) is { } ver)
@@ -59,9 +75,12 @@ public static class VersionDiscovery
 	/// Get the version that the <c>current</c> junction points to.
 	/// Returns null if the junction doesn't exist or its target isn't a valid version dir.
 	/// </summary>
-	public static Version? GetCurrentVersion()
+	public static Version? GetCurrentVersion() => GetCurrentVersion(SeaShellPaths.DataDir);
+
+	/// <summary>Same, under an explicit data dir.</summary>
+	public static Version? GetCurrentVersion(string dataDir)
 	{
-		var target = JunctionHelper.ReadTarget(SeaShellPaths.CurrentDir);
+		var target = JunctionHelper.ReadTarget(SeaShellPaths.CurrentDirIn(dataDir));
 		if (target == null) return null;
 		return ParseVersionDir(Path.GetFileName(target));
 	}

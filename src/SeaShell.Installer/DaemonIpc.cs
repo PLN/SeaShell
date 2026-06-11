@@ -30,8 +30,10 @@ public static class DaemonIpc
 		}
 	}
 
-	/// <summary>Send StopRequest to the daemon. Returns true if the daemon acknowledged.</summary>
-	public static async Task<bool> StopAsync(string address, int timeoutMs = 2000)
+	/// <summary>Send StopRequest to the daemon. Returns true if the daemon acknowledged.
+	/// Default timeout is generous: a daemon mid-compilation needs a moment to wind
+	/// down gracefully, and escalating to task-end/hard-kill is far more disruptive.</summary>
+	public static async Task<bool> StopAsync(string address, int timeoutMs = 10_000)
 	{
 		try
 		{

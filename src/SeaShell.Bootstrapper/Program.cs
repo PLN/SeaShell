@@ -21,10 +21,59 @@ using SeaShell.Protocol;
 var version = typeof(Program).Assembly.GetName().Version?.ToString(4) ?? "0.0.0";
 var isWindows = RuntimeInformation.IsOSPlatform(OSPlatform.Windows);
 var systemMode = args.Any(a => a is "--system");
-args = args.Where(a => a is not "--system").ToArray();
+var allMode = args.Any(a => a is "--all");
 
-var versionDir = SeaShellPaths.VersionDir(version);
-var binDir = SeaShellPaths.BinDir(version);
+// --log-file / --invoker-sid: internal plumbing for the self-elevated relaunch
+// of `install --all`. The elevated child tees its console output to the log
+// file (the parent tails it live into the original console) and compares the
+// invoker SID to detect over-the-shoulder UAC with a different account.
+string? logFile = null, invokerSid = null;
+{
+	var filtered = new List<string>();
+	for (var i = 0; i < args.Length; i++)
+	{
+		switch (args[i])
+		{
+			case "--system" or "--all": continue;
+			case "--log-file" when i + 1 < args.Length: logFile = args[++i]; continue;
+			case "--invoker-sid" when i + 1 < args.Length: invokerSid = args[++i]; continue;
+			default: filtered.Add(args[i]); continue;
+		}
+	}
+	args = filtered.ToArray();
+}
+
+if (logFile != null)
+{
+	var teeStream = new StreamWriter(File.Open(logFile, FileMode.Create, FileAccess.Write, FileShare.ReadWrite | FileShare.Delete))
+	{
+		AutoFlush = true,
+	};
+	Console.SetOut(new TeeWriter(Console.Out, teeStream));
+	Console.SetError(new TeeWriter(Console.Error, teeStream));
+}
+
+// The install TARGET. On Windows, --system targets LocalSystem: every
+// identity-derived value (data dir, task principal, lock name) is computed
+// for S-1-5-18 and the elevated bootstrapper operates on it directly — no
+// SYSTEM-context execution needed. On Linux, --system is just "run as root",
+// so the ambient identity is already the target.
+// Mutable: `install --all` runs the install flow twice (user, then SYSTEM)
+// by retargeting between passes — the local functions close over these.
+var target = systemMode && isWindows ? SeaShellIdentity.LocalSystem : SeaShellIdentity.Current;
+var systemTarget = isWindows && target.IsSystem;
+var dataDir = target.DataDir;
+var versionDir = SeaShellPaths.VersionDirIn(dataDir, version);
+var binDir = SeaShellPaths.BinDirIn(dataDir, version);
+
+void SetTarget(SeaShellIdentity t)
+{
+	target = t;
+	systemTarget = isWindows && t.IsSystem;
+	dataDir = t.DataDir;
+	versionDir = SeaShellPaths.VersionDirIn(dataDir, version);
+	binDir = SeaShellPaths.BinDirIn(dataDir, version);
+}
 
 if (args.Length == 0)
 	return await Status();
@@ -34,11 +83,12 @@ if (args[0] is "--help" or "-h")
 	Console.WriteLine($"{{~}} SeaShell v{version}");
 	Console.WriteLine();
 	Console.WriteLine("Usage: seashell              Show installation status");
-	Console.WriteLine("       seashell status --system  Show system-wide installation status");
-	Console.WriteLine("       seashell install      Install or update SeaShell");
-	Console.WriteLine("       seashell install --system  System-wide install (requires elevation)");
+	Console.WriteLine("       seashell status --system  Show SYSTEM installation status");
+	Console.WriteLine("       seashell install      Install or update SeaShell (current user)");
+	Console.WriteLine("       seashell install --all     User + elevator + SYSTEM in one pass (one UAC prompt)");
+	Console.WriteLine("       seashell install --system  SYSTEM-only install (requires elevation)");
 	Console.WriteLine("       seashell uninstall    Remove SeaShell binaries and PATH entry");
-	Console.WriteLine("       seashell uninstall --system  Remove system-wide install");
+	Console.WriteLine("       seashell uninstall --system  Remove SYSTEM install");
 	Console.WriteLine("       seashell start        Start daemon and elevator");
 	Console.WriteLine("       seashell stop         Stop daemon and elevator");
 	Console.WriteLine("       seashell schedule <script.cs> <timing...>");
@@ -51,6 +101,8 @@ switch (args[0].ToLowerInvariant())
 {
 	case "install":
 	case "update":
+		if (allMode && isWindows)
+			return await InstallAll(args[0].ToLowerInvariant());
 		return await Install();
 
 	case "uninstall":
@@ -87,21 +139,9 @@ async Task<int> Install()
 		return 1;
 	}
 
-	// On Windows, --system install runs as SYSTEM via a transient scheduled
-	// task — that's the only way to bind the install to SYSTEM's identity
-	// (pipe naming, LocalAppData resolution) rather than qd's. The helper
-	// handles staging, polling, cleanup.
-	if (systemMode && isWindows)
-	{
-		Console.WriteLine($"{{~}} SeaShell Installer v{version} (system)");
-		Console.WriteLine();
-		return await SeaShell.Bootstrapper.SystemOps.InstallAsync(
-			version,
-			msg => Console.WriteLine(msg),
-			msg => Console.Error.WriteLine(msg));
-	}
-
-	using var installLock = InstallLock.TryAcquire();
+	// Lock is scoped to the TARGET identity — two elevated admins racing a
+	// --system install contend on the same lock.
+	using var installLock = InstallLock.TryAcquire(target);
 	if (installLock == null)
 	{
 		Console.Error.WriteLine("seashell: another install or uninstall is in progress");
@@ -113,22 +153,30 @@ async Task<int> Install()
 
 	// 1. Platform info
 	Console.WriteLine($"  Platform:  {GetCurrentRid()}");
+	Console.WriteLine($"  Target:    {target.DisplayName}");
 	Console.WriteLine($"  Version:   {versionDir}");
 
 	// 2. Stop running daemons/elevators and wipe any pre-0.5.0 flat-layout state.
 	//    Running daemons first so rename-then-delete in the sweep below isn't
 	//    blocked by held handles on Windows.
 	await StopExistingInstancesAsync();
-	LegacyCleanup.SweepFilesystem(SeaShellPaths.DataDir, msg => Console.WriteLine($"  {msg}"));
-	if (isWindows)
+	LegacyCleanup.SweepFilesystem(dataDir, msg => Console.WriteLine($"  {msg}"));
+	if (systemTarget)
 	{
-		StripWindowsPathEntries(new[] { Path.Combine(SeaShellPaths.DataDir, "bin") });
+		// Pre-0.6.0 --system installs ran `dotnet tool install` under SYSTEM's
+		// profile via a transient task; remove that footprint.
+		LegacyCleanup.SweepLegacySystemArtifacts(msg => Console.WriteLine($"  {msg}"));
 	}
-	LegacyCommonInstallCleanup();
+	else if (isWindows)
+	{
+		StripWindowsPathEntries(new[] { Path.Combine(dataDir, "bin") });
+	}
+	if (!systemTarget)
+		LegacyCommonInstallCleanup();
 
 	// 3. Create version directory structure
 	Directory.CreateDirectory(binDir);
-	Directory.CreateDirectory(SeaShellPaths.CacheDir(version));
+	Directory.CreateDirectory(SeaShellPaths.CacheDirIn(dataDir, version));
 	Console.WriteLine($"  Created version directory");
 
 	// 4. Find and extract the matching archive into bin/
@@ -193,11 +241,11 @@ async Task<int> Install()
 	Console.WriteLine($"  elevator.path: {(MarkerFile.Exists(versionDir, MarkerFile.ElevatorPath) ? "ok" : "not found")}");
 
 	// 7. Update `current` junction (create if missing, update if newer)
-	var currentVersion = VersionDiscovery.GetCurrentVersion();
+	var currentVersion = VersionDiscovery.GetCurrentVersion(dataDir);
 	var myVersion = System.Version.TryParse(version, out var mv) ? mv : null;
 	if (currentVersion == null || (myVersion != null && myVersion >= currentVersion))
 	{
-		JunctionHelper.CreateOrUpdate(SeaShellPaths.CurrentDir, versionDir);
+		JunctionHelper.CreateOrUpdate(SeaShellPaths.CurrentDirIn(dataDir), versionDir);
 		Console.WriteLine($"  current -> v{version}");
 	}
 	else
@@ -205,13 +253,16 @@ async Task<int> Install()
 		Console.WriteLine($"  current -> v{currentVersion} (newer, kept)");
 	}
 
-	// 8. Add to PATH (User environment, using junction path)
-	AddToPath();
+	// 8. Add to PATH (User environment, using junction path). Skipped for the
+	//    SYSTEM target — that would edit the invoking admin's HKCU, not SYSTEM's,
+	//    and SYSTEM consumers find binaries via markers, not PATH.
+	if (!systemTarget)
+		AddToPath();
 
 	// 8b. Refresh baked-in paths in user-scheduled tasks / crontab entries so
 	//     schedules created under a prior layout keep pointing at the current
 	//     install. Skip for SYSTEM — it doesn't own user-scoped schedules.
-	if (isWindows && !IsSystemAccount())
+	if (isWindows && !systemTarget)
 		TaskPathRefresher.RefreshWindows(msg => Console.WriteLine($"  {msg}"));
 	else if (!isWindows)
 		TaskPathRefresher.RefreshLinux(msg => Console.WriteLine($"  {msg}"));
@@ -225,13 +276,12 @@ async Task<int> Install()
 
 	// 9. Register scheduled tasks (Windows only)
 	Action<string> taskLog = msg => Console.WriteLine($"  {msg}");
-	var runningAsSystem = isWindows && IsSystemAccount();
-	if (isWindows && runningAsSystem)
+	if (systemTarget)
 	{
 		Console.WriteLine("  Registering daemon (SYSTEM, boot trigger)...");
-		DaemonTasks.InstallSystemDaemon(taskLog);
+		DaemonTasks.InstallSystemDaemon(target, taskLog);
 
-		// Event Log source (SYSTEM can always register).
+		// Event Log source (we're elevated; SYSTEM context can too).
 		try
 		{
 			if (!System.Diagnostics.EventLog.SourceExists("SeaShell"))
@@ -241,16 +291,22 @@ async Task<int> Install()
 			}
 		}
 		catch { }
+
+		// Boot trigger only covers the next reboot — start the daemon now so
+		// the install is immediately usable (and verifiable below).
+		Console.WriteLine(DaemonTasks.TryRunSystemDaemonTask()
+			? "  Starting daemon (SYSTEM)..."
+			: "  WARNING: could not start the SYSTEM daemon task");
 	}
 	else if (isWindows)
 	{
 		Console.WriteLine("  Registering daemon...");
-		DaemonTasks.InstallDaemon(taskLog);
+		DaemonTasks.InstallDaemon(target, taskLog);
 
 		if (IsElevated())
 		{
 			Console.WriteLine("  Registering elevator (elevated)...");
-			DaemonTasks.InstallElevator(taskLog);
+			DaemonTasks.InstallElevator(target, taskLog);
 
 			// Register Event Log source (requires elevation)
 			try
@@ -271,7 +327,7 @@ async Task<int> Install()
 	}
 
 	// 10. File associations — user-context only. SYSTEM's HKCU isn't useful.
-	if (isWindows && !runningAsSystem)
+	if (isWindows && !systemTarget)
 	{
 		Console.WriteLine("  Registering file associations...");
 		FileAssoc.Associate(".cs", seaPath, taskLog);
@@ -285,9 +341,12 @@ async Task<int> Install()
 
 	// 12. End-to-end verification — marker contents resolve to real files,
 	//     junction points where we expect, sea binary reports our version,
-	//     scheduled tasks and file associations wired up correctly.
+	//     scheduled tasks and file associations wired up correctly. For the
+	//     SYSTEM target this includes waiting for the just-started daemon to
+	//     come up and answer a ping (the daemon writes its pid/pipe markers
+	//     under its own identity — self-reporting doubles as verification).
 	Console.WriteLine();
-	if (!VerifyInstallation(seaPath, runningAsSystem))
+	if (!await VerifyInstallationAsync(seaPath))
 		return 1;
 
 	Console.WriteLine();
@@ -295,9 +354,155 @@ async Task<int> Install()
 	return 0;
 }
 
+// ── install --all: user + elevator + SYSTEM, one elevation ─────────
+
+// Composite install behind a single UAC prompt. Non-elevated invocations
+// relaunch themselves elevated and stream the child's output back into the
+// original console via a tailed log file.
+async Task<int> InstallAll(string commandName)
+{
+	if (!IsElevated())
+		return await RelaunchElevatedAsync(commandName);
+
+	// Over-the-shoulder UAC check: if the elevated account differs from the
+	// invoker, the user-profile parts would land in the wrong profile.
+	var skipUserParts = invokerSid != null
+		&& !string.Equals(invokerSid, SeaShellIdentity.Current.Token, StringComparison.OrdinalIgnoreCase);
+	if (skipUserParts)
+	{
+		Console.WriteLine($"  NOTE: elevated as a different account than the invoker ({invokerSid}).");
+		Console.WriteLine("        Installing SYSTEM only. For the user-profile install, run");
+		Console.WriteLine("        'seashell install' as that user (elevated, for the elevator task).");
+	}
+
+	var rc = 0;
+	if (!skipUserParts)
+	{
+		SetTarget(SeaShellIdentity.Current);
+		rc = await Install();
+		if (rc != 0) return rc;
+
+		// We're elevated and both tasks are registered — bring the whole chain
+		// up now: daemon first, then the elevator (it connects TO the daemon,
+		// retrying every 3s, so order only affects latency).
+		Console.WriteLine();
+		Console.WriteLine("  Starting daemon...");
+		if (!DaemonTasks.TryRunDaemonTask())
+			Console.WriteLine("  WARNING: could not start the daemon task");
+		else if (await VerifyDaemonLiveAsync("daemon"))
+		{
+			Console.WriteLine("  Starting elevator...");
+			if (!DaemonTasks.TryRunElevatorTask())
+				Console.WriteLine("  WARNING: could not start the elevator task");
+			else
+				await VerifyElevatorRegisteredAsync();
+		}
+	}
+
+	Console.WriteLine();
+	SetTarget(SeaShellIdentity.LocalSystem);
+	var rcSystem = await Install();
+	return rc != 0 ? rc : rcSystem;
+}
+
+async Task<int> RelaunchElevatedAsync(string commandName)
+{
+	var exe = Environment.ProcessPath;
+	if (exe == null)
+	{
+		Console.Error.WriteLine("seashell: cannot determine own executable path for elevation.");
+		return 1;
+	}
+
+	var childLog = Path.Combine(Path.GetTempPath(), $"seashell-install-{Guid.NewGuid():N}.log");
+	var psi = new ProcessStartInfo
+	{
+		FileName = exe,
+		UseShellExecute = true,        // required for the UAC verb
+		Verb = "runas",
+		WindowStyle = ProcessWindowStyle.Hidden,
+	};
+	psi.ArgumentList.Add(commandName);
+	psi.ArgumentList.Add("--all");
+	psi.ArgumentList.Add("--log-file");
+	psi.ArgumentList.Add(childLog);
+	psi.ArgumentList.Add("--invoker-sid");
+	psi.ArgumentList.Add(SeaShellIdentity.Current.Token);
+
+	Console.WriteLine("  Requesting elevation (UAC prompt)...");
+	Process child;
+	try
+	{
+		child = Process.Start(psi)!;
+	}
+	catch (System.ComponentModel.Win32Exception)
+	{
+		Console.Error.WriteLine("  ERROR: elevation was declined.");
+		return 1;
+	}
+
+	await TailLogUntilExitAsync(childLog, child);
+	return child.ExitCode;
+}
+
+// Stream a log file the elevated child is appending to into this console,
+// until the child exits; then drain the remainder and clean up.
+async Task TailLogUntilExitAsync(string logPath, Process child)
+{
+	long position = 0;
+
+	async Task DrainAsync()
+	{
+		if (!File.Exists(logPath)) return;
+		try
+		{
+			using var fs = new FileStream(logPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+			if (fs.Length <= position) return;
+			fs.Position = position;
+			using var reader = new StreamReader(fs);
+			var chunk = await reader.ReadToEndAsync();
+			position = fs.Length;
+			Console.Write(chunk);
+		}
+		catch (IOException) { } // file mid-create; retry next tick
+	}
+
+	while (!child.HasExited)
+	{
+		await DrainAsync();
+		await Task.Delay(200);
+	}
+	await child.WaitForExitAsync(); // settle ExitCode
+	await DrainAsync();
+	try { File.Delete(logPath); } catch { }
+}
+
+// After starting the elevator task: the elevator connects to the daemon and
+// registers; the daemon then reports its version in PingResponse — one check
+// proving daemon up + elevator up + handshake complete.
+async Task<bool> VerifyElevatorRegisteredAsync()
+{
+	for (var i = 0; i < 30; i++)
+	{
+		var pipe = MarkerFile.Read(versionDir, MarkerFile.DaemonPipe);
+		if (!string.IsNullOrEmpty(pipe))
+		{
+			var ping = await DaemonIpc.PingAsync(pipe, timeoutMs: 1000);
+			if (ping?.ElevatorVersion != null)
+			{
+				Console.WriteLine($"    elevator → OK (v{ping.ElevatorVersion}, registered with daemon)");
+				return true;
+			}
+		}
+		await Task.Delay(500);
+	}
+	Console.WriteLine("    elevator → WARNING (did not register with the daemon within 15s)");
+	return false;
+}
+
 // ── Verification ───────────────────────────────────────────────────
 
-bool VerifyInstallation(string seaPath, bool runningAsSystem)
+async Task<bool> VerifyInstallationAsync(string seaPath)
 {
 	Console.WriteLine("  Verifying installation...");
 	var ok = true;
@@ -305,7 +510,7 @@ bool VerifyInstallation(string seaPath, bool runningAsSystem)
 	ok &= VerifyMarkerPointsToExistingFile(MarkerFile.DaemonPath, "daemon.path");
 	ok &= VerifyMarkerPointsToExistingFile(MarkerFile.ElevatorPath, "elevator.path");
 
-	var junctionTarget = JunctionHelper.ReadTarget(SeaShellPaths.CurrentDir);
+	var junctionTarget = JunctionHelper.ReadTarget(SeaShellPaths.CurrentDirIn(dataDir));
 	if (junctionTarget != null &&
 	    string.Equals(Path.GetFullPath(junctionTarget).TrimEnd(Path.DirectorySeparatorChar),
 	                  Path.GetFullPath(versionDir).TrimEnd(Path.DirectorySeparatorChar),
@@ -330,7 +535,7 @@ bool VerifyInstallation(string seaPath, bool runningAsSystem)
 		ok = false;
 	}
 
-	if (isWindows && runningAsSystem)
+	if (systemTarget)
 	{
 		var sysDaemonState = DaemonTasks.QuerySystemDaemonTaskState();
 		if (sysDaemonState != null)
@@ -338,6 +543,12 @@ bool VerifyInstallation(string seaPath, bool runningAsSystem)
 		else
 			Console.Error.WriteLine("    daemon task (SYSTEM) → FAIL (not registered)");
 		ok &= sysDaemonState != null;
+
+		// The daemon was started above; wait for it to come up and answer.
+		// It writes daemon.pid/daemon.pipe under its own (SYSTEM) identity at
+		// startup, and the pipe ACL admits Administrators — so an elevated
+		// installer can confirm the full chain end-to-end.
+		ok &= await VerifyDaemonLiveAsync("daemon (SYSTEM)");
 		// No elevator and no file associations under SYSTEM — nothing else to check.
 	}
 	else if (isWindows)
@@ -382,6 +593,29 @@ bool VerifyMarkerPointsToExistingFile(string marker, string label)
 		return true;
 	}
 	Console.Error.WriteLine($"    {label} → FAIL (marker: {path ?? "<missing>"})");
+	return false;
+}
+
+// Wait for the freshly-started daemon of THIS version to write its pipe
+// marker and answer a ping. ~15s budget: marker polling is cheap; a ping
+// against a stale pipe (same-version reinstall) fails fast and retries.
+async Task<bool> VerifyDaemonLiveAsync(string label)
+{
+	for (var i = 0; i < 30; i++)
+	{
+		var pipe = MarkerFile.Read(versionDir, MarkerFile.DaemonPipe);
+		if (!string.IsNullOrEmpty(pipe))
+		{
+			var ping = await DaemonIpc.PingAsync(pipe, timeoutMs: 1000);
+			if (ping != null && ping.Version == version)
+			{
+				Console.WriteLine($"    {label} → OK (pid {ping.Pid}, v{ping.Version})");
+				return true;
+			}
+		}
+		await Task.Delay(500);
+	}
+	Console.Error.WriteLine($"    {label} → FAIL (daemon did not come up within 15s)");
 	return false;
 }
 
@@ -534,17 +768,7 @@ async Task<int> Uninstall()
 		return 1;
 	}
 
-	// See Install: --system uninstall also runs as SYSTEM (pipe DACLs require it).
-	if (systemMode && isWindows)
-	{
-		Console.WriteLine($"{{~}} SeaShell Uninstaller (system)");
-		Console.WriteLine();
-		return await SeaShell.Bootstrapper.SystemOps.UninstallAsync(
-			msg => Console.WriteLine(msg),
-			msg => Console.Error.WriteLine(msg));
-	}
-
-	using var installLock = InstallLock.TryAcquire();
+	using var installLock = InstallLock.TryAcquire(target);
 	if (installLock == null)
 	{
 		Console.Error.WriteLine("seashell: another install or uninstall is in progress");
@@ -558,24 +782,28 @@ async Task<int> Uninstall()
 
 	// Wipe any pre-0.5.0 flat-layout state so the final Directory.Delete
 	// below on an empty DataDir actually succeeds.
-	LegacyCleanup.SweepFilesystem(SeaShellPaths.DataDir, msg => Console.WriteLine($"  {msg}"));
+	LegacyCleanup.SweepFilesystem(dataDir, msg => Console.WriteLine($"  {msg}"));
+	if (systemTarget)
+		LegacyCleanup.SweepLegacySystemArtifacts(msg => Console.WriteLine($"  {msg}"));
 
-	// Remove file associations (Windows, skip for --system)
-	if (isWindows && !systemMode)
+	// Remove file associations and PATH entry — user-context concerns; the
+	// SYSTEM target never had either.
+	if (isWindows && !systemTarget)
 	{
 		FileAssoc.Unassociate(".cs", msg => Console.WriteLine($"  {msg}"));
 		FileAssoc.Unassociate(".csw", msg => Console.WriteLine($"  {msg}"));
 	}
+	if (!systemTarget)
+		RemoveFromPath();
 
-	// Remove from PATH
-	RemoveFromPath();
-
-	// Remove scheduled tasks belonging to this user, across all installed versions.
-	// First via markers (precise), then sweep the \SeaShell\ folder for orphans
-	// (covers tasks left behind by a crashed prior uninstall).
-	if (isWindows && !systemMode)
+	// Remove scheduled tasks belonging to the target identity, across all
+	// installed versions. First via markers (precise), then sweep the
+	// \SeaShell\ folder for orphans (covers tasks left behind by a crashed
+	// prior uninstall). The "({DisplayName})" prefix matches pre-0.6.0 task
+	// names too, including "(SYSTEM)".
+	if (isWindows)
 	{
-		foreach (var (ver, dir) in VersionDiscovery.EnumerateVersions())
+		foreach (var (ver, dir) in VersionDiscovery.EnumerateVersions(dataDir))
 		{
 			foreach (var marker in new[] { MarkerFile.DaemonTask, MarkerFile.ElevatorTask })
 			{
@@ -585,7 +813,7 @@ async Task<int> Uninstall()
 			}
 		}
 
-		var userPrefix = $"({Environment.UserName})";
+		var targetPrefix = $"({target.DisplayName})";
 		foreach (var path in TaskQuery.EnumerateFolder().ToList())
 		{
 			var name = path.StartsWith(TaskQuery.Folder, StringComparison.Ordinal)
@@ -594,7 +822,7 @@ async Task<int> Uninstall()
 			var isSeaShell = name.StartsWith("SeaShell Daemon ", StringComparison.OrdinalIgnoreCase)
 				|| name.StartsWith("SeaShell Elevator ", StringComparison.OrdinalIgnoreCase);
 			if (!isSeaShell) continue;
-			if (!name.Contains(userPrefix, StringComparison.Ordinal)) continue;
+			if (!name.Contains(targetPrefix, StringComparison.Ordinal)) continue;
 
 			if (TaskQuery.Delete(path))
 				Console.WriteLine($"  Removed orphan task: {name}");
@@ -602,16 +830,15 @@ async Task<int> Uninstall()
 	}
 
 	// Remove current junction
-	if (JunctionHelper.IsJunction(SeaShellPaths.CurrentDir))
+	if (JunctionHelper.IsJunction(SeaShellPaths.CurrentDirIn(dataDir)))
 	{
-		try { Directory.Delete(SeaShellPaths.CurrentDir, false); }
+		try { Directory.Delete(SeaShellPaths.CurrentDirIn(dataDir), false); }
 		catch { }
 		Console.WriteLine("  Removed current junction");
 	}
 
 	// Remove all version directories
-	var dataDir = SeaShellPaths.DataDir;
-	foreach (var (ver, dir) in VersionDiscovery.EnumerateVersions())
+	foreach (var (ver, dir) in VersionDiscovery.EnumerateVersions(dataDir))
 	{
 		Console.WriteLine($"  Removing v{ver}...");
 		try { Directory.Delete(dir, true); }
@@ -619,7 +846,7 @@ async Task<int> Uninstall()
 	}
 
 	// Remove shared dirs
-	var snippetsDir = SeaShellPaths.SnippetsDir;
+	var snippetsDir = Path.Combine(dataDir, "snippets");
 	if (Directory.Exists(snippetsDir))
 	{
 		try { Directory.Delete(snippetsDir, true); } catch { }
@@ -633,7 +860,8 @@ async Task<int> Uninstall()
 	}
 
 	Console.WriteLine("  {~} Uninstalled.");
-	Console.WriteLine("  Run 'dotnet tool uninstall -g SeaShell' to remove the bootstrapper.");
+	if (!systemTarget)
+		Console.WriteLine("  Run 'dotnet tool uninstall -g SeaShell' to remove the bootstrapper.");
 	return 0;
 }
 
@@ -645,7 +873,7 @@ async Task CleanupOldVersionsAsync()
 	if (myVersion == null) return;
 
 	var uninstallable = new List<(System.Version ver, string dir)>();
-	foreach (var (ver, dir) in VersionDiscovery.EnumerateVersions())
+	foreach (var (ver, dir) in VersionDiscovery.EnumerateVersions(dataDir))
 	{
 		if (ver >= myVersion) continue; // never touch newer or current
 		uninstallable.Add((ver, dir));
@@ -729,17 +957,8 @@ async Task CleanupOldVersionsAsync()
 
 async Task<int> Status()
 {
-	// --system status: ask SYSTEM. Pipe DACLs block cross-user probes, so
-	// the local qd can't sensibly query SYSTEM's daemon — dispatch via the
-	// transient task helper.
 	if (systemMode && isWindows)
-	{
-		Console.WriteLine("{~} SeaShell (system)");
-		Console.WriteLine();
-		return await SeaShell.Bootstrapper.SystemOps.StatusAsync(
-			msg => Console.WriteLine(msg),
-			msg => Console.Error.WriteLine(msg));
-	}
+		return await SystemStatus();
 
 	Console.WriteLine($"{{~}} SeaShell{(systemMode ? " (system)" : "")}");
 	Console.WriteLine();
@@ -771,48 +990,20 @@ async Task<int> Status()
 
 	if (installed)
 	{
-		if (systemMode && isWindows)
+		var statusOutput = RunProcess(seaPath!, "--status").Trim();
+		if (!string.IsNullOrEmpty(statusOutput))
 		{
-			var currentUser = Environment.UserName.ToLowerInvariant();
-			var foundDaemons = new List<(string ident, string ver, string state)>();
-			var foundElevators = new List<(string ident, string ver, string state)>();
-			var anyAclBlocked = false;
-
-			foreach (var ep in TransportEndpoint.EnumerateAllSeashellEndpoints())
+			var daemonRunning = statusOutput.Contains(", up ");
+			foreach (var line in statusOutput.Split('\n'))
 			{
-				if (ep.Identity == currentUser) continue;
-				var state = ProbeSystemPipe(ep.Address);
-				if (state.Contains("ACL", StringComparison.Ordinal)) anyAclBlocked = true;
-				(ep.IsElevator ? foundElevators : foundDaemons).Add((ep.Identity, ep.Version, state));
+				var trimmed = line.Trim();
+				if (trimmed.Length > 0) Console.WriteLine($"  {trimmed}");
 			}
 
-			if (foundDaemons.Count == 0) Console.WriteLine("  daemon       not running");
-			else foreach (var (ident, ver, state) in foundDaemons)
-				Console.WriteLine($"  daemon       v{ver} ({ident}) — {state}");
-
-			if (foundElevators.Count == 0) Console.WriteLine("  elevator     not running");
-			else foreach (var (ident, ver, state) in foundElevators)
-				Console.WriteLine($"  elevator     v{ver} ({ident}) — {state}");
-
-			if (anyAclBlocked) Console.WriteLine("  (re-run under gsudo for full details)");
-		}
-		else
-		{
-			var statusOutput = RunProcess(seaPath!, "--status").Trim();
-			if (!string.IsNullOrEmpty(statusOutput))
+			if (!daemonRunning && isWindows)
 			{
-				var daemonRunning = statusOutput.Contains(", up ");
-				foreach (var line in statusOutput.Split('\n'))
-				{
-					var trimmed = line.Trim();
-					if (trimmed.Length > 0) Console.WriteLine($"  {trimmed}");
-				}
-
-				if (!daemonRunning && isWindows)
-				{
-					var elevState = DaemonTasks.QueryElevatorTaskState();
-					if (elevState != null) Console.WriteLine($"  elevator: task {elevState.ToLowerInvariant()}");
-				}
+				var elevState = DaemonTasks.QueryElevatorTaskState();
+				if (elevState != null) Console.WriteLine($"  elevator: task {elevState.ToLowerInvariant()}");
 			}
 		}
 	}
@@ -849,6 +1040,84 @@ async Task<int> Status()
 	return 0;
 }
 
+// Status view for the SYSTEM install, runnable from any user context.
+// Filesystem and ping details need elevation (systemprofile ACLs, pipe ACE);
+// without it the view degrades to task state + pipe presence probing.
+async Task<int> SystemStatus()
+{
+	Console.WriteLine("{~} SeaShell (system)");
+	Console.WriteLine();
+
+	var sys = SeaShellIdentity.LocalSystem;
+	var elevated = IsElevated();
+
+	var versions = VersionDiscovery.EnumerateVersions(sys.DataDir);
+	var current = VersionDiscovery.GetCurrentVersion(sys.DataDir);
+	if (versions.Count > 0)
+	{
+		Console.WriteLine($"  Installed    v{current?.ToString() ?? versions[0].Version.ToString()}");
+		foreach (var (ver, dir) in versions)
+		{
+			var isCurrent = current != null && ver == current ? " *" : "";
+			var daemon = MarkerFile.Exists(dir, MarkerFile.DaemonPath) ? "daemon: ok" : "daemon: -";
+			Console.WriteLine($"    v{ver}{isCurrent}  {daemon}");
+		}
+	}
+	else
+	{
+		Console.WriteLine(elevated
+			? "  Installed    no"
+			: "  Installed    unknown (run elevated for filesystem details)");
+	}
+
+	// Prefix search so a SYSTEM daemon task from any version shows up. Tasks
+	// registered with a SYSTEM principal aren't readable without elevation,
+	// so absence only means "not registered" when we could actually look.
+	var taskPath = TaskQuery.FindByPrefix("SeaShell Daemon (SYSTEM)");
+	if (taskPath != null)
+		Console.WriteLine($"  daemon task  {TaskQuery.QueryState(taskPath) ?? "unknown"} ({taskPath[(taskPath.LastIndexOf('\\') + 1)..]})");
+	else
+		Console.WriteLine(elevated ? "  daemon task  not registered" : "  daemon task  unknown (run elevated)");
+
+	// Live daemon: prefer a real ping via the pipe marker (works elevated on
+	// 0.6.0+ daemons thanks to the Administrators ACE), fall back to raw pipe
+	// probing of every non-self endpoint.
+	var pinged = false;
+	if (elevated && current != null)
+	{
+		var pipe = MarkerFile.Read(SeaShellPaths.VersionDirIn(sys.DataDir, current.ToString()), MarkerFile.DaemonPipe);
+		if (!string.IsNullOrEmpty(pipe))
+		{
+			var ping = await DaemonIpc.PingAsync(pipe);
+			if (ping != null)
+			{
+				Console.WriteLine($"  daemon       v{ping.Version}, pid {ping.Pid}, up {TimeSpan.FromSeconds(ping.UptimeSeconds):g}, {ping.ActiveScripts} active");
+				pinged = true;
+			}
+		}
+	}
+
+	if (!pinged)
+	{
+		var self = SeaShellIdentity.Current;
+		var found = 0;
+		var anyAclBlocked = false;
+		foreach (var ep in TransportEndpoint.EnumerateAllSeashellEndpoints())
+		{
+			if (self.Matches(ep.Identity)) continue;
+			var state = ProbeSystemPipe(ep.Address);
+			if (state.Contains("ACL", StringComparison.Ordinal)) anyAclBlocked = true;
+			var kind = ep.IsElevator ? "elevator" : "daemon";
+			Console.WriteLine($"  {kind,-12} v{ep.Version} ({ep.Identity}) — {state}");
+			found++;
+		}
+		if (found == 0) Console.WriteLine("  daemon       not running");
+		if (anyAclBlocked) Console.WriteLine("  (re-run under gsudo for full details)");
+	}
+
+	return 0;
+}
+
 // ── Helpers ─────────────────────────────────────────────────────────
 
 string? FindSeaExe()
@@ -876,24 +1145,27 @@ string GetCurrentRid()
 
 async Task StopExistingInstancesAsync()
 {
-	var currentUser = TransportEndpoint.CurrentUserIdentity;
-
-	// 1. Graceful stop via IPC on every live SeaShell pipe for the current
-	//    user (covers any version — legacy or new — that still holds a pipe).
+	// 1. Graceful stop via IPC on every live SeaShell pipe for the TARGET
+	//    identity (covers any version — legacy or new — that still holds a
+	//    pipe). Matches both the SID token and the pre-0.6.0 username token,
+	//    so upgrading over an old install stops its daemons too. For the
+	//    SYSTEM target this works against 0.6.0+ daemons (Administrators ACE
+	//    on the pipe); older SYSTEM daemons fall through to steps 2/3.
 	foreach (var ep in TransportEndpoint.EnumerateAllSeashellEndpoints())
 	{
 		if (ep.IsElevator) continue; // elevator accepts spawn requests, not StopRequest
-		if (!string.Equals(ep.Identity, currentUser, StringComparison.Ordinal)) continue;
+		if (!target.Matches(ep.Identity)) continue;
 		await DaemonIpc.StopAsync(ep.Address);
 	}
 
 	// 2. Ask Task Scheduler to end any registered daemon/elevator tasks for
-	//    this user (catches task-scheduler-launched daemons that aren't
+	//    the target (catches task-scheduler-launched daemons that aren't
 	//    currently holding the IPC pipe open, and elevators where IPC stop
-	//    isn't the right signal).
+	//    isn't the right signal). "({DisplayName})" matches pre-0.6.0 names
+	//    too, including "(SYSTEM)".
 	if (isWindows)
 	{
-		var userPrefix = $"({Environment.UserName})";
+		var targetPrefix = $"({target.DisplayName})";
 		foreach (var path in TaskQuery.EnumerateFolder().ToList())
 		{
 			var name = path.StartsWith(TaskQuery.Folder, StringComparison.Ordinal)
@@ -901,31 +1173,56 @@ async Task StopExistingInstancesAsync()
 				: Path.GetFileName(path);
 			var isSea = name.StartsWith("SeaShell Daemon ", StringComparison.OrdinalIgnoreCase)
 				|| name.StartsWith("SeaShell Elevator ", StringComparison.OrdinalIgnoreCase);
-			if (!isSea || !name.Contains(userPrefix, StringComparison.Ordinal)) continue;
+			if (!isSea || !name.Contains(targetPrefix, StringComparison.Ordinal)) continue;
 			TaskQuery.End(path);
 		}
 	}
 
-	// 3. Hard kill by process name — absolute fallback for hung daemons
-	//    that ignore IPC and whose task isn't registered.
-	if (isWindows)
+	// 3. Kill by pid markers — daemons/elevators of the target whose task is
+	//    gone and who ignore IPC. The markers live in the target's version
+	//    dirs and are readable (and the processes killable) by an elevated
+	//    installer even when the target is SYSTEM.
+	foreach (var (_, dir) in VersionDiscovery.EnumerateVersions(dataDir))
 	{
-		try
+		foreach (var marker in new[] { MarkerFile.DaemonPid, MarkerFile.ElevatorPid })
 		{
-			foreach (var p in Process.GetProcessesByName("seashell-daemon"))
-				try { p.Kill(); } catch { }
-			foreach (var p in Process.GetProcessesByName("seashell-elevator"))
-				try { p.Kill(); } catch { }
+			var pidStr = MarkerFile.Read(dir, marker);
+			if (pidStr == null || !int.TryParse(pidStr, out var pid)) continue;
+			try
+			{
+				using var proc = Process.GetProcessById(pid);
+				if (proc.ProcessName.StartsWith("seashell-", StringComparison.OrdinalIgnoreCase))
+					proc.Kill();
+			}
+			catch { } // already gone, or pid reused by something else
 		}
-		catch { }
-	}
-	else
-	{
-		try { RunProcess("pkill", "-f seashell-daemon"); } catch { }
-		try { RunProcess("pkill", "-f seashell-elevator"); } catch { }
 	}
 
-	// 4. Brief pause so Windows releases file locks before cleanup.
+	// 4. Hard kill by process name — absolute fallback for hung daemons that
+	//    ignore IPC and left no usable markers. Only for the ambient identity:
+	//    name-based killing can't distinguish owners, and an elevated --system
+	//    install must not take down the admin's own user daemons.
+	if (!systemTarget)
+	{
+		if (isWindows)
+		{
+			try
+			{
+				foreach (var p in Process.GetProcessesByName("seashell-daemon"))
+					try { p.Kill(); } catch { }
+				foreach (var p in Process.GetProcessesByName("seashell-elevator"))
+					try { p.Kill(); } catch { }
+			}
+			catch { }
+		}
+		else
+		{
+			try { RunProcess("pkill", "-f seashell-daemon"); } catch { }
+			try { RunProcess("pkill", "-f seashell-elevator"); } catch { }
+		}
+	}
+
+	// 5. Brief pause so Windows releases file locks before cleanup.
 	await Task.Delay(500);
 }
 
@@ -1098,19 +1395,6 @@ bool IsElevated()
 	catch { return false; }
 }
 
-bool IsSystemAccount()
-{
-	if (!isWindows) return false;
-	try
-	{
-		using var identity = System.Security.Principal.WindowsIdentity.GetCurrent();
-		// S-1-5-18 = LocalSystem. LocalService/NetworkService are S-1-5-19/20 —
-		// we're intentionally NOT treating those as "SYSTEM" for the install flow.
-		return identity.User?.Value == "S-1-5-18";
-	}
-	catch { return false; }
-}
-
 bool IsElevatedOrRoot()
 {
 	if (isWindows) return IsElevated();
@@ -1161,4 +1445,24 @@ string RunProcess(string exe, string args)
 		return output + error;
 	}
 	catch { return ""; }
+}
+
+/// <summary>
+/// Duplicates console writes into a second writer (the --log-file the parent
+/// of a self-elevated install tails). Char-level is enough — Console writers
+/// funnel everything through Write(char)/Write(string).
+/// </summary>
+file sealed class TeeWriter : System.IO.TextWriter
+{
+	private readonly System.IO.TextWriter _a;
+	private readonly System.IO.TextWriter _b;
+
+	public TeeWriter(System.IO.TextWriter a, System.IO.TextWriter b) { _a = a; _b = b; }
+
+	public override System.Text.Encoding Encoding => _a.Encoding;
+
+	public override void Write(char value) { _a.Write(value); _b.Write(value); }
+	public override void Write(string? value) { _a.Write(value); _b.Write(value); }
+	public override void WriteLine(string? value) { _a.WriteLine(value); _b.WriteLine(value); }
+	public override void Flush() { _a.Flush(); _b.Flush(); }
 }

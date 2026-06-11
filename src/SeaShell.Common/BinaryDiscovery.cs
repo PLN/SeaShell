@@ -13,14 +13,22 @@ namespace SeaShell;
 public static class BinaryDiscovery
 {
 	public static string? FindDaemon(string version, Action<string>? log = null) =>
-		FindBinary(version, MarkerFile.DaemonPath, "daemon", log);
+		FindBinary(version, SeaShellPaths.DataDir, MarkerFile.DaemonPath, "daemon", log);
 
 	public static string? FindElevator(string version, Action<string>? log = null) =>
-		FindBinary(version, MarkerFile.ElevatorPath, "elevator", log);
+		FindBinary(version, SeaShellPaths.DataDir, MarkerFile.ElevatorPath, "elevator", log);
 
-	private static string? FindBinary(string version, string marker, string label, Action<string>? log)
+	/// <summary>Find the daemon under an explicit data dir (target-identity installs).</summary>
+	public static string? FindDaemon(string version, string dataDir, Action<string>? log = null) =>
+		FindBinary(version, dataDir, MarkerFile.DaemonPath, "daemon", log);
+
+	/// <summary>Find the elevator under an explicit data dir (target-identity installs).</summary>
+	public static string? FindElevator(string version, string dataDir, Action<string>? log = null) =>
+		FindBinary(version, dataDir, MarkerFile.ElevatorPath, "elevator", log);
+
+	private static string? FindBinary(string version, string dataDir, string marker, string label, Action<string>? log)
 	{
-		var versionDir = SeaShellPaths.VersionDir(version);
+		var versionDir = SeaShellPaths.VersionDirIn(dataDir, version);
 		var path = MarkerFile.Read(versionDir, marker);
 		if (path != null && File.Exists(path))
 		{
@@ -29,7 +37,7 @@ public static class BinaryDiscovery
 		}
 		log?.Invoke($"{label}: marker at {versionDir} = {path ?? "<missing>"} (exists: {path != null && File.Exists(path)})");
 
-		foreach (var (ver, dir) in VersionDiscovery.EnumerateVersions())
+		foreach (var (ver, dir) in VersionDiscovery.EnumerateVersions(dataDir))
 		{
 			if (System.Version.TryParse(version, out var requested) && ver < requested)
 				continue;

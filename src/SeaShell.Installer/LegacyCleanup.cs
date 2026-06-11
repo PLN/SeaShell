@@ -83,6 +83,48 @@ public static class LegacyCleanup
 		}
 	}
 
+	/// <summary>
+	/// Remove the pre-0.6.0 SYSTEM-install footprint: the dotnet global tool
+	/// that `--system` used to install under SYSTEM's own profile
+	/// (<c>systemprofile\.dotnet\tools\</c>) and leftover transient-task stage
+	/// dirs under <c>C:\ProgramData\seashell-stage\</c>. The 0.6.0 flow installs
+	/// SYSTEM directly from the elevated bootstrapper, so neither exists anymore.
+	/// Requires elevation (the paths are admin-writable only); call only from
+	/// the elevated `--system` install/uninstall paths. Best-effort.
+	/// </summary>
+	public static void SweepLegacySystemArtifacts(Action<string>? log = null)
+	{
+		var systemProfile = Path.Combine(
+			Environment.GetFolderPath(Environment.SpecialFolder.Windows),
+			"System32", "config", "systemprofile");
+
+		// The tool shim + its store entry. Leave the rest of .dotnet/ alone —
+		// SYSTEM may legitimately use other global tools.
+		var toolShim = Path.Combine(systemProfile, ".dotnet", "tools", "seashell.exe");
+		if (File.Exists(toolShim))
+		{
+			try
+			{
+				File.Delete(toolShim);
+				log?.Invoke("Removed legacy SYSTEM tool shim: seashell.exe");
+			}
+			catch (Exception ex)
+			{
+				log?.Invoke($"Legacy SYSTEM tool shim could not be removed: {ex.Message}");
+			}
+		}
+
+		var toolStore = Path.Combine(systemProfile, ".dotnet", "tools", ".store", "seashell");
+		if (Directory.Exists(toolStore) && TryDeleteRecursive(toolStore))
+			log?.Invoke("Removed legacy SYSTEM tool store: .store/seashell");
+
+		var stageRoot = Path.Combine(
+			Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData),
+			"seashell-stage");
+		if (Directory.Exists(stageRoot) && TryDeleteRecursive(stageRoot))
+			log?.Invoke("Removed legacy stage dir: seashell-stage");
+	}
+
 	private static void SweepQuarantines(string dataDir, Action<string>? log)
 	{
 		string[] entries;

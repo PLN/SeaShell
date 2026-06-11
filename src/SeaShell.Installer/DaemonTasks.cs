@@ -18,12 +18,19 @@ public static class DaemonTasks
 {
 	private static readonly string Version =
 		typeof(DaemonTasks).Assembly.GetName().Version?.ToString(4) ?? "0.0.0";
-	private static readonly string DaemonTaskName = $"SeaShell Daemon ({Environment.UserName}) {Version}";
-	private static readonly string ElevatorTaskName = $"SeaShell Elevator ({Environment.UserName}) {Version}";
-	private static readonly string SystemDaemonTaskName = $"SeaShell Daemon (SYSTEM) {Version}";
-	private static string DaemonTaskPath => TaskQuery.Folder + DaemonTaskName;
-	private static string ElevatorTaskPath => TaskQuery.Folder + ElevatorTaskName;
-	private static string SystemDaemonTaskPath => TaskQuery.Folder + SystemDaemonTaskName;
+
+	// Task names carry the identity's DISPLAY name — human-readable in the Task
+	// Scheduler UI, format-compatible with pre-0.6.0 names. Principals inside
+	// the task XML use the SID (see BuildTaskXml).
+	private static string DaemonTaskNameFor(SeaShellIdentity id) => $"SeaShell Daemon ({id.DisplayName}) {Version}";
+	private static string ElevatorTaskNameFor(SeaShellIdentity id) => $"SeaShell Elevator ({id.DisplayName}) {Version}";
+	private static string DaemonTaskPathFor(SeaShellIdentity id) => TaskQuery.Folder + DaemonTaskNameFor(id);
+	private static string ElevatorTaskPathFor(SeaShellIdentity id) => TaskQuery.Folder + ElevatorTaskNameFor(id);
+
+	private static string DaemonTaskPath => DaemonTaskPathFor(SeaShellIdentity.Current);
+	private static string ElevatorTaskPath => ElevatorTaskPathFor(SeaShellIdentity.Current);
+	private static string SystemDaemonTaskPath =>
+		TaskQuery.Folder + $"SeaShell Daemon (SYSTEM) {Version}";
 
 	// ── On-demand task start (silent) ──────────────────────────────────
 
@@ -96,11 +103,11 @@ public static class DaemonTasks
 
 	// ── Install / uninstall ────────────────────────────────────────────
 
-	public static int InstallDaemon(Action<string>? log = null)
+	public static int InstallDaemon(SeaShellIdentity target, Action<string>? log = null)
 	{
 		if (!RequireWindows(log)) return 1;
-		CleanupOldTasks("Daemon", Environment.UserName, log);
-		var binary = BinaryDiscovery.FindDaemon(Version, log);
+		CleanupOldTasks(target, "Daemon", log);
+		var binary = BinaryDiscovery.FindDaemon(Version, target.DataDir, log);
 		if (binary == null) { log?.Invoke("could not find seashell-daemon"); return 1; }
 		var (command, arguments) = BuildLaunch(binary);
 		log?.Invoke($"binary: {command}{(arguments != null ? " " + arguments : "")}");
@@ -108,18 +115,20 @@ public static class DaemonTasks
 			principal: TaskPrincipal.CurrentUser,
 			trigger: TaskTrigger.Logon,
 			runLevel: "LeastPrivilege",
-			description: "SeaShell scripting daemon — persistent compilation service for C# scripts");
-		if (!RegisterTaskFromXml(DaemonTaskPath, xml, elevatedContext: false, log))
+			description: "SeaShell scripting daemon — persistent compilation service for C# scripts",
+			userSid: TaskSid(target));
+		var taskPath = DaemonTaskPathFor(target);
+		if (!RegisterTaskFromXml(taskPath, xml, elevatedContext: false, log))
 			return 1;
-		MarkerFile.Write(SeaShellPaths.VersionDir(Version), MarkerFile.DaemonTask, DaemonTaskPath);
+		MarkerFile.Write(SeaShellPaths.VersionDirIn(target.DataDir, Version), MarkerFile.DaemonTask, taskPath);
 		return 0;
 	}
 
-	public static int InstallElevator(Action<string>? log = null)
+	public static int InstallElevator(SeaShellIdentity target, Action<string>? log = null)
 	{
 		if (!RequireWindows(log)) return 1;
-		CleanupOldTasks("Elevator", Environment.UserName, log);
-		var binary = BinaryDiscovery.FindElevator(Version, log);
+		CleanupOldTasks(target, "Elevator", log);
+		var binary = BinaryDiscovery.FindElevator(Version, target.DataDir, log);
 		if (binary == null) { log?.Invoke("could not find seashell-elevator"); return 1; }
 		var (command, arguments) = BuildLaunch(binary);
 		log?.Invoke($"binary: {command}{(arguments != null ? " " + arguments : "")}");
@@ -129,10 +138,12 @@ public static class DaemonTasks
 			principal: TaskPrincipal.CurrentUser,
 			trigger: TaskTrigger.Logon,
 			runLevel: "HighestAvailable",
-			description: "SeaShell elevated process spawner — pre-elevated at logon for UAC-free script elevation");
-		if (!RegisterTaskFromXml(ElevatorTaskPath, xml, elevatedContext: true, log))
+			description: "SeaShell elevated process spawner — pre-elevated at logon for UAC-free script elevation",
+			userSid: TaskSid(target));
+		var taskPath = ElevatorTaskPathFor(target);
+		if (!RegisterTaskFromXml(taskPath, xml, elevatedContext: true, log))
 			return 1;
-		MarkerFile.Write(SeaShellPaths.VersionDir(Version), MarkerFile.ElevatorTask, ElevatorTaskPath);
+		MarkerFile.Write(SeaShellPaths.VersionDirIn(target.DataDir, Version), MarkerFile.ElevatorTask, taskPath);
 		return 0;
 	}
 
@@ -149,17 +160,18 @@ public static class DaemonTasks
 	}
 
 	/// <summary>
-	/// Register a daemon scheduled task that runs as SYSTEM at boot. Called
-	/// from a SYSTEM-context `seashell install` during the `--system` flow.
-	/// Task name: <c>SeaShell Daemon (SYSTEM) {version}</c>; trigger is
+	/// Register a daemon scheduled task that runs as SYSTEM at boot. Called by
+	/// the elevated bootstrapper during `seashell install --system` — registering
+	/// a task with an S-1-5-18 principal requires elevation, not running AS
+	/// SYSTEM. Task name: <c>SeaShell Daemon (SYSTEM) {version}</c>; trigger is
 	/// <c>BootTrigger</c>; principal is <c>S-1-5-18</c> with
 	/// <c>HighestAvailable</c> runlevel.
 	/// </summary>
-	public static int InstallSystemDaemon(Action<string>? log = null)
+	public static int InstallSystemDaemon(SeaShellIdentity target, Action<string>? log = null)
 	{
 		if (!RequireWindows(log)) return 1;
-		CleanupOldTasks("Daemon", "SYSTEM", log);
-		var binary = BinaryDiscovery.FindDaemon(Version, log);
+		CleanupOldTasks(target, "Daemon", log);
+		var binary = BinaryDiscovery.FindDaemon(Version, target.DataDir, log);
 		if (binary == null) { log?.Invoke("could not find seashell-daemon"); return 1; }
 		var (command, arguments) = BuildLaunch(binary);
 		log?.Invoke($"binary: {command}{(arguments != null ? " " + arguments : "")}");
@@ -170,9 +182,13 @@ public static class DaemonTasks
 			description: "SeaShell scripting daemon (SYSTEM) — starts at boot under the SYSTEM account.");
 		if (!RegisterTaskFromXml(SystemDaemonTaskPath, xml, elevatedContext: true, log))
 			return 1;
-		MarkerFile.Write(SeaShellPaths.VersionDir(Version), MarkerFile.DaemonTask, SystemDaemonTaskPath);
+		MarkerFile.Write(SeaShellPaths.VersionDirIn(target.DataDir, Version), MarkerFile.DaemonTask, SystemDaemonTaskPath);
 		return 0;
 	}
+
+	/// <summary>Try to start the SYSTEM daemon task. Requires elevation.</summary>
+	public static bool TryRunSystemDaemonTask() =>
+		RuntimeInformation.IsOSPlatform(OSPlatform.Windows) && TaskQuery.Run(SystemDaemonTaskPath);
 
 	public static int UninstallSystemDaemon(Action<string>? log = null)
 	{
@@ -181,22 +197,16 @@ public static class DaemonTasks
 	}
 
 	/// <summary>
-	/// Remove old versioned tasks for a specific principal. Tasks are named
-	/// <c>SeaShell {component} ({principal}) {version}</c>; on update the prior
-	/// version's task would otherwise linger. <paramref name="principal"/> is
-	/// the literal parenthesised string (e.g. a Windows username, or the
-	/// literal "SYSTEM"). Called from InstallDaemon/InstallElevator/InstallSystemDaemon.
+	/// Remove old versioned tasks for a target identity. Tasks are named
+	/// <c>SeaShell {component} ({displayName}) {version}</c>; on update the prior
+	/// version's task would otherwise linger. The display-name prefix matches
+	/// pre-0.6.0 task names too (same format), so upgrade cleans them up.
+	/// Called from InstallDaemon/InstallElevator/InstallSystemDaemon.
 	/// </summary>
-	private static void CleanupOldTasks(string component, string principal, Action<string>? log)
+	private static void CleanupOldTasks(SeaShellIdentity target, string component, Action<string>? log)
 	{
-		var prefix = $"SeaShell {component} ({principal})";
-		var currentName = (component, principal) switch
-		{
-			("Daemon", "SYSTEM") => SystemDaemonTaskName,
-			("Daemon", _)        => DaemonTaskName,
-			("Elevator", _)      => ElevatorTaskName,
-			_                    => $"{prefix} {Version}",
-		};
+		var prefix = $"SeaShell {component} ({target.DisplayName})";
+		var currentName = $"{prefix} {Version}";
 
 		foreach (var path in TaskQuery.EnumerateFolder())
 		{
@@ -228,6 +238,14 @@ public static class DaemonTasks
 			return ("dotnet", $"exec \"{binaryPath}\"");
 		return (binaryPath, null);
 	}
+
+	/// <summary>
+	/// SID string for task XML UserId elements. Task Scheduler accepts SIDs
+	/// wherever it accepts account names, and the SID sidesteps every
+	/// locale/domain/rename pitfall of <c>DOMAIN\username</c>. Uppercased to
+	/// the conventional form.
+	/// </summary>
+	private static string TaskSid(SeaShellIdentity target) => target.Token.ToUpperInvariant();
 
 	internal static bool RegisterTaskFromXml(string taskPath, string xml, bool elevatedContext, Action<string>? log)
 	{
@@ -300,9 +318,15 @@ public static class DaemonTasks
 		TaskPrincipal principal,
 		TaskTrigger trigger,
 		string runLevel,
-		string description)
+		string description,
+		string? userSid = null)
 	{
 		XNamespace ns = "http://schemas.microsoft.com/windows/2004/02/mit/task";
+
+		// Principal/trigger UserIds are SIDs, not DOMAIN\username — canonical,
+		// locale-independent, and computable for a target identity from a
+		// different security context.
+		var sid = userSid ?? TaskSid(SeaShellIdentity.Current);
 
 		XElement principalXml = principal switch
 		{
@@ -315,7 +339,7 @@ public static class DaemonTasks
 				new XElement(ns + "RunLevel", runLevel)),
 			_ => new XElement(ns + "Principal",
 				new XAttribute("id", "Author"),
-				new XElement(ns + "UserId", $"{Environment.UserDomainName}\\{Environment.UserName}"),
+				new XElement(ns + "UserId", sid),
 				new XElement(ns + "LogonType", "InteractiveToken"),
 				new XElement(ns + "RunLevel", runLevel)),
 		};
@@ -326,7 +350,7 @@ public static class DaemonTasks
 				new XElement(ns + "Enabled", "true")),
 			TaskTrigger.Logon => new XElement(ns + "LogonTrigger",
 				new XElement(ns + "Enabled", "true"),
-				new XElement(ns + "UserId", $"{Environment.UserDomainName}\\{Environment.UserName}")),
+				new XElement(ns + "UserId", sid)),
 			TaskTrigger.None => null,
 			_ => throw new ArgumentOutOfRangeException(nameof(trigger)),
 		};

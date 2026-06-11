@@ -1,5 +1,73 @@
 # History
 
+## v0.6.0 (2026-06-11)
+
+**SID-based identity, direct elevated SYSTEM install, `install --all`
+single-elevation setup.**
+
+- **Identity is explicit and SID-based.** New `SeaShellIdentity` type: the
+  identity token in pipe/socket names, mutex names, lock names, and task XML
+  principals is now the lowercase SID string on Windows (uid on Unix) instead
+  of `Environment.UserName` — canonical, locale-independent, and stable under
+  LocalSystem. The key property is that a TARGET identity is computable from
+  a different security context: `SeaShellIdentity.LocalSystem` describes the
+  SYSTEM install (well-known `S-1-5-18`, `systemprofile` data dir) from an
+  elevated admin console. Endpoint parsing switched from last-hyphen to
+  first-hyphen-after-version (SIDs contain hyphens; versions never do) and
+  validates the version segment, which also filters GUID-shaped script pipes.
+  Pre-0.6.0 names still parse, and `LegacyToken` keeps installers able to
+  recognize and stop old daemons during migration.
+- **`--system` install runs directly in the elevated bootstrapper.** The
+  entire transient-task machinery is gone: `SystemOps`, `SystemOpRunner`, the
+  cmd.exe wrapper templates, nupkg tool-store probing, `ProgramData` staging,
+  and the 300s sentinel polling. Registering an `S-1-5-18` boot-trigger task
+  only requires elevation, and with explicit identity every other step
+  (extract, markers, junction) is plain file I/O into SYSTEM's profile. The
+  daemon task is started immediately after registration, and verification
+  waits for the daemon to write its pid/pipe markers under its own identity
+  and answer a ping — proving the chain end-to-end. The dotnet-tool layer
+  under `systemprofile\.dotnet\` is no longer used; a legacy sweep removes
+  the old shim/store footprint and stage dirs. SYSTEM installs no longer
+  register an elevator (pointless for an already-privileged account), PATH
+  entry, or file associations (those wrote to the wrong HKCU anyway).
+- **`seashell install --all` — one command, one UAC prompt.** Composite
+  install: user install + elevator task + Event Log source + SYSTEM install,
+  then starts the daemon and elevator and verifies the elevator registered
+  with the daemon (`PingResponse.ElevatorVersion`). From a non-elevated
+  console it relaunches itself elevated and streams the child's output back
+  into the original console by tailing a tee'd log file. An `--invoker-sid`
+  guard detects over-the-shoulder UAC with a different account and skips the
+  user-profile parts with guidance instead of installing into the wrong
+  profile.
+- **Daemon pipes grant `BUILTIN\Administrators` ReadWrite.** An elevated
+  installer can ping/stop daemons of other identities gracefully — most
+  importantly SYSTEM's during `--system` upgrades. Grants nothing without
+  elevation (deny-only group SID in filtered tokens).
+- **User-scope script mutex is genuinely cross-session now.** The name was
+  unprefixed, which lands in the session-local namespace — "user" scope never
+  excluded across RDP/console sessions. New name: `Global\` + SID token.
+  During 0.6.x both the new and the legacy username-based names are held (in
+  fixed acquire order) so mixed versions exclude each other; the shim is
+  removed in 0.7.
+- **Install lock fixed and target-scoped.** Same session-local-namespace bug
+  as the mutex (`Global\` prefix added), and the lock name now uses the
+  TARGET identity token, so two elevated admins racing a `--system` install
+  contend on one lock.
+- **Stop flow hardened.** `StopAsync` default timeout 2s → 10s (a daemon
+  mid-compilation was routinely escalated to hard kill); stop now also kills
+  by pid markers before falling back to name-based kill, and the name-based
+  kill is skipped for the SYSTEM target (it can't distinguish owners and
+  must not take down the admin's own daemons).
+- **Version comparisons unified.** `DaemonLauncher` compared daemon versions
+  with ordinal string compare in two spots (the v0.4.4 bug class); now
+  `Version.Parse`.
+- **Junction self-heal.** `IsJunction`/`ReadTarget`/`CreateOrUpdate` handle
+  orphaned links: a dangling `current` junction reads as "no current
+  version" and is deleted and recreated on install instead of being trusted.
+- **`seashell status --system` reads the install directly.** Versions and
+  marker-based ping when elevated; graceful degradation to task-state and
+  pipe-presence probing when not. No SYSTEM-context dispatch.
+
 ## v0.5.0 (2026-04-18)
 
 **Side-by-side versioning, proper `--system` install, Installer assembly

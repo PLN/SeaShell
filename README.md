@@ -8,25 +8,31 @@ Requires .NET 10 SDK.
 
 ```
 dotnet tool install -g SeaShell
-seashell install
+seashell install --all
 ```
 
-On Windows, run elevated (`gsudo seashell install`) to also register the
-elevator task for UAC-free `//sea_elevate` scripts and the Windows Event Log
-source. Without elevation the daemon is registered but the elevator is skipped.
+On Windows, `install --all` does everything in one pass behind a single UAC
+prompt: the per-user install, the elevator task (for UAC-free `//sea_elevate`
+scripts), the Windows Event Log source, and the SYSTEM install — then starts
+the daemon and elevator immediately and verifies the whole chain. From a
+non-elevated console it self-elevates and streams the elevated output back.
 
-For an install under the SYSTEM user (so Windows services running as
-LocalSystem can use SeaShell), use `--system` with elevation:
+`seashell install` (without `--all`) is the user-only install: no elevation
+needed, daemon task and file associations registered, elevator skipped unless
+the console is already elevated.
+
+The parts are also available separately. For just the SYSTEM install (so
+Windows services running as LocalSystem can use SeaShell):
 ```
 gsudo seashell install --system      # Windows
 sudo seashell install --system       # Linux
 ```
 On Windows this installs under SYSTEM's own user profile
 (`%SystemRoot%\System32\config\systemprofile\AppData\Local\seashell\`) and
-registers the daemon task with a boot trigger running as SYSTEM. The install
-is performed by a transient one-shot scheduled task running as SYSTEM — the
-binaries, markers, pipe names, and scheduled tasks are all created under
-SYSTEM's identity rather than the invoking user's. On Linux, `--system`
+registers the daemon task with a boot trigger and an `S-1-5-18` principal,
+then starts it. The elevated bootstrapper performs the install directly —
+identity-derived values (data dir, pipe names, task principals) are computed
+from SIDs, so nothing needs to execute as SYSTEM. On Linux, `--system`
 installs to root's standard location (`/var/lib/seashell/`).
 
 Run `seashell` with no arguments to see a dashboard with version, platform,
@@ -363,7 +369,7 @@ Supported init systems (auto-detected): Windows Service, systemd, runit, OpenRC,
 
 - `SeaShell Daemon ({user}) {version}` — LogonTrigger, LeastPrivilege. Auto-starts the daemon at user logon.
 - `SeaShell Elevator ({user}) {version}` — LogonTrigger, HighestAvailable. Only registered when `seashell install` runs elevated.
-- `SeaShell Daemon (SYSTEM) {version}` — BootTrigger, HighestAvailable. Only registered by `seashell install --system`.
+- `SeaShell Daemon (SYSTEM) {version}` — BootTrigger, HighestAvailable. Only registered by `seashell install --system` / `--all`.
 
 Use `sea --start` / `sea --stop` / `sea --status` (or `seashell start`/`stop`/`status`) for lifecycle and state. `sea --stop` uses IPC first (works on Linux too), then ends Task Scheduler tasks. The daemon also starts lazily on first `sea` invocation if no task is registered.
 
@@ -377,20 +383,22 @@ SeaShell installation:
 ```
 seashell                          Dashboard: version, platform, daemon/elevator state
 seashell install                  Extract archives, register daemon, update PATH
-seashell install --system         System-wide install (requires elevation)
+seashell install --all            User + elevator + SYSTEM in one pass (one UAC prompt)
+seashell install --system         SYSTEM-only install (requires elevation)
 seashell uninstall                Remove binaries, daemon task, file associations
-seashell uninstall --system       Remove system-wide install
+seashell uninstall --system       Remove SYSTEM install
 seashell start                    Start daemon (and elevator if registered)
 seashell stop                     Stop daemon and elevator
 seashell status                   Show running state and versions
+seashell status --system          Show SYSTEM installation status
 seashell schedule <script> <timing>  Schedule a script via Task Scheduler
 seashell schedule                 List scheduled scripts
 seashell unschedule <script>      Remove a scheduled script
 ```
 
 `seashell install` and `seashell update` are identical — both extract the latest
-archives and re-register tasks. On Windows, run elevated (`gsudo seashell install`)
-to also register the elevator and Event Log source.
+archives and re-register tasks. Updating everything is the same motion:
+`dotnet tool update -g SeaShell && seashell install --all`.
 
 ## Project Structure
 
