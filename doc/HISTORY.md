@@ -1,5 +1,20 @@
 # History
 
+## v0.6.1 (2026-07-08)
+
+**NuGet dependency resolution fix for DacFx and runtime-specific assets.**
+
+- **Direct `//sea_nuget` versions now win over transitives.** Multiple package
+  directives are resolved as one graph, preserving a direct pin such as
+  `System.Runtime.Caching 8.0.1` even when a dependency requests an older
+  floor.
+- **Runtime asset selection avoids `netstandard` shims when real net6+ assets
+  exist.** RID-specific managed assets and generic `lib/net6.0+` assets are
+  preferred over compatibility throw-shims for a net10 host.
+- **Unsupported NuGet directive diagnostics.** `#r "nuget: ..."` and
+  `#:package` now report a SeaShell-specific message pointing users to
+  `//sea_nuget <Package> [version]`.
+
 ## v0.6.0 (2026-06-11)
 
 **SID-based identity, direct elevated SYSTEM install, `install --all`

@@ -36,12 +36,18 @@ public sealed class NuGetResolver
 		DateTime VersionDirTimestamp);
 
 	public NuGetResolver()
+		: this(
+			Path.Combine(
+				Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+				".nuget", "packages"),
+			GetRuntimeIdentifier())
 	{
-		_cacheRoot = Path.Combine(
-			Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
-			".nuget", "packages");
+	}
 
-		_rid = GetRuntimeIdentifier();
+	internal NuGetResolver(string cacheRoot, string rid)
+	{
+		_cacheRoot = cacheRoot;
+		_rid = rid;
 	}
 
 	/// <summary>Invalidate all cached entries. Called after downloading new packages.</summary>
@@ -73,6 +79,12 @@ public sealed class NuGetResolver
 
 		/// <summary>Path relative to the package root (for .deps.json).</summary>
 		public required string RelativePath { get; init; }
+
+		/// <summary>TFM folder the asset came from, e.g. net8.0 or netstandard2.0.</summary>
+		public string? TargetFramework { get; init; }
+
+		/// <summary>RID folder the asset came from, e.g. win-x64 or linux.</summary>
+		public string? RuntimeIdentifier { get; init; }
 	}
 
 	/// <summary>
@@ -91,6 +103,56 @@ public sealed class NuGetResolver
 		return resolved.Values.ToList();
 	}
 
+	/// <summary>
+	/// Resolve multiple direct package references as one graph. Direct references win over
+	/// transitives with the same package ID, and repeated transitive requests keep the
+	/// highest requested version seen.
+	/// </summary>
+	public List<ResolvedPackage> ResolveWithDependencies(IEnumerable<(string PackageName, string? Version)> directRefs)
+	{
+		var refs = directRefs.ToList();
+		var directVersions = new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase);
+		foreach (var (packageName, version) in refs)
+		{
+			var concreteVersion = ResolveDirectVersion(packageName, version) ?? version;
+			if (!directVersions.TryGetValue(packageName, out var existing)
+				|| IsHigherVersion(concreteVersion, existing))
+			{
+				directVersions[packageName] = concreteVersion;
+			}
+		}
+
+		var packages = new List<ResolvedPackage>();
+		var indexes = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+
+		foreach (var (packageName, version) in refs)
+		{
+			var tree = ResolveWithDependencies(packageName, version);
+			foreach (var pkg in tree)
+			{
+				if (directVersions.TryGetValue(pkg.Name, out var directVersion)
+					&& directVersion != null
+					&& !string.Equals(pkg.Version, directVersion, StringComparison.OrdinalIgnoreCase))
+				{
+					continue;
+				}
+
+				if (!indexes.TryGetValue(pkg.Name, out var existingIndex))
+				{
+					indexes[pkg.Name] = packages.Count;
+					packages.Add(pkg);
+					continue;
+				}
+
+				if (IsHigherVersion(pkg.Version, packages[existingIndex].Version))
+					packages[existingIndex] = pkg;
+			}
+		}
+
+		_log.Debug("Resolved {DirectCount} direct packages: {Total} total packages", refs.Count, packages.Count);
+		return packages;
+	}
+
 	private void ResolveRecursive(
 		string packageName,
 		string? version,
@@ -98,7 +160,13 @@ public sealed class NuGetResolver
 		HashSet<string> visiting)
 	{
 		// Already in the output set for this resolution pass
-		if (resolved.ContainsKey(packageName)) return;
+		if (resolved.TryGetValue(packageName, out var existing))
+		{
+			var requestedVersion = ResolveDirectVersion(packageName, version) ?? version;
+			if (!IsHigherVersion(requestedVersion, existing.Version))
+				return;
+			resolved.Remove(packageName);
+		}
 
 		// Skip packages provided by the .NET runtime framework
 		if (IsFrameworkProvided(packageName)) return;
@@ -308,21 +376,18 @@ public sealed class NuGetResolver
 
 		// ── Resolve managed DLLs ────────────────────────────────────────
 
-		// 1. Try runtime-specific: runtimes/{rid}/lib/{tfm}/
+		// 1. Try compile reference assemblies: ref/{tfm}/
+		var refManaged = ProbeGeneric(versionDir, "ref");
+
+		// 2. Try runtime-specific: runtimes/{rid}/lib/{tfm}/
 		var runtimeManaged = ProbeRuntimeSpecific(versionDir, "lib");
 
-		// 2. Fallback to generic: lib/{tfm}/
-		var genericManaged = ProbeGenericLib(versionDir);
+		// 3. Fallback to generic: lib/{tfm}/
+		var genericManaged = ProbeGeneric(versionDir, "lib");
 
-		// For compilation: prefer generic (broader API surface), fall back to runtime-specific
-		var compileDlls = genericManaged.Count > 0
-			? genericManaged.Select(a => a.FullPath).ToList()
-			: runtimeManaged.Select(a => a.FullPath).ToList();
-
-		// For runtime: prefer runtime-specific (correct platform implementation)
-		var runtimeAssets = runtimeManaged.Count > 0
-			? runtimeManaged
-			: genericManaged;
+		var compileAssets = SelectCompileAssets(refManaged, genericManaged, runtimeManaged);
+		var compileDlls = compileAssets.Select(a => a.FullPath).ToList();
+		var runtimeAssets = SelectRuntimeAssets(runtimeManaged, genericManaged);
 
 		// ── Resolve native DLLs ─────────────────────────────────────────
 		var nativeAssets = ProbeNative(versionDir);
@@ -355,6 +420,8 @@ public sealed class NuGetResolver
 					{
 						FullPath = f,
 						RelativePath = Path.GetRelativePath(versionDir, f).Replace('\\', '/'),
+						TargetFramework = tfm,
+						RuntimeIdentifier = rid,
 					})
 					.ToList();
 
@@ -365,12 +432,12 @@ public sealed class NuGetResolver
 		return new List<ResolvedAsset>();
 	}
 
-	/// <summary>Probe lib/{tfm}/ for generic managed DLLs.</summary>
-	private List<ResolvedAsset> ProbeGenericLib(string versionDir)
+	/// <summary>Probe {baseDir}/{tfm}/ for managed DLLs.</summary>
+	private List<ResolvedAsset> ProbeGeneric(string versionDir, string baseDir)
 	{
 		foreach (var tfm in TfmProbeOrder)
 		{
-			var dir = Path.Combine(versionDir, "lib", tfm);
+			var dir = Path.Combine(versionDir, baseDir, tfm);
 			if (!Directory.Exists(dir)) continue;
 
 			var dlls = Directory.GetFiles(dir, "*.dll")
@@ -379,6 +446,7 @@ public sealed class NuGetResolver
 				{
 					FullPath = f,
 					RelativePath = Path.GetRelativePath(versionDir, f).Replace('\\', '/'),
+					TargetFramework = tfm,
 				})
 				.ToList();
 
@@ -386,6 +454,38 @@ public sealed class NuGetResolver
 		}
 
 		return new List<ResolvedAsset>();
+	}
+
+	private static List<ResolvedAsset> SelectCompileAssets(
+		List<ResolvedAsset> refManaged,
+		List<ResolvedAsset> genericManaged,
+		List<ResolvedAsset> runtimeManaged)
+	{
+		if (refManaged.Count > 0) return refManaged;
+		if (genericManaged.Count == 0) return runtimeManaged;
+		if (runtimeManaged.Count == 0) return genericManaged;
+
+		var genericTfm = genericManaged[0].TargetFramework;
+		var runtimeTfm = runtimeManaged[0].TargetFramework;
+		return IsNetStandard(runtimeTfm) && IsNetCoreAppTfm(genericTfm)
+			? genericManaged
+			: IsNetStandard(genericTfm) && IsNetCoreAppTfm(runtimeTfm)
+				? runtimeManaged
+				: genericManaged;
+	}
+
+	private static List<ResolvedAsset> SelectRuntimeAssets(
+		List<ResolvedAsset> runtimeManaged,
+		List<ResolvedAsset> genericManaged)
+	{
+		if (runtimeManaged.Count == 0) return genericManaged;
+		if (genericManaged.Count == 0) return runtimeManaged;
+
+		var runtimeTfm = runtimeManaged[0].TargetFramework;
+		var genericTfm = genericManaged[0].TargetFramework;
+		return IsNetStandard(runtimeTfm) && IsNetCoreAppTfm(genericTfm)
+			? genericManaged
+			: runtimeManaged;
 	}
 
 	/// <summary>Probe runtimes/{rid}/native/ for native DLLs.</summary>
@@ -437,6 +537,30 @@ public sealed class NuGetResolver
 			.OrderByDescending(d => Version.Parse(Path.GetFileName(d)!))
 			.FirstOrDefault();
 	}
+
+	private static bool IsHigherVersion(string? candidate, string? existing)
+	{
+		if (string.IsNullOrEmpty(candidate)) return false;
+		if (string.IsNullOrEmpty(existing)) return true;
+		if (TryParseVersion(candidate, out var candidateVersion)
+			&& TryParseVersion(existing, out var existingVersion))
+			return candidateVersion.CompareTo(existingVersion) > 0;
+		return string.Compare(candidate, existing, StringComparison.OrdinalIgnoreCase) > 0;
+	}
+
+	private static bool TryParseVersion(string value, out Version version)
+	{
+		var normalized = value.Split('-', '+')[0];
+		return Version.TryParse(normalized, out version!);
+	}
+
+	private static bool IsNetStandard(string? tfm) =>
+		tfm?.StartsWith("netstandard", StringComparison.OrdinalIgnoreCase) == true;
+
+	private static bool IsNetCoreAppTfm(string? tfm) =>
+		tfm?.StartsWith("net", StringComparison.OrdinalIgnoreCase) == true
+		&& !IsNetStandard(tfm)
+		&& !tfm.StartsWith("net4", StringComparison.OrdinalIgnoreCase);
 
 	/// <summary>RID fallback chain, e.g., linux-musl-x64 → linux-x64 → linux → any.</summary>
 	private IEnumerable<string> GetRidFallbacks()

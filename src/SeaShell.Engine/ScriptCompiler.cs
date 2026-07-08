@@ -106,6 +106,10 @@ public sealed class ScriptCompiler
 			return new CompileResult { Error = ex.Message };
 		}
 
+		var unsupportedNuGetDirective = FindUnsupportedNuGetDirective(resolved.Sources);
+		if (unsupportedNuGetDirective != null)
+			return new CompileResult { Error = unsupportedNuGetDirective };
+
 		// ── Check cache ─────────────────────────────────────────────────
 		// Hash includes source content, engine fingerprint, and resolved direct
 		// NuGet versions. Transitive deps are not included (immutable by convention).
@@ -447,15 +451,11 @@ public sealed class ScriptCompiler
 	private List<NuGetResolver.ResolvedPackage>? ResolveNuGetPackages(
 		List<DirectiveParser.NuGetRef> nugets)
 	{
-		var resolvedPackages = new List<NuGetResolver.ResolvedPackage>();
-		var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-
 		foreach (var nuget in nugets)
 		{
 			_log.Debug("Resolving NuGet {Package} {Version}", nuget.PackageName, nuget.Version ?? "latest");
-			var tree = NuGetResolver.ResolveWithDependencies(nuget.PackageName, nuget.Version);
 
-			if (tree.Count == 0 && NuGetResolver.Resolve(nuget.PackageName, nuget.Version) == null)
+			if (NuGetResolver.Resolve(nuget.PackageName, nuget.Version) == null)
 			{
 				_log.Information("Downloading {Package} (not in cache)", nuget.PackageName);
 				var dl = NuGetDownloader.Download(nuget.PackageName, nuget.Version);
@@ -467,28 +467,49 @@ public sealed class ScriptCompiler
 				}
 
 				NuGetResolver.InvalidateCache();
-				tree = NuGetResolver.ResolveWithDependencies(nuget.PackageName, nuget.Version);
-
-				if (tree.Count == 0)
-				{
-					_log.Error("Package {Package} downloaded but could not be resolved", nuget.PackageName);
-					_lastNuGetError = new CompileResult
-					{
-						Error = $"Package '{nuget.PackageName}' was downloaded but could not be resolved."
-					};
-					return null;
-				}
 			}
+		}
 
-			foreach (var pkg in tree)
+		var resolvedPackages = NuGetResolver.ResolveWithDependencies(
+			nugets.Select(n => (n.PackageName, n.Version)));
+
+		foreach (var nuget in nugets)
+		{
+			var expectedVersion = NuGetResolver.ResolveDirectVersion(nuget.PackageName, nuget.Version);
+			if (!resolvedPackages.Any(p =>
+				string.Equals(p.Name, nuget.PackageName, StringComparison.OrdinalIgnoreCase)
+				&& (expectedVersion == null
+					|| string.Equals(p.Version, expectedVersion, StringComparison.OrdinalIgnoreCase))))
 			{
-				if (seen.Add(pkg.Name))
-					resolvedPackages.Add(pkg);
+				_log.Error("Package {Package} downloaded but could not be resolved", nuget.PackageName);
+				_lastNuGetError = new CompileResult
+				{
+					Error = $"Package '{nuget.PackageName}' was downloaded but could not be resolved."
+				};
+				return null;
 			}
 		}
 
 		_log.Debug("Resolved {Count} direct, {Total} total NuGet packages", nugets.Count, resolvedPackages.Count);
 		return resolvedPackages;
+	}
+
+	private static string? FindUnsupportedNuGetDirective(
+		IEnumerable<(string Path, string Source)> sources)
+	{
+		foreach (var (_, source) in sources)
+		{
+			foreach (var line in source.AsSpan().EnumerateLines())
+			{
+				var trimmed = line.Trim();
+				if (trimmed.StartsWith("#:package", StringComparison.OrdinalIgnoreCase))
+					return "SeaShell does not support '#:package' directives. Use '//sea_nuget <Package> [version]' instead.";
+				if (trimmed.StartsWith("#r", StringComparison.OrdinalIgnoreCase)
+					&& trimmed.ToString().Contains("nuget:", StringComparison.OrdinalIgnoreCase))
+					return "SeaShell does not support '#r \"nuget: ...\"' directives. Use '//sea_nuget <Package> [version]' instead.";
+			}
+		}
+		return null;
 	}
 
 	// ── Binary pass-through ────────────────────────────────────────────

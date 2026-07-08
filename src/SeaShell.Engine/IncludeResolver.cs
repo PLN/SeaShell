@@ -138,7 +138,8 @@ public sealed class IncludeResolver
 		foreach (var n in directives.NuGets)
 		{
 			if (!aggregated.NuGets.Exists(x =>
-				x.PackageName.Equals(n.PackageName, StringComparison.OrdinalIgnoreCase)))
+				x.PackageName.Equals(n.PackageName, StringComparison.OrdinalIgnoreCase)
+				&& string.Equals(x.Version, n.Version, StringComparison.OrdinalIgnoreCase)))
 				aggregated.NuGets.Add(n);
 		}
 		foreach (var r in directives.References)
