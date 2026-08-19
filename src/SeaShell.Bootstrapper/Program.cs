@@ -218,7 +218,13 @@ async Task<int> Install()
 			var path = Path.Combine(binDir, name);
 			if (File.Exists(path))
 			{
-				try { File.SetUnixFileMode(path, File.GetUnixFileMode(path) | UnixFileMode.UserExecute); }
+				// All three exec bits: a --system install lives in /var/lib/seashell
+				// and is executed by every user, not just root.
+				try
+				{
+					File.SetUnixFileMode(path, File.GetUnixFileMode(path)
+						| UnixFileMode.UserExecute | UnixFileMode.GroupExecute | UnixFileMode.OtherExecute);
+				}
 				catch { }
 			}
 		}

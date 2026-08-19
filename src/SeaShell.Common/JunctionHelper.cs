@@ -24,8 +24,10 @@ public static class JunctionHelper
 		if (IsJunction(junctionPath))
 		{
 			try { Directory.Delete(junctionPath, false); }
-			catch (DirectoryNotFoundException) { }
-			catch (IOException) { File.Delete(junctionPath); } // dangling symlink on Unix
+			// Dangling symlink on Unix: Directory.Delete throws without removing
+			// the link entry itself — delete it as a file so creation can proceed.
+			catch (DirectoryNotFoundException) { try { File.Delete(junctionPath); } catch { } }
+			catch (IOException) { File.Delete(junctionPath); }
 		}
 		else if (Directory.Exists(junctionPath))
 		{
