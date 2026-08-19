@@ -161,6 +161,7 @@ async Task<int> Install()
 	//    blocked by held handles on Windows.
 	await StopExistingInstancesAsync();
 	LegacyCleanup.SweepFilesystem(dataDir, msg => Console.WriteLine($"  {msg}"));
+	LegacyCleanup.SweepStaleTempDir(msg => Console.WriteLine($"  {msg}"));
 	if (systemTarget)
 	{
 		// Pre-0.6.0 --system installs ran `dotnet tool install` under SYSTEM's
@@ -783,6 +784,7 @@ async Task<int> Uninstall()
 	// Wipe any pre-0.5.0 flat-layout state so the final Directory.Delete
 	// below on an empty DataDir actually succeeds.
 	LegacyCleanup.SweepFilesystem(dataDir, msg => Console.WriteLine($"  {msg}"));
+	LegacyCleanup.SweepStaleTempDir(msg => Console.WriteLine($"  {msg}"));
 	if (systemTarget)
 		LegacyCleanup.SweepLegacySystemArtifacts(msg => Console.WriteLine($"  {msg}"));
 

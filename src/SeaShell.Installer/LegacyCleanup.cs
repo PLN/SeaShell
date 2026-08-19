@@ -125,6 +125,26 @@ public static class LegacyCleanup
 			log?.Invoke("Removed legacy stage dir: seashell-stage");
 	}
 
+	/// <summary>
+	/// Remove the pre-0.6.1.249 NuGet restore scratch dir under the shared temp
+	/// path. Earlier releases used <c>{TempPath}/seashell/restore/</c>; on Linux
+	/// <c>/tmp</c> is shared between users, so an elevated run could leave a
+	/// root-owned <c>/tmp/seashell/</c> behind that broke every later non-root
+	/// package restore (the reason the scratch dir moved to
+	/// <c>SeaShellPaths.DataDir/restore/</c>). Best-effort: logs a manual
+	/// removal hint if the dir survives, e.g. when it is owned by another user.
+	/// </summary>
+	public static void SweepStaleTempDir(Action<string>? log = null)
+	{
+		var stale = Path.Combine(Path.GetTempPath(), "seashell");
+		if (!Directory.Exists(stale)) return;
+
+		if (TryDeleteRecursive(stale))
+			log?.Invoke($"Removed stale temp dir: {stale}");
+		else
+			log?.Invoke($"Stale temp dir could not be removed (owned by another user?): {stale} — remove it manually, e.g. 'sudo rm -rf {stale}'");
+	}
+
 	private static void SweepQuarantines(string dataDir, Action<string>? log)
 	{
 		string[] entries;

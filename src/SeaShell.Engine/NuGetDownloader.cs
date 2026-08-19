@@ -1,6 +1,7 @@
 using System;
 using System.Diagnostics;
 using System.IO;
+using System.Threading.Tasks;
 using Serilog;
 
 namespace SeaShell.Engine;
@@ -14,6 +15,9 @@ public static class NuGetDownloader
 {
 	private static readonly ILogger _log = Log.ForContext(typeof(NuGetDownloader));
 
+	private const int RestoreTimeoutMs = 60_000;
+	private const int PipeDrainTimeoutMs = 5_000;
+
 	public sealed record DownloadResult(bool Success, string? Error);
 
 	/// <summary>
@@ -21,11 +25,14 @@ public static class NuGetDownloader
 	/// </summary>
 	public static DownloadResult Download(string packageName, string? version)
 	{
-		var tempDir = Path.Combine(Path.GetTempPath(), "seashell", "restore", Guid.NewGuid().ToString("N")[..8]);
-		Directory.CreateDirectory(tempDir);
+		// Per-user scratch dir. NOT Path.GetTempPath(): on Linux /tmp is shared
+		// between users, so a root-owned /tmp/seashell/ left behind by an elevated
+		// run makes CreateDirectory fail for every non-root daemon afterwards.
+		var tempDir = Path.Combine(SeaShellPaths.DataDir, "restore", Guid.NewGuid().ToString("N")[..8]);
 
 		try
 		{
+			Directory.CreateDirectory(tempDir);
 			var tfm = $"net{Environment.Version.Major}.{Environment.Version.Minor}";
 			var versionAttr = $" Version=\"{version ?? "*"}\"";  // * = latest
 
@@ -48,7 +55,9 @@ public static class NuGetDownloader
 			var psi = new ProcessStartInfo
 			{
 				FileName = "dotnet",
-				ArgumentList = { "restore", "--verbosity", "quiet" },
+				// --disable-build-servers: no MSBuild/Roslyn worker processes that
+				// could outlive the restore holding inherited pipe handles.
+				ArgumentList = { "restore", "--verbosity", "quiet", "--disable-build-servers" },
 				WorkingDirectory = tempDir,
 				UseShellExecute = false,
 				RedirectStandardOutput = true,
@@ -57,15 +66,24 @@ public static class NuGetDownloader
 			};
 
 			using var proc = Process.Start(psi)!;
-			var stdout = proc.StandardOutput.ReadToEnd();
-			var stderr = proc.StandardError.ReadToEnd();
-			proc.WaitForExit(60_000); // 60s timeout
 
-			if (!proc.HasExited)
+			// Read both pipes concurrently and put the timeout on WaitForExit.
+			// A synchronous ReadToEnd() before WaitForExit() blocks until the pipe
+			// closes, which would make the timeout unreachable if restore stalls.
+			var stdoutTask = proc.StandardOutput.ReadToEndAsync();
+			var stderrTask = proc.StandardError.ReadToEndAsync();
+
+			if (!proc.WaitForExit(RestoreTimeoutMs))
 			{
-				try { proc.Kill(); } catch { }
-				return new DownloadResult(false, $"Package restore timed out after 60s");
+				try { proc.Kill(entireProcessTree: true); } catch { }
+				return new DownloadResult(false, $"Package restore timed out after {RestoreTimeoutMs / 1000}s");
 			}
+
+			// Drain the pipes with a grace period — a child that inherited the
+			// handles can keep them open past the parent's exit.
+			Task.WaitAll(new Task[] { stdoutTask, stderrTask }, PipeDrainTimeoutMs);
+			var stdout = stdoutTask.IsCompletedSuccessfully ? stdoutTask.Result : "";
+			var stderr = stderrTask.IsCompletedSuccessfully ? stderrTask.Result : "";
 
 			if (proc.ExitCode != 0)
 			{

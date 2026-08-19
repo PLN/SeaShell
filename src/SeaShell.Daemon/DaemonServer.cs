@@ -150,7 +150,19 @@ public sealed class DaemonServer : IAsyncDisposable
 			if (type == MessageType.RunRequest)
 			{
 				var runReq = (RunRequest)message;
-				var response = HandleRun(runReq);
+				RunResponse response;
+				try
+				{
+					response = HandleRun(runReq);
+				}
+				catch (Exception ex)
+				{
+					// A compile-path exception must still produce a response —
+					// otherwise the client waits forever on a reply that never comes.
+					_log.Error(ex, "Run request failed: {ScriptPath}", runReq.ScriptPath);
+					response = new RunResponse(false, false, false, null, null, null, null, 0,
+						$"Daemon error: {ex.Message}");
+				}
 				await conn.Channel.SendAsync(response, ct);
 
 				// If watch mode, keep connection open and push HotSwapNotify on changes
@@ -196,6 +208,9 @@ public sealed class DaemonServer : IAsyncDisposable
 		catch (Exception ex)
 		{
 			_log.Error(ex, "Connection error");
+			// The connection is in an unknown state — close it so the client
+			// sees a disconnect instead of waiting on a response forever.
+			try { await conn.DisposeAsync(); } catch { }
 		}
 		finally
 		{
@@ -455,7 +470,10 @@ public sealed class DaemonServer : IAsyncDisposable
 			? (int)(now - _elevatorConnectedTime.Value).TotalSeconds : 0;
 		var elevIdle = _elevatorConnectedTime.HasValue
 			? (int)((now.Ticks - Interlocked.Read(ref _elevatorLastActivityTicks)) / TimeSpan.TicksPerSecond) : 0;
-		return new PingResponse(Version, false, _elevator != null, uptime, _activeConnections,
+		// Exclude the connection carrying this ping — otherwise --status always
+		// reports at least "1 active" and phantom operations get diagnosed.
+		return new PingResponse(Version, false, _elevator != null, uptime,
+			Math.Max(0, _activeConnections - 1),
 			Environment.ProcessId, idle, timeout, _elevatorVersion,
 			elevUptime, elevIdle);
 	}
