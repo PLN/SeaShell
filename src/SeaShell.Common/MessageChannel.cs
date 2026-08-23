@@ -33,7 +33,8 @@ public sealed class MessageChannel : IAsyncDisposable
 
 	private static readonly MessagePackSerializerOptions MsgPackOpts =
 		MessagePackSerializerOptions.Standard
-			.WithResolver(ContractlessStandardResolver.Instance);
+			.WithResolver(ContractlessStandardResolver.Instance)
+			.WithSecurity(MessagePackSecurity.UntrustedData);
 
 	public MessageChannel(Stream stream, bool leaveOpen = false)
 	{
