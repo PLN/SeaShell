@@ -16,6 +16,21 @@ public static class TaskQuery
 {
 	public const string Folder = @"\SeaShell\";
 
+	/// <summary>
+	/// Parse the version suffix from a versioned SeaShell task path, such as
+	/// <c>\SeaShell\SeaShell Daemon (SYSTEM) 0.6.1.257</c>.
+	/// </summary>
+	public static Version? ParseVersionSuffix(string taskPath)
+	{
+		var name = taskPath.StartsWith(Folder, StringComparison.Ordinal)
+			? taskPath[Folder.Length..]
+			: Path.GetFileName(taskPath);
+		var separator = name.LastIndexOf(' ');
+		return separator >= 0 && Version.TryParse(name.AsSpan(separator + 1), out var version)
+			? version
+			: null;
+	}
+
 	/// <summary>Find a task under <see cref="Folder"/> whose name starts with <paramref name="namePrefix"/>.
 	/// Returns the first match's full path, or null if none. Useful for looking up the current user's
 	/// versioned task when the exact version isn't known.</summary>

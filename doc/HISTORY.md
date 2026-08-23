@@ -14,6 +14,13 @@
 - **Unsupported NuGet directive diagnostics.** `#r "nuget: ..."` and
   `#:package` now report a SeaShell-specific message pointing users to
   `//sea_nuget <Package> [version]`.
+- **Stale installers no longer downgrade scheduled runtimes.** When a target's
+  `current` junction points to a newer version, install exits as a no-op before
+  stopping processes or changing tasks. This prevents a split SYSTEM install
+  with a newer junction but an older boot task/daemon. SYSTEM verification
+  failures now point to `seashell status --system`, whose output includes the
+  SYSTEM `current` junction explicitly and warns when its version differs
+  from the registered daemon task.
 
 ## v0.6.0 (2026-06-11)
 

@@ -65,6 +65,7 @@ var systemTarget = isWindows && target.IsSystem;
 var dataDir = target.DataDir;
 var versionDir = SeaShellPaths.VersionDirIn(dataDir, version);
 var binDir = SeaShellPaths.BinDirIn(dataDir, version);
+var lastInstallSkippedNewerVersion = false;
 
 void SetTarget(SeaShellIdentity t)
 {
@@ -133,6 +134,8 @@ switch (args[0].ToLowerInvariant())
 
 async Task<int> Install()
 {
+	lastInstallSkippedNewerVersion = false;
+
 	if (systemMode && !IsElevatedOrRoot())
 	{
 		Console.Error.WriteLine("  ERROR: --system requires elevation (gsudo on Windows, sudo on Linux).");
@@ -155,6 +158,22 @@ async Task<int> Install()
 	Console.WriteLine($"  Platform:  {GetCurrentRid()}");
 	Console.WriteLine($"  Target:    {target.DisplayName}");
 	Console.WriteLine($"  Version:   {versionDir}");
+
+	// A stale bootstrapper must not disturb a newer active installation. In
+	// particular, stopping its daemon and re-registering this version's task
+	// would leave `current` on the newer version while booting the older one.
+	// Check after acquiring the target lock, but before making any changes.
+	var currentVersion = VersionDiscovery.GetCurrentVersion(dataDir);
+	var myVersion = System.Version.TryParse(version, out var mv) ? mv : null;
+	if (myVersion != null && InstallVersionPolicy.WouldDowngrade(currentVersion, myVersion))
+	{
+		lastInstallSkippedNewerVersion = true;
+		Console.WriteLine();
+		Console.WriteLine($"  Newer version already active: v{currentVersion}");
+		Console.WriteLine($"  Skipping v{version} for {target.DisplayName}; no binaries, tasks, or running processes were changed.");
+		Console.WriteLine($"  Use a v{currentVersion} or newer bootstrapper to update or repair this target.");
+		return 0;
+	}
 
 	// 2. Stop running daemons/elevators and wipe any pre-0.5.0 flat-layout state.
 	//    Running daemons first so rename-then-delete in the sweep below isn't
@@ -247,18 +266,10 @@ async Task<int> Install()
 		MarkerFile.Write(versionDir, MarkerFile.ElevatorPath, elevatorDll);
 	Console.WriteLine($"  elevator.path: {(MarkerFile.Exists(versionDir, MarkerFile.ElevatorPath) ? "ok" : "not found")}");
 
-	// 7. Update `current` junction (create if missing, update if newer)
-	var currentVersion = VersionDiscovery.GetCurrentVersion(dataDir);
-	var myVersion = System.Version.TryParse(version, out var mv) ? mv : null;
-	if (currentVersion == null || (myVersion != null && myVersion >= currentVersion))
-	{
-		JunctionHelper.CreateOrUpdate(SeaShellPaths.CurrentDirIn(dataDir), versionDir);
-		Console.WriteLine($"  current -> v{version}");
-	}
-	else
-	{
-		Console.WriteLine($"  current -> v{currentVersion} (newer, kept)");
-	}
+	// 7. Activate this version. A newer active version returned early above,
+	//    so the junction, registered tasks, and verification all agree.
+	JunctionHelper.CreateOrUpdate(SeaShellPaths.CurrentDirIn(dataDir), versionDir);
+	Console.WriteLine($"  current -> v{version}");
 
 	// 8. Add to PATH (User environment, using junction path). Skipped for the
 	//    SYSTEM target — that would edit the invoking admin's HKCU, not SYSTEM's,
@@ -392,17 +403,20 @@ async Task<int> InstallAll(string commandName)
 		// We're elevated and both tasks are registered — bring the whole chain
 		// up now: daemon first, then the elevator (it connects TO the daemon,
 		// retrying every 3s, so order only affects latency).
-		Console.WriteLine();
-		Console.WriteLine("  Starting daemon...");
-		if (!DaemonTasks.TryRunDaemonTask())
-			Console.WriteLine("  WARNING: could not start the daemon task");
-		else if (await VerifyDaemonLiveAsync("daemon"))
+		if (!lastInstallSkippedNewerVersion)
 		{
-			Console.WriteLine("  Starting elevator...");
-			if (!DaemonTasks.TryRunElevatorTask())
-				Console.WriteLine("  WARNING: could not start the elevator task");
-			else
-				await VerifyElevatorRegisteredAsync();
+			Console.WriteLine();
+			Console.WriteLine("  Starting daemon...");
+			if (!DaemonTasks.TryRunDaemonTask())
+				Console.WriteLine("  WARNING: could not start the daemon task");
+			else if (await VerifyDaemonLiveAsync("daemon"))
+			{
+				Console.WriteLine("  Starting elevator...");
+				if (!DaemonTasks.TryRunElevatorTask())
+					Console.WriteLine("  WARNING: could not start the elevator task");
+				else
+					await VerifyElevatorRegisteredAsync();
+			}
 		}
 	}
 
@@ -586,7 +600,9 @@ async Task<bool> VerifyInstallationAsync(string seaPath)
 	if (!ok)
 	{
 		Console.Error.WriteLine();
-		Console.Error.WriteLine("  ERROR: Installation verification failed. Run 'seashell status' for details.");
+		Console.Error.WriteLine(systemTarget
+			? "  ERROR: Installation verification failed. Run elevated 'seashell status --system' for details."
+			: "  ERROR: Installation verification failed. Run 'seashell status' for details.");
 	}
 	return ok;
 }
@@ -1064,6 +1080,7 @@ async Task<int> SystemStatus()
 	if (versions.Count > 0)
 	{
 		Console.WriteLine($"  Installed    v{current?.ToString() ?? versions[0].Version.ToString()}");
+		Console.WriteLine($"  Current      {SeaShellPaths.CurrentDirIn(sys.DataDir)} -> {(current != null ? $"v{current}" : "<missing>")}");
 		foreach (var (ver, dir) in versions)
 		{
 			var isCurrent = current != null && ver == current ? " *" : "";
@@ -1083,7 +1100,12 @@ async Task<int> SystemStatus()
 	// so absence only means "not registered" when we could actually look.
 	var taskPath = TaskQuery.FindByPrefix("SeaShell Daemon (SYSTEM)");
 	if (taskPath != null)
+	{
 		Console.WriteLine($"  daemon task  {TaskQuery.QueryState(taskPath) ?? "unknown"} ({taskPath[(taskPath.LastIndexOf('\\') + 1)..]})");
+		var taskVersion = TaskQuery.ParseVersionSuffix(taskPath);
+		if (current != null && taskVersion != null && taskVersion != current)
+			Console.WriteLine($"  WARNING      current is v{current}, but the SYSTEM daemon task is v{taskVersion}");
+	}
 	else
 		Console.WriteLine(elevated ? "  daemon task  not registered" : "  daemon task  unknown (run elevated)");
 
