@@ -397,6 +397,20 @@ jobs:
       - name: "Test: nuget-transitive (CS1704 dedup)"
         run: sea test/nuget-transitive/nuget-transitive.cs
 
+      - name: "Test: nuget-native-dacfx (native runtime assets, Windows)"
+        if: matrix.os == 'windows'
+        shell: powershell
+        run: |
+          # End-to-end native asset staging — needs the runner's local SQL Server.
+          $svc = Get-Service -Name 'MSSQL*' -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -match '^MSSQL(\$.+|SERVER)$' -and $_.Status -eq 'Running' } |
+            Select-Object -First 1
+          if (-not $svc) { Write-Host 'No running SQL Server service on runner'; exit 1 }
+          $ds = if ($svc.Name -eq 'MSSQLSERVER') { 'localhost' } else { 'localhost\' + $svc.Name.Split('$')[1] }
+          Write-Host "Using SQL Server instance: $ds"
+          sea test/nuget-native-dacfx/nuget-native-dacfx.cs "$ds"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
       - name: "Test: host-in-host (ScriptHost compilation)"
         run: sea test/host-in-host/host-in-host.cs
 

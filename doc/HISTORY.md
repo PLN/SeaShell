@@ -21,6 +21,16 @@
   failures now point to `seashell status --system`, whose output includes the
   SYSTEM `current` junction explicitly and warns when its version differs
   from the registered daemon task.
+- **Native runtime assets load.** Packages carrying `runtimes/<rid>/native/*`
+  (SqlClient SNI, DacFx, SQLite, SkiaSharp, …) threw `DllNotFoundException` at
+  first use: native files were staged and declared at their package-relative
+  subpath while every library is `type:"project"`, whose assets the host
+  resolves against the app directory root. Native assets are now copied flat
+  and declared by bare filename, like the managed ones. Covered by a deps.json
+  unit test and an end-to-end DacFx test against a real SQL Server.
+- **IPC deserialization hardened.** The daemon/client MessagePack channel now
+  deserializes with `MessagePackSecurity.UntrustedData` (depth limits and
+  hash-collision-resistant collections).
 
 ## v0.6.0 (2026-06-11)
 

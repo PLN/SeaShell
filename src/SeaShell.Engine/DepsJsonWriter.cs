@@ -87,12 +87,14 @@ public static class DepsJsonWriter
 					a => (object)new { });
 			}
 
-			// Native assets — keep relative path (runtimes/{rid}/native/ structure
-			// is preserved in the output dir by ScriptCompiler)
+			// Native assets — bare filenames, same as managed (copied flat to output
+			// dir by ScriptCompiler). Must match the type:"project" convention: the
+			// host resolves project-library assets against the app directory root,
+			// so a runtimes/{rid}/native/ path here would never be found.
 			if (pkg.NativeAssets.Count > 0)
 			{
 				entry["native"] = pkg.NativeAssets.ToDictionary(
-					a => a.RelativePath,
+					a => Path.GetFileName(a.FullPath),
 					a => (object)new { });
 			}
 

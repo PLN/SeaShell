@@ -192,6 +192,48 @@ public class DepsJsonWriterTests : IDisposable
 		}
 	}
 
+	// ── Native assets: declared flat, matching the staged layout ───
+
+	[Fact]
+	public void Write_NativeAssets_DeclaredAsBareFilenames()
+	{
+		// Native assets are copied flat to the output dir by ScriptCompiler.
+		// With type:"project" libraries the host resolves assets against the
+		// app dir root, so the declared path must be the bare filename — a
+		// runtimes/{rid}/native/ subpath is never added to the native search
+		// directories and the first P/Invoke throws DllNotFoundException.
+		var packages = new List<NuGetResolver.ResolvedPackage>
+		{
+			new()
+			{
+				Name = "Microsoft.Data.SqlClient.SNI.runtime",
+				Version = "6.0.2",
+				PackagePath = "microsoft.data.sqlclient.sni.runtime/6.0.2",
+				CompileDlls = new List<string>(),
+				RuntimeAssets = new List<NuGetResolver.ResolvedAsset>(),
+				NativeAssets = new List<NuGetResolver.ResolvedAsset>
+				{
+					new()
+					{
+						FullPath = "/fake/runtimes/win-x64/native/Microsoft.Data.SqlClient.SNI.dll",
+						RelativePath = "runtimes/win-x64/native/Microsoft.Data.SqlClient.SNI.dll",
+					}
+				},
+			}
+		};
+
+		DepsJsonWriter.Write(_tempFile, "test", packages, _engineDir);
+
+		var doc = JsonDocument.Parse(File.ReadAllText(_tempFile));
+		var tfm = doc.RootElement.GetProperty("targets").EnumerateObject().First().Value;
+		var native = tfm.EnumerateObject()
+			.First(e => e.Name.StartsWith("Microsoft.Data.SqlClient.SNI.runtime/"))
+			.Value.GetProperty("native");
+
+		var declared = native.EnumerateObject().Select(p => p.Name).ToList();
+		Assert.Equal(new[] { "Microsoft.Data.SqlClient.SNI.dll" }, declared);
+	}
+
 	// ── Structure ──────────────────────────────────────────────────
 
 	[Fact]

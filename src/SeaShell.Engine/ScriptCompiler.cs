@@ -310,12 +310,15 @@ public sealed class ScriptCompiler
 				if (File.Exists(asset.FullPath) && !File.Exists(dest))
 					File.Copy(asset.FullPath, dest);
 			}
-			// Native DLLs — preserve runtimes/{rid}/native/ structure
+			// Native DLLs — copy flat like the managed ones. The deps.json declares
+			// every library as type:"project", and for project libraries the host
+			// resolves assets against the app directory root — a nested
+			// runtimes/{rid}/native/ copy never makes it into
+			// NATIVE_DLL_SEARCH_DIRECTORIES, so P/Invoke fails (DllNotFoundException)
+			// even though the file is on disk.
 			foreach (var asset in pkg.NativeAssets)
 			{
-				var dest = Path.Combine(outputDir, asset.RelativePath.Replace('/', Path.DirectorySeparatorChar));
-				var destDir = Path.GetDirectoryName(dest)!;
-				Directory.CreateDirectory(destDir);
+				var dest = Path.Combine(outputDir, Path.GetFileName(asset.FullPath));
 				if (File.Exists(asset.FullPath) && !File.Exists(dest))
 					File.Copy(asset.FullPath, dest);
 			}
