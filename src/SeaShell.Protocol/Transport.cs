@@ -39,6 +39,21 @@ public sealed class TransportStream : IAsyncDisposable
 		await Channel.DisposeAsync();
 		_owner?.Dispose();
 	}
+
+	/// <summary>
+	/// Send one request and wait at most <paramref name="replyTimeout"/> for the reply.
+	/// Connect timeouts only cover establishing the connection; without this a peer
+	/// that accepts but never answers blocks the caller forever. Throws
+	/// <see cref="OperationCanceledException"/> on timeout; null means disconnect.
+	/// </summary>
+	public async Task<(MessageType Type, object Message)?> RequestAsync<T>(
+		T request, TimeSpan replyTimeout, CancellationToken ct = default) where T : notnull
+	{
+		using var cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+		cts.CancelAfter(replyTimeout);
+		await Channel.SendAsync(request, cts.Token);
+		return await Channel.ReceiveAsync(cts.Token);
+	}
 }
 
 // ── Platform endpoint ───────────────────────────────────────────────────
@@ -548,8 +563,7 @@ public static class TransportClient
 		try
 		{
 			await using var conn = await ConnectAsync(address, timeoutMs: 1000, ct);
-			await conn.Channel.SendAsync(new PingRequest(), ct);
-			var reply = await conn.Channel.ReceiveAsync(ct);
+			var reply = await conn.RequestAsync(new PingRequest(), TimeSpan.FromSeconds(5), ct);
 			return reply != null;
 		}
 		catch

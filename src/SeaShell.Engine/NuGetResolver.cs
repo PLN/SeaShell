@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
@@ -25,10 +26,11 @@ public sealed class NuGetResolver
 	};
 
 	private readonly string _cacheRoot;
-	private readonly string _rid;
+	private readonly IReadOnlyList<string> _ridFallbacks;
 
-	// Per-package resolution cache: avoids re-reading .nuspec and re-probing TFM dirs
-	private readonly Dictionary<string, CachedEntry> _cache = new(StringComparer.OrdinalIgnoreCase);
+	// Per-package resolution cache: avoids re-reading .nuspec and re-probing TFM dirs.
+	// Concurrent: the daemon compiles several scripts at once on one resolver.
+	private readonly ConcurrentDictionary<string, CachedEntry> _cache = new(StringComparer.OrdinalIgnoreCase);
 
 	private sealed record CachedEntry(
 		ResolvedPackage Package,
@@ -47,14 +49,14 @@ public sealed class NuGetResolver
 	internal NuGetResolver(string cacheRoot, string rid)
 	{
 		_cacheRoot = cacheRoot;
-		_rid = rid;
+		_ridFallbacks = GetRidFallbacks(rid);
 	}
 
 	/// <summary>Invalidate all cached entries. Called after downloading new packages.</summary>
 	public void InvalidateCache() => _cache.Clear();
 
 	/// <summary>Invalidate a specific package's cached entry.</summary>
-	public void InvalidateCache(string packageName) => _cache.Remove(packageName);
+	public void InvalidateCache(string packageName) => _cache.TryRemove(packageName, out _);
 
 	public sealed record ResolvedPackage
 	{
@@ -407,7 +409,7 @@ public sealed class NuGetResolver
 	private List<ResolvedAsset> ProbeRuntimeSpecific(string versionDir, string subDir)
 	{
 		// Try exact RID first, then fall back to broader RIDs
-		foreach (var rid in GetRidFallbacks())
+		foreach (var rid in _ridFallbacks)
 		{
 			foreach (var tfm in TfmProbeOrder)
 			{
@@ -491,7 +493,7 @@ public sealed class NuGetResolver
 	/// <summary>Probe runtimes/{rid}/native/ for native DLLs.</summary>
 	private List<ResolvedAsset> ProbeNative(string versionDir)
 	{
-		foreach (var rid in GetRidFallbacks())
+		foreach (var rid in _ridFallbacks)
 		{
 			var dir = Path.Combine(versionDir, "runtimes", rid, "native");
 			if (!Directory.Exists(dir)) continue;
@@ -499,8 +501,10 @@ public sealed class NuGetResolver
 			var dlls = Directory.GetFiles(dir)
 				.Where(f =>
 				{
-					var ext = Path.GetExtension(f).ToLowerInvariant();
-					return ext is ".dll" or ".so" or ".dylib";
+					var name = Path.GetFileName(f);
+					var ext = Path.GetExtension(name).ToLowerInvariant();
+					return ext is ".dll" or ".so" or ".dylib"
+						|| name.Contains(".so.", StringComparison.OrdinalIgnoreCase); // libfoo.so.1
 				})
 				.Select(f => new ResolvedAsset
 				{
@@ -562,27 +566,85 @@ public sealed class NuGetResolver
 		&& !IsNetStandard(tfm)
 		&& !tfm.StartsWith("net4", StringComparison.OrdinalIgnoreCase);
 
-	/// <summary>RID fallback chain, e.g., linux-musl-x64 → linux-x64 → linux → any.</summary>
-	private IEnumerable<string> GetRidFallbacks()
+	private static readonly HashSet<string> KnownArchitectures = new(StringComparer.OrdinalIgnoreCase)
 	{
-		yield return _rid;                                         // e.g., linux-musl-x64
-		if (_rid.Contains("-musl-"))
+		"x64", "x86", "arm64", "arm", "armel", "s390x", "ppc64le", "riscv64", "loongarch64",
+	};
+
+	/// <summary>
+	/// RID fallback chain, most specific first — a breadth-first expansion of the
+	/// portable RID graph (Microsoft.NETCore.Platforms), the same order NuGet uses:
+	/// linux-musl-x64 → linux-musl → linux-x64 → linux → unix-x64 → unix → any → base.
+	/// Packages such as Microsoft.Data.SqlClient ship their only Linux
+	/// implementation under runtimes/unix/, so the unix nodes are essential.
+	/// </summary>
+	internal static IReadOnlyList<string> GetRidFallbacks(string rid)
+	{
+		var expansions = new List<string> { rid };
+		var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase) { rid };
+		for (var i = 0; i < expansions.Count; i++)
 		{
-			yield return _rid.Replace("-musl", "");                // e.g., linux-x64
+			foreach (var parent in GetRidParents(expansions[i]))
+			{
+				if (seen.Add(parent))
+					expansions.Add(parent);
+			}
 		}
-		var dashIdx = _rid.IndexOf('-');
-		if (dashIdx > 0) yield return _rid[..dashIdx];             // e.g., linux
-		yield return "any";
+		return expansions;
+	}
+
+	/// <summary>Direct imports of a RID in the portable RID graph.</summary>
+	private static IEnumerable<string> GetRidParents(string rid)
+	{
+		var dash = rid.LastIndexOf('-');
+		if (dash > 0 && KnownArchitectures.Contains(rid[(dash + 1)..]))
+		{
+			var os = rid[..dash];
+			var arch = rid[(dash + 1)..];
+			yield return os;                                       // linux-x64 → linux
+			if (os.Equals("linux-musl", StringComparison.OrdinalIgnoreCase))
+				yield return $"linux-{arch}";                      // linux-musl-x64 → linux-x64
+			else if (!os.Equals("win", StringComparison.OrdinalIgnoreCase)
+				&& !os.Equals("unix", StringComparison.OrdinalIgnoreCase))
+				yield return $"unix-{arch}";                       // linux-x64 → unix-x64
+			yield break;
+		}
+
+		switch (rid.ToLowerInvariant())
+		{
+			case "any":
+				yield return "base";
+				yield break;
+			case "base":
+				yield break;
+			case "linux-musl":
+				yield return "linux";
+				yield break;
+			case "linux":
+			case "osx":
+			case "freebsd":
+				yield return "unix";
+				yield break;
+			default:
+				yield return "any";
+				yield break;
+		}
 	}
 
 	private static string GetRuntimeIdentifier()
 	{
-		var arch = RuntimeInformation.OSArchitecture switch
+		// Process, not OS, architecture: scripts run under the same dotnet host
+		// architecture as this process (e.g. x64 emulation on an arm64 machine).
+		var arch = RuntimeInformation.ProcessArchitecture switch
 		{
 			Architecture.X64 => "x64",
 			Architecture.X86 => "x86",
 			Architecture.Arm64 => "arm64",
 			Architecture.Arm => "arm",
+			Architecture.S390x => "s390x",
+			Architecture.Ppc64le => "ppc64le",
+			Architecture.RiscV64 => "riscv64",
+			Architecture.LoongArch64 => "loongarch64",
 			_ => "x64",
 		};
 

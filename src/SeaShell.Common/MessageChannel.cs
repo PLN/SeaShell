@@ -17,7 +17,10 @@ namespace SeaShell.Ipc;
 /// Wire format: [4-byte LE length][1-byte MessageType tag][MessagePack payload]
 ///
 /// Supports concurrent send + receive (PipeReader and PipeWriter are independent).
-/// A write lock prevents interleaved sends from concurrent callers.
+/// A write lock prevents interleaved sends from concurrent callers; a read lock lets
+/// DisposeAsync wait for an in-flight receive. Awaits use ConfigureAwait(false):
+/// script code calls this synchronously (GetAwaiter().GetResult()), possibly under a
+/// single-threaded synchronization context.
 /// </summary>
 public sealed class MessageChannel : IAsyncDisposable
 {
@@ -26,6 +29,10 @@ public sealed class MessageChannel : IAsyncDisposable
 	private readonly Stream? _stream;
 	private readonly bool _leaveOpen;
 	private readonly SemaphoreSlim _writeLock = new(1, 1);
+	private readonly SemaphoreSlim _readLock = new(1, 1);
+	private readonly CancellationTokenSource _disposeCts = new();
+	private volatile bool _sendFaulted;
+	private int _disposed;
 
 	private const int HeaderSize = 4; // length prefix
 	private const int TagSize = 1;    // MessageType byte
@@ -49,8 +56,24 @@ public sealed class MessageChannel : IAsyncDisposable
 	{
 		var tag = MessageTypeMap.GetTag<T>();
 		var payload = MessagePackSerializer.Serialize(message, MsgPackOpts, ct);
+		await WriteFrameAsync(tag, payload, ct).ConfigureAwait(false);
+	}
 
-		await _writeLock.WaitAsync(ct);
+	/// <summary>Send a message using a runtime type (for forwarding).</summary>
+	public async ValueTask SendAsync(MessageType tag, object message, CancellationToken ct = default)
+	{
+		var clrType = MessageTypeMap.GetClrType(tag);
+		var payload = MessagePackSerializer.Serialize(clrType, message, MsgPackOpts, ct);
+		await WriteFrameAsync(tag, payload, ct).ConfigureAwait(false);
+	}
+
+	private async ValueTask WriteFrameAsync(MessageType tag, byte[] payload, CancellationToken ct)
+	{
+		ObjectDisposedException.ThrowIf(Volatile.Read(ref _disposed) != 0, this);
+
+		// DisposeAsync cancels this to unwind a send blocked on a peer that stopped reading.
+		using var linked = CancellationTokenSource.CreateLinkedTokenSource(ct, _disposeCts.Token);
+		await _writeLock.WaitAsync(linked.Token).ConfigureAwait(false);
 		try
 		{
 			var frameLength = TagSize + payload.Length;
@@ -70,38 +93,15 @@ public sealed class MessageChannel : IAsyncDisposable
 			payload.CopyTo(dest);
 			_writer.Advance(payload.Length);
 
-			await _writer.FlushAsync(ct);
+			await _writer.FlushAsync(linked.Token).ConfigureAwait(false);
 		}
-		finally
+		catch
 		{
-			_writeLock.Release();
-		}
-	}
-
-	/// <summary>Send a message using a runtime type (for forwarding).</summary>
-	public async ValueTask SendAsync(MessageType tag, object message, CancellationToken ct = default)
-	{
-		var clrType = MessageTypeMap.GetClrType(tag);
-		var payload = MessagePackSerializer.Serialize(clrType, message, MsgPackOpts, ct);
-
-		await _writeLock.WaitAsync(ct);
-		try
-		{
-			var frameLength = TagSize + payload.Length;
-
-			var header = _writer.GetMemory(HeaderSize);
-			BinaryPrimitives.WriteUInt32LittleEndian(header.Span, (uint)frameLength);
-			_writer.Advance(HeaderSize);
-
-			var tagMem = _writer.GetMemory(TagSize);
-			tagMem.Span[0] = (byte)tag;
-			_writer.Advance(TagSize);
-
-			var dest = _writer.GetMemory(payload.Length);
-			payload.CopyTo(dest);
-			_writer.Advance(payload.Length);
-
-			await _writer.FlushAsync(ct);
+			// A cancelled or failed flush can leave a partial frame buffered for a
+			// peer that isn't reading. Completing the writer normally would retry
+			// that write with no deadline, so DisposeAsync discards it instead.
+			_sendFaulted = true;
+			throw;
 		}
 		finally
 		{
@@ -115,12 +115,39 @@ public sealed class MessageChannel : IAsyncDisposable
 	/// </summary>
 	public async ValueTask<(MessageType Type, object Message)?> ReceiveAsync(CancellationToken ct = default)
 	{
+		if (Volatile.Read(ref _disposed) != 0) return null;
+
+		using var linked = CancellationTokenSource.CreateLinkedTokenSource(ct, _disposeCts.Token);
+		try
+		{
+			await _readLock.WaitAsync(linked.Token).ConfigureAwait(false);
+		}
+		catch (OperationCanceledException) when (_disposeCts.IsCancellationRequested && !ct.IsCancellationRequested)
+		{
+			return null; // disposed while waiting: same as a disconnect
+		}
+
+		try
+		{
+			// Disposal cancels a pending read via CancelPendingRead (→ null), then
+			// waits for this lock before completing the reader under us.
+			if (Volatile.Read(ref _disposed) != 0) return null;
+			return await ReceiveCoreAsync(ct).ConfigureAwait(false);
+		}
+		finally
+		{
+			_readLock.Release();
+		}
+	}
+
+	private async ValueTask<(MessageType Type, object Message)?> ReceiveCoreAsync(CancellationToken ct)
+	{
 		uint frameLength = 0;
 		bool headerRead = false;
 
 		while (true)
 		{
-			var result = await _reader.ReadAsync(ct);
+			var result = await _reader.ReadAsync(ct).ConfigureAwait(false);
 			var buffer = result.Buffer;
 
 			if (result.IsCanceled)
@@ -197,16 +224,38 @@ public sealed class MessageChannel : IAsyncDisposable
 	/// <summary>Receive and cast to the expected type. Returns default if disconnected.</summary>
 	public async ValueTask<T?> ReceiveAsync<T>(CancellationToken ct = default) where T : class
 	{
-		var result = await ReceiveAsync(ct);
+		var result = await ReceiveAsync(ct).ConfigureAwait(false);
 		return result?.Message as T;
 	}
 
 	public async ValueTask DisposeAsync()
 	{
-		await _reader.CompleteAsync();
-		await _writer.CompleteAsync();
-		if (!_leaveOpen && _stream != null)
-			await _stream.DisposeAsync();
-		_writeLock.Dispose();
+		if (Interlocked.Exchange(ref _disposed, 1) != 0) return;
+
+		// Unwind in-flight I/O first: a pending read returns null (disconnect), a
+		// blocked send is cancelled and marks the channel faulted.
+		_disposeCts.Cancel();
+		_reader.CancelPendingRead();
+
+		// Reader and writer must be idle before they are completed — completing under
+		// an active read or flush releases buffers that operation still uses. The locks
+		// are never released again: late sends throw, late receives return null.
+		var readerIdle = await _readLock.WaitAsync(TimeSpan.FromSeconds(5)).ConfigureAwait(false);
+		var writerIdle = await _writeLock.WaitAsync(TimeSpan.FromSeconds(5)).ConfigureAwait(false);
+		try
+		{
+			if (readerIdle)
+				await _reader.CompleteAsync().ConfigureAwait(false);
+			// Completing with an exception skips flushing a partial frame left by a
+			// failed send. If a send ignored cancellation, closing the stream below
+			// is what unblocks it.
+			if (writerIdle)
+				await _writer.CompleteAsync(_sendFaulted ? new OperationCanceledException("Send aborted") : null).ConfigureAwait(false);
+		}
+		finally
+		{
+			if (!_leaveOpen && _stream != null)
+				await _stream.DisposeAsync().ConfigureAwait(false);
+		}
 	}
 }

@@ -35,6 +35,8 @@ public enum MessageType : byte
 	ReplEvalReq     = 28,
 	ReplEvalResp    = 29,
 	RecompileRequest = 30,
+	CacheTouchRequest  = 31,
+	CacheTouchResponse = 32,
 
 	// Attach protocol (blocked caller ↔ running script)
 	AttachHello     = 50,
@@ -78,6 +80,8 @@ public static class MessageTypeMap
 		[typeof(ReplEvalRequest)]   = MessageType.ReplEvalReq,
 		[typeof(ReplEvalResponse)]  = MessageType.ReplEvalResp,
 		[typeof(RecompileRequest)]  = MessageType.RecompileRequest,
+		[typeof(CacheTouchRequest)]  = MessageType.CacheTouchRequest,
+		[typeof(CacheTouchResponse)] = MessageType.CacheTouchResponse,
 		[typeof(AttachHello)]     = MessageType.AttachHello,
 		[typeof(AttachMessage)]   = MessageType.AttachMessage,
 		[typeof(AttachClose)]     = MessageType.AttachClose,
@@ -242,6 +246,15 @@ public sealed record StopRequest();
 /// <summary>CLI → Daemon: request immediate recompilation (triggered by script-initiated reload).</summary>
 public sealed record RecompileRequest(bool ClearCache = false);
 
+/// <summary>
+/// CLI → Daemon keep-alive: a script launched from this cache output dir is still
+/// running, so the cache sweep must treat the entry as just hit.
+/// </summary>
+public sealed record CacheTouchRequest(string OutputDir);
+
+/// <summary>Daemon → CLI: whether the dir is one of the daemon's cache entries.</summary>
+public sealed record CacheTouchResponse(bool Known);
+
 // ── REPL protocol ───────────────────────────────────────────────────
 
 /// <summary>CLI → Daemon: start an interactive REPL session over this connection.</summary>
@@ -305,12 +318,20 @@ public sealed record SpawnRequest(
 	string[] EnvironmentVars,
 	int CliPid,
 	int AwaitElevatorMs = 0,
-	bool DirectExe = false
+	bool DirectExe = false,
+	// Environment.TickCount64 after which the daemon must not forward the request to
+	// the elevator (0 = no deadline). Set by the CLI so a request it already gave up
+	// on is never started late. TickCount64 is monotonic and machine-wide, so CLI and
+	// daemon compare the same clock, immune to wall-clock adjustments.
+	long ForwardDeadlineTickCount = 0
 );
 
 /// <summary>Elevator → Daemon: result of the spawn.</summary>
 public sealed record SpawnResponse(
 	bool Success,
 	int ProcessId,
-	string? Error
+	string? Error,
+	// On failure: true when the request may have reached the elevator, so the
+	// process may be running and the spawn must not be retried.
+	bool MayHaveStarted = false
 );

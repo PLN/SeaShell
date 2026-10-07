@@ -16,7 +16,6 @@ namespace SeaShell.Engine;
 public sealed class IncludeResolver
 {
 	private readonly List<string> _searchPaths;
-	private readonly List<string> _scriptIncludeDirs = new(); // from //sea_incdir, per-resolve
 
 	public IncludeResolver(IEnumerable<string>? extraSearchPaths = null)
 	{
@@ -79,14 +78,15 @@ public sealed class IncludeResolver
 		mainScriptPath = Path.GetFullPath(mainScriptPath);
 		var mainDir = Path.GetDirectoryName(mainScriptPath)!;
 
-		_scriptIncludeDirs.Clear(); // fresh per resolve
-
+		// //sea_incdir dirs are per resolve and stay local: the daemon resolves
+		// scripts concurrently on one shared IncludeResolver.
+		var scriptIncludeDirs = new List<string>();
 		var visited = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 		var orderedSources = new List<(string Path, string Source)>();
 		var aggregated = new DirectiveParser.DirectiveSet();
 
 		// Resolve the main script and all its transitive includes
-		ResolveRecursive(mainScriptPath, mainDir, visited, orderedSources, aggregated);
+		ResolveRecursive(mainScriptPath, mainDir, scriptIncludeDirs, visited, orderedSources, aggregated);
 
 		return new ResolvedScript
 		{
@@ -98,6 +98,7 @@ public sealed class IncludeResolver
 	private void ResolveRecursive(
 		string filePath,
 		string scriptDir,
+		List<string> scriptIncludeDirs,
 		HashSet<string> visited,
 		List<(string Path, string Source)> orderedSources,
 		DirectiveParser.DirectiveSet aggregated)
@@ -117,18 +118,18 @@ public sealed class IncludeResolver
 		{
 			var expanded = Path.GetFullPath(dir);
 			if (Directory.Exists(expanded) && !_searchPaths.Contains(expanded))
-				_scriptIncludeDirs.Add(expanded);
+				scriptIncludeDirs.Add(expanded);
 		}
 
 		// Process includes first (depth-first → dependencies before dependents)
 		foreach (var inc in directives.Includes)
 		{
-			var resolved = FindInclude(inc, scriptDir);
+			var resolved = FindInclude(inc, scriptDir, scriptIncludeDirs);
 			if (resolved == null)
 				throw new FileNotFoundException($"Include not found: {inc} (from {filePath})", inc);
 
 			var incDir = Path.GetDirectoryName(resolved)!;
-			ResolveRecursive(resolved, incDir, visited, orderedSources, aggregated);
+			ResolveRecursive(resolved, incDir, scriptIncludeDirs, visited, orderedSources, aggregated);
 		}
 
 		// Add this source (after its includes)
@@ -174,14 +175,14 @@ public sealed class IncludeResolver
 		return source[newline..];
 	}
 
-	private string? FindInclude(string name, string scriptDir)
+	private string? FindInclude(string name, string scriptDir, List<string> scriptIncludeDirs)
 	{
 		// 1. Script's own directory
 		var candidate = Path.Combine(scriptDir, name);
 		if (File.Exists(candidate)) return Path.GetFullPath(candidate);
 
 		// 2. Script-declared include dirs (//sea_incdir)
-		foreach (var dir in _scriptIncludeDirs)
+		foreach (var dir in scriptIncludeDirs)
 		{
 			candidate = Path.Combine(dir, name);
 			if (File.Exists(candidate)) return Path.GetFullPath(candidate);

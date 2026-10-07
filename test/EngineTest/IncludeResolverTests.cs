@@ -121,6 +121,42 @@ public class IncludeResolverTests
 		finally { Directory.Delete(dir, true); }
 	}
 
+	[Fact]
+	public void Resolve_ConcurrentScriptsKeepTheirOwnIncludeDirs()
+	{
+		// The daemon resolves scripts concurrently on one IncludeResolver. Each script
+		// names a different //sea_incdir holding a same-named include.
+		var dir = CreateTempDir();
+		try
+		{
+			string MakeScript(string name)
+			{
+				var lib = Path.Combine(dir, name, "lib");
+				var scriptDir = Path.Combine(dir, name, "script");
+				Directory.CreateDirectory(lib);
+				Directory.CreateDirectory(scriptDir);
+				File.WriteAllText(Path.Combine(lib, "shared.cs"), $"// from {name}\n");
+				var main = Path.Combine(scriptDir, "main.cs");
+				File.WriteAllText(main, $"//sea_incdir {lib}\n//sea_inc shared.cs\n");
+				return main;
+			}
+			var scripts = new[] { MakeScript("a"), MakeScript("b") };
+
+			var resolver = new IncludeResolver();
+			var wrong = 0;
+			System.Threading.Tasks.Parallel.For(0, 200, i =>
+			{
+				var name = i % 2 == 0 ? "a" : "b";
+				var result = resolver.Resolve(scripts[i % 2]);
+				if (!result.Sources.Exists(src => src.Source.Contains($"// from {name}")))
+					System.Threading.Interlocked.Increment(ref wrong);
+			});
+
+			Assert.Equal(0, wrong);
+		}
+		finally { Directory.Delete(dir, true); }
+	}
+
 	private static string CreateTempDir()
 	{
 		var dir = Path.Combine(Path.GetTempPath(), $"seashell-test-{System.Guid.NewGuid():N}");

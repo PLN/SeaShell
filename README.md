@@ -64,7 +64,7 @@ SeaShell is inspired by and grateful to [CS-Script](https://github.com/oleg-shil
 - **NuGet just works** — Transitive dependency resolution via .nuspec walking. Auto-download. Runtime-specific and native DLLs handled via .deps.json generation.
 - **Hot-swap** — Edit a `//sea_watch` script while it runs. SeaShell recompiles and swaps the process, with state handoff between instances.
 - **REPL** — `sea` with no arguments drops into an interactive session. Variables and state carry across evaluations.
-- **Elevation** — `//sea_elevate` scripts run elevated via a pre-registered Task Scheduler worker. No UAC prompts. Falls back to `gsudo sea script.cs` if the elevator isn't running. Ignored on Linux.
+- **Elevation** — `//sea_elevate` scripts run elevated via a pre-registered Task Scheduler worker. No UAC prompts. Requires a running or registered elevator unless the CLI is already elevated. Ignored on Linux.
 - **Binary running** — Run pre-compiled `.dll` and `.exe` files with full Sea context. Single-file executables, apphosts, and plain DLLs all supported. Companion `.sea.json` enables directives for binaries.
 - **Script-initiated reload** — `Sea.RequestReload()` triggers recompilation and hot-swap from within a script. Optional `clearCache` for forced fresh builds. Works in both direct and watch mode.
 - **Service hosting** — `SeaShell.Host` includes service hosting (namespace `SeaShell.ServiceHost`). Runs scripts as system services. Windows Service, systemd, runit, OpenRC, sysvinit — auto-detected. Zero-locking automatic updates via NuGet.
@@ -85,7 +85,7 @@ SeaShell is inspired by and grateful to [CS-Script](https://github.com/oleg-shil
 | `//sea_incdir %ProgramData%/mylibs` | Add an include search directory (env vars expanded) |
 | `//sea_ref path/to/lib.dll` | Explicit assembly reference |
 | `//sea_webapp` | Enable ASP.NET Core shared framework |
-| `//sea_elevate` | Run elevated (via Elevator or gsudo; ignored on Linux) |
+| `//sea_elevate` | Run elevated (via Elevator; ignored on Linux) |
 | `//sea_watch` | Hot-swap: recompile and restart on source file changes |
 | `//sea_restart` | Auto-restart on exit (with crash backoff) |
 | `//sea_mutex` | Single instance (system scope). `//sea_mutex session` or `user` for narrower scope |
@@ -232,8 +232,8 @@ Three scopes control the mutex boundary:
 | `//sea_mutex user` | Per-user. Different users can each run one instance. |
 | `//sea_mutex session` | Per-session. Same user can run one per login session. |
 
-On Windows, scopes map to named kernel mutexes (`Global\`, default, `Local\`).
-On Linux, file locks in scope-appropriate directories.
+On Windows, system and user scopes use `Global\` (user scope includes the SID);
+session scope uses `Local\`. On Linux, file locks in scope-appropriate directories.
 
 ### Attach
 
@@ -279,8 +279,8 @@ Console.WriteLine("I have a console window");
 When seaw.exe encounters an error without a console, it writes to the Windows Event
 Log (SeaShell source) so errors aren't silently lost.
 
-The `.csw` extension is a convention for window-mode scripts. Associate it with
-seaw.exe via `seaw --associate .csw`.
+The `.csw` extension is a convention for window-mode scripts. `seashell install`
+associates it with seaw.exe.
 
 ## Embedding (SeaShell.Host)
 
@@ -373,7 +373,8 @@ Supported init systems (auto-detected): Windows Service, systemd, runit, OpenRC,
 
 Use `sea --start` / `sea --stop` / `sea --status` (or `seashell start`/`stop`/`status`) for lifecycle and state. `sea --stop` uses IPC first (works on Linux too), then ends Task Scheduler tasks. The daemon also starts lazily on first `sea` invocation if no task is registered.
 
-The elevator is optional — without it, `//sea_elevate` scripts fall back to `gsudo sea script.cs`. When the elevator task is registered but not running, `sea` auto-starts it on demand.
+The elevator is optional — without it, `//sea_elevate` scripts require an already
+elevated CLI. When its task is registered but not running, `sea` auto-starts it on demand.
 
 ## Bootstrapper Commands
 
@@ -422,8 +423,8 @@ See [doc/ARCHITECTURE.md](doc/ARCHITECTURE.md) for the full architecture,
 ## File Association (Windows)
 
 `seashell install` registers `.cs` and `.csw` per-user (HKCU), pointing at
-the per-version `sea.exe` / `seaw.exe` via the `current` junction so the
-association survives updates. Double-click a `.cs` file in Explorer to run
+the per-version `sea.exe` / `seaw.exe`. Associations are re-registered on
+install or update. Double-click a `.cs` file in Explorer to run
 it with SeaShell; `.csw` files are run by `seaw.exe` in Windows subsystem
 mode (no console flash).
 
@@ -461,7 +462,7 @@ All runtime data lives in a persistent per-user directory (not temp):
 |---------|------|
 | Windows user | `%LOCALAPPDATA%\seashell\` |
 | Windows SYSTEM | `%SystemRoot%\System32\config\systemprofile\AppData\Local\seashell\` |
-| Linux user | `~/.local/share/seashell/` |
+| Linux user | `$XDG_DATA_HOME/seashell/` (or `~/.local/share/seashell/`) |
 | Linux root | `/var/lib/seashell/` |
 
 Override with `SEASHELL_DATA` environment variable. Layout under each:
@@ -477,16 +478,24 @@ older ones only after the running daemon confirms no active clients.
 
 ### Compilation Cache
 
-Compiled scripts are cached in `{DataDir}/cache/`. The cache key is a SHA256 hash of:
-- All source files (main script + includes, by content)
-- All resolved NuGet package versions (name@version)
-- The Engine and Script assembly timestamps
+Compiled scripts are cached in `{DataDir}/v{version}/cache/{script}_{hash8}/`. The cache key is a SHA256 hash of:
+- All source files (main script + includes, by path and content)
+- Resolved direct NuGet package versions (name@version; transitives excluded)
+- The engine fingerprint (Engine, Script, Common, and MessagePack assembly timestamps)
 
-A cache hit skips Roslyn entirely — the daemon returns the existing DLL. The cache invalidates automatically when:
+A cache hit skips Roslyn entirely — the daemon returns the existing artifacts. The cache invalidates automatically when:
 - Any source file changes
-- A NuGet package is updated to a new version
-- The SeaShell engine or script runtime is rebuilt
-- The .NET SDK is updated (Engine DLL is recompiled)
+- A direct NuGet package resolves to a different version
+- An assembly in the engine fingerprint is rebuilt
+
+Unused entries are cleaned up automatically. The daemon tracks when each entry was
+created and last hit (`cache/.tracker.json`) and sweeps hourly:
+- An entry not hit for **24 hours** is deleted — one-off scripts and edited versions don't pile up.
+- An entry recreated within **30 days** of its last hit (a weekly job, say) is promoted
+  and then kept until it goes **30 days** without a hit.
+- A running script counts as a hit: its `sea`/host process pings the daemon every
+  10 minutes, and the sweep never deletes an entry whose files a running process has
+  loaded — long-running services and watch sessions keep their files.
 
 ### Exit Delay (Windows)
 
@@ -518,7 +527,8 @@ Sea.Reloading += () => app.StopAsync().Wait(TimeSpan.FromSeconds(2));
 app.Run("http://localhost:5199");
 ```
 
-Edit, save — the new version is serving on the same port in seconds. No downtime, no port conflicts. Without the `StopAsync` call, the killed process may leave the port in TIME_WAIT and the new instance would fail to bind.
+Edit, save — the CLI waits for the old process to exit before starting the replacement.
+The `StopAsync` call gives Kestrel a chance to shut down cleanly during reload.
 
 ### Elevation Cascade
 
@@ -526,13 +536,13 @@ When a script has `//sea_elevate`, the CLI resolves it in order:
 1. Already elevated? (e.g., `gsudo sea script.cs`) — spawn directly
 2. Elevator worker connected to daemon? — delegate to it (no UAC prompt)
 3. Elevator task registered but not running? — auto-start it, wait for it to connect (up to 15s), then delegate
-4. None of the above — error with a helpful message suggesting `gsudo` or an elevated `seashell install`
+4. None of the above — error (`Elevation failed: ...`)
 
 On Linux, `//sea_elevate` is silently ignored.
 
 ### NuGet Resolution
 
-Packages are resolved from the global NuGet cache (`~/.nuget/packages/`). Transitive dependencies are walked via .nuspec files. Runtime-specific DLLs (`runtimes/{rid}/lib/{tfm}/`) and native DLLs (`runtimes/{rid}/native/`) are included in the generated `.deps.json`, which the dotnet host reads for correct assembly probing. This is the key improvement over CS-Script, which loads the generic `lib/{tfm}/` stub and fails on packages like `Microsoft.Data.SqlClient`.
+Packages are resolved from the global NuGet cache (`~/.nuget/packages/`). Transitive dependencies are walked via .nuspec files. Runtime-specific DLLs (`runtimes/{rid}/lib/{tfm}/`) and native DLLs (`runtimes/{rid}/native/`) are copied flat into the script output directory and declared by bare filename in the generated `.deps.json` (all libraries are type:"project"), which the dotnet host reads for correct assembly probing. This is the key improvement over CS-Script, which loads the generic `lib/{tfm}/` stub and fails on packages like `Microsoft.Data.SqlClient`.
 
 All configured NuGet sources from the user's `nuget.config` are checked. The background updater probes sources before iterating packages (circuit breaker) and distinguishes 404 (package not on this source) from 5xx (service error) to avoid false positives.
 

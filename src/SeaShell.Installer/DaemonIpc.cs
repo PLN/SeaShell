@@ -19,8 +19,7 @@ public static class DaemonIpc
 		try
 		{
 			await using var conn = await TransportClient.ConnectAsync(address, timeoutMs);
-			await conn.Channel.SendAsync(new PingRequest());
-			var reply = await conn.Channel.ReceiveAsync();
+			var reply = await conn.RequestAsync(new PingRequest(), TimeSpan.FromSeconds(5));
 			if (reply == null) return null;
 			return reply.Value.Message as PingResponse;
 		}
@@ -38,8 +37,7 @@ public static class DaemonIpc
 		try
 		{
 			await using var conn = await TransportClient.ConnectAsync(address, timeoutMs);
-			await conn.Channel.SendAsync(new StopRequest());
-			await conn.Channel.ReceiveAsync();
+			await conn.RequestAsync(new StopRequest(), TimeSpan.FromMilliseconds(timeoutMs));
 			return true;
 		}
 		catch

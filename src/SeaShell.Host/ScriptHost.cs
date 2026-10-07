@@ -94,7 +94,10 @@ public sealed class ScriptHost
 
 	/// <summary>
 	/// Run an already-compiled script. Use this when you want to compile once
-	/// and run multiple times.
+	/// and run multiple times. The compiled output lives in the daemon's cache, which
+	/// deletes entries unused for 24 hours: if a <see cref="CompiledScript"/> may sit
+	/// longer than that between runs, call <see cref="CompileAsync"/> again first
+	/// (a cache hit, so cheap).
 	/// </summary>
 	public async Task<ScriptResult> ExecuteAsync(
 		CompiledScript compiled,

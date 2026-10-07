@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.IO.Pipes;
+using System.Linq;
 using System.Runtime.InteropServices;
 using System.Text.Json;
 using System.Threading;
@@ -152,7 +153,7 @@ public sealed class ScriptInvoker
 		if (compiled.Watch)
 		{
 			// Watch mode keeps the daemon connection open for HotSwapNotify
-			return await ExecuteWatchAsync(conn, compiled, args, output, connection, workingDirectory, environmentVars, windowMode, ct);
+			return await ExecuteWatchAsync(conn, resolvedAddress, compiled, args, output, connection, workingDirectory, environmentVars, windowMode, ct);
 		}
 
 		await conn.DisposeAsync();
@@ -169,7 +170,7 @@ public sealed class ScriptInvoker
 		bool windowMode = false,
 		CancellationToken ct = default)
 	{
-		return ExecuteDirectAsync(compiled, args, daemonAddress, scriptPath, output, connection, workingDirectory, environmentVars, windowMode, ct);
+		return ExecuteDirectAsync(compiled, args, daemonAddress, scriptPath, output, connection, workingDirectory, environmentVars, windowMode, ct, precompiled: true);
 	}
 
 	// ── Direct execution ────────────────────────────────────────────────
@@ -179,13 +180,18 @@ public sealed class ScriptInvoker
 		string? daemonAddress, string? scriptPath,
 		OutputMode output, ScriptConnection? connection,
 		string? workingDirectory, Dictionary<string, string>? environmentVars,
-		bool windowMode, CancellationToken ct)
+		bool windowMode, CancellationToken ct, bool precompiled = false)
 	{
 		var reloadCount = 0;
 		var restartCount = 0;
 		var currentCompiled = compiled;
 		string? stateBase64 = null;
 		var consecutiveFastExits = 0;
+		// Compiled earlier (ExecuteAsync): record the hit before starting, so the cache
+		// sweep cannot take the entry from under the starting script.
+		await using var keepAlive = await CacheKeepAlive.StartAsync(daemonAddress, compiled, touchNow: precompiled, ct);
+		if (precompiled && !ArtifactsPresent(compiled))
+			return new ScriptResult(1, "", "Compiled script is no longer in the cache (unused for over a day) — compile it again");
 
 		if (compiled.Restart)
 			_verboseLog?.Invoke("restart mode active");
@@ -261,9 +267,18 @@ public sealed class ScriptInvoker
 
 			stateBase64 = result.State;
 			currentCompiled = recompiled;
+			keepAlive.Update(currentCompiled);
 			reloadCount++;
 		}
 	}
+
+	/// <summary>
+	/// All of a compiled script's files still exist. A binary run in place keeps its
+	/// executable when its staged manifest expires, and would start without Sea context.
+	/// </summary>
+	private static bool ArtifactsPresent(CompiledScript compiled) =>
+		new[] { compiled.AssemblyPath, compiled.ManifestPath, compiled.RuntimeConfigPath, compiled.DepsJsonPath }
+			.All(path => path == null || File.Exists(path));
 
 	// ── Elevated execution ──────────────────────────────────────────────
 
@@ -274,6 +289,7 @@ public sealed class ScriptInvoker
 	{
 		var restartCount = 0;
 		var consecutiveFastExits = 0;
+		await using var keepAlive = await CacheKeepAlive.StartAsync(daemonAddress, compiled, touchNow: false, ct);
 
 		while (true)
 		{
@@ -298,8 +314,9 @@ public sealed class ScriptInvoker
 
 			var spawnResult = await DaemonManager.RequestElevatedSpawnAsync(daemonAddress, spawnReq);
 
-			// Elevator not connected — try starting it, then retry with wait
-			if (!spawnResult.Success)
+			// Elevator not connected — try starting it, then retry with wait. Never
+			// retry a request that may have reached an elevator: it could be running.
+			if (!spawnResult.Success && !spawnResult.MayHaveStarted)
 			{
 				if (TryStartElevator())
 				{
@@ -368,7 +385,7 @@ public sealed class ScriptInvoker
 	// ── Watch mode ──────────────────────────────────────────────────────
 
 	private async Task<ScriptResult> ExecuteWatchAsync(
-		TransportStream daemonConn, CompiledScript initial, string[] args,
+		TransportStream daemonConn, string daemonAddress, CompiledScript initial, string[] args,
 		OutputMode output, ScriptConnection? connection,
 		string? workingDirectory, Dictionary<string, string>? environmentVars,
 		bool windowMode, CancellationToken ct)
@@ -378,6 +395,7 @@ public sealed class ScriptInvoker
 		var consecutiveFastExits = 0;
 		var currentCompiled = initial;
 		string? stateBase64 = null;
+		await using var keepAlive = await CacheKeepAlive.StartAsync(daemonAddress, initial, touchNow: false, ct);
 
 		try
 		{
@@ -527,6 +545,7 @@ public sealed class ScriptInvoker
 					swapNotify.DirectExe,
 					false, true,
 					swapNotify.Restart);
+				keepAlive.Update(currentCompiled);
 
 				}
 				finally

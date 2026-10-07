@@ -89,17 +89,33 @@ public static class CompilationCache
 		return Convert.ToHexString(sha.Hash!).ToLowerInvariant();
 	}
 
-	/// <summary>Delete all cache directories for a script (name_* pattern).</summary>
+	/// <summary>
+	/// Delete all cache directories for a script (name_* pattern). Prefer
+	/// <see cref="ScriptCompiler.ClearCache"/>, which also excludes concurrent compiles.
+	/// </summary>
 	public static void ClearScript(string cacheDir, string scriptName)
 	{
 		try
 		{
 			foreach (var dir in Directory.GetDirectories(cacheDir, $"{scriptName}_*"))
-			{
-				try { Directory.Delete(dir, recursive: true); }
-				catch { } // locked by running process — will be cleaned up on next run
-			}
+				ClearDir(dir);
 		}
 		catch { }
+	}
+
+	/// <summary>
+	/// Delete one output dir, completion marker first: when a file locked by a
+	/// running script stops the delete halfway, what remains is a cache miss
+	/// (repaired by the next compile), never a cache hit over missing files.
+	/// </summary>
+	internal static void ClearDir(string dir)
+	{
+		try
+		{
+			foreach (var marker in Directory.GetFiles(dir, "*.complete"))
+				File.Delete(marker);
+			Directory.Delete(dir, recursive: true);
+		}
+		catch { } // locked by running process — will be cleaned up on next run
 	}
 }

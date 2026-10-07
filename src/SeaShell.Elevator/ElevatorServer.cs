@@ -106,6 +106,7 @@ public sealed class ElevatorWorker
 	{
 		_log.Information("Spawn: {AssemblyPath}", request.AssemblyPath);
 
+		var created = false;
 		try
 		{
 			ProcessStartInfo psi;
@@ -157,8 +158,13 @@ public sealed class ElevatorWorker
 			}
 
 			using var proc = Process.Start(psi);
-			if (proc == null || proc.HasExited)
+			if (proc == null)
 				return new SpawnResponse(false, 0, "Failed to start process");
+			// From here the process exists: even a failure report must say so, or the
+			// CLI would retry and run the script a second time.
+			created = true;
+			if (proc.HasExited)
+				return new SpawnResponse(false, 0, "Process exited immediately", MayHaveStarted: true);
 
 			var pid = proc.Id;
 			_log.Information("Spawned pid {ProcessId}", pid);
@@ -167,7 +173,7 @@ public sealed class ElevatorWorker
 		catch (Exception ex)
 		{
 			_log.Error(ex, "Spawn failed");
-			return new SpawnResponse(false, 0, ex.Message);
+			return new SpawnResponse(false, 0, ex.Message, MayHaveStarted: created);
 		}
 	}
 

@@ -377,7 +377,31 @@ jobs:
       # ── Phase 2: Functional tests ──────────────────────────────────
 
       - name: "Test: dotnet test EngineTest"
-        run: dotnet test test/EngineTest/EngineTest.csproj -c Release --no-build
+        # No --no-build: this job starts from a fresh checkout. --no-build also
+        # skips restore, so without the test SDK's targets the project isn't
+        # recognised as a test project and the step "passes" running nothing.
+        # dotnet test can exit 0 without running anything, so require a results file.
+        run: |
+          RESULTS="$(pwd)/artifacts/enginetest"
+          rm -rf "$RESULTS"
+          TEST_STATUS=0
+          dotnet test test/EngineTest/EngineTest.csproj -c Release \
+            --results-directory "$RESULTS" --logger "trx;LogFileName=enginetest.trx" || TEST_STATUS=$?
+          if [ ! -f "$RESULTS/enginetest.trx" ]; then
+            echo "EngineTest produced no results file - diagnostics:"
+            dotnet --info | head -30
+            env | grep -iE '^(DOTNET|VSTEST|MSBUILD|NUGET|TERM)' || true
+            dotnet test test/EngineTest/EngineTest.csproj -c Release -v detailed 2>&1 \
+              | grep -iE 'VSTest|IsTestProject|TestSdk|testhost|skipp|Microsoft\.NET\.Test' | head -80
+            exit 1
+          fi
+          grep -o '<Counters [^>]*>' "$RESULTS/enginetest.trx"
+          if [ "$TEST_STATUS" -ne 0 ]; then
+            # The musl runner's log does not show VSTest's console output; name the failures.
+            echo "Failed tests:"
+            grep -o 'testName="[^"]*"[^>]*outcome="Failed"' "$RESULTS/enginetest.trx" | sed 's/^testName="//; s/".*//'
+            exit "$TEST_STATUS"
+          fi
 
       - name: "Test: engine-dir-nuget (dotnet run, NuGet cache layout)"
 
@@ -396,6 +420,12 @@ jobs:
 
       - name: "Test: nuget-transitive (CS1704 dedup)"
         run: sea test/nuget-transitive/nuget-transitive.cs
+
+      - name: "Test: nuget-native-sqlite (native runtime assets, per RID)"
+        run: sea test/nuget-native-sqlite/nuget-native-sqlite.cs
+
+      - name: "Test: nuget-runtime-sqlclient (RID-specific managed assets)"
+        run: sea test/nuget-runtime-sqlclient/nuget-runtime-sqlclient.cs
 
       - name: "Test: nuget-native-dacfx (native runtime assets, Windows)"
         if: matrix.os == 'windows'
@@ -829,13 +859,8 @@ jobs:
         if: matrix.os == 'windows'
         shell: powershell
         run: |
-          $seawExe = Join-Path $env:LOCALAPPDATA 'seashell\bin\seaw.exe'
-          Write-Host ('  Checking: ' + $seawExe + ' -> ' + (Test-Path $seawExe))
-          if (-not (Test-Path $seawExe)) {
-            $seawExe = Join-Path $env:USERPROFILE '.dotnet\tools\seaw.exe'
-            Write-Host ('  Fallback: ' + $seawExe + ' -> ' + (Test-Path $seawExe))
-          }
-          if (-not (Test-Path $seawExe)) { Write-Host 'seaw.exe not found, skipping'; exit 0 }
+          $seawExe = Join-Path $env:LOCALAPPDATA 'seashell\current\bin\seaw.exe'
+          if (-not (Test-Path $seawExe)) { Write-Host ('seaw.exe not found: ' + $seawExe); exit 1 }
           Write-Host ('  Using: ' + $seawExe)
 
           $markerPath = (Join-Path (Get-Location) 'artifacts\seaw_window_marker.txt')
@@ -877,11 +902,8 @@ jobs:
         if: matrix.os == 'windows'
         shell: powershell
         run: |
-          $seawExe = Join-Path $env:LOCALAPPDATA 'seashell\bin\seaw.exe'
-          if (-not (Test-Path $seawExe)) {
-            $seawExe = Join-Path $env:USERPROFILE '.dotnet\tools\seaw.exe'
-          }
-          if (-not (Test-Path $seawExe)) { Write-Host 'seaw.exe not found, skipping'; exit 0 }
+          $seawExe = Join-Path $env:LOCALAPPDATA 'seashell\current\bin\seaw.exe'
+          if (-not (Test-Path $seawExe)) { Write-Host ('seaw.exe not found: ' + $seawExe); exit 1 }
 
           $markerPath = (Join-Path (Get-Location) 'artifacts\seaw_console_marker.txt')
           $scriptPath = (Resolve-Path 'test/seaw_console_test.csw').Path
@@ -938,11 +960,8 @@ jobs:
         if: matrix.os == 'windows'
         shell: powershell
         run: |
-          $seawExe = Join-Path $env:LOCALAPPDATA 'seashell\bin\seaw.exe'
-          if (-not (Test-Path $seawExe)) {
-            $seawExe = Join-Path $env:USERPROFILE '.dotnet\tools\seaw.exe'
-          }
-          if (-not (Test-Path $seawExe)) { Write-Host 'seaw.exe not found, skipping'; exit 0 }
+          $seawExe = Join-Path $env:LOCALAPPDATA 'seashell\current\bin\seaw.exe'
+          if (-not (Test-Path $seawExe)) { Write-Host ('seaw.exe not found: ' + $seawExe); exit 1 }
 
           $scriptPath = (Resolve-Path 'test/seaw_eventlog_test.csw').Path
           $beforeTime = [DateTime]::UtcNow

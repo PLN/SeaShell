@@ -27,11 +27,22 @@ public sealed class DaemonServer : IAsyncDisposable
 	private bool _elevatorIsElevated;
 	private string? _elevatorVersion;
 	private readonly SemaphoreSlim _elevatorLock = new(1, 1);
+	// One SpawnRequest/SpawnResponse exchange at a time: the elevator channel has
+	// a single reader and replies carry no request id, so concurrent exchanges
+	// would read each other's responses.
+	private readonly SemaphoreSlim _elevatorExchangeLock = new(1, 1);
+	// Worst case per SpawnRequest: AwaitElevatorMs + queue wait + reply, kept below the
+	// CLI's reply timeout (DaemonManager.RequestElevatedSpawnAsync). The CLI's
+	// ForwardDeadlineTickCount additionally covers time before this handler ran.
+	private static readonly TimeSpan ElevatorQueueTimeout = TimeSpan.FromSeconds(20);
+	private static readonly TimeSpan ElevatorReplyTimeout = TimeSpan.FromSeconds(15);
 	private TaskCompletionSource<bool>? _elevatorArrived;
 	private DateTime? _elevatorConnectedTime;
 	private long _elevatorLastActivityTicks;
 
 	private static readonly TimeSpan UpdateInterval = TimeSpan.FromHours(8);
+	// Matches the invoker's keep-alive (ScriptInvoker / CacheKeepAlive.Interval).
+	private static readonly TimeSpan CacheKeepAliveInterval = TimeSpan.FromMinutes(10);
 	private static readonly string Version = typeof(DaemonServer).Assembly.GetName().Version?.ToString(4) ?? "0.1.0";
 
 	// Idle timeout — 0 means stay active (default).
@@ -70,9 +81,8 @@ public sealed class DaemonServer : IAsyncDisposable
 		// Background NuGet update check — every 8 hours
 		_ = RunUpdateLoopAsync(ct);
 
-		// Background cache freshness: touch our version's cache dir periodically
-		// so CleanupCaches knows it's in active use.
-		_ = RunCacheTouchLoopAsync(ct);
+		// Cache tracker persistence + expiry sweep
+		_ = RunCacheMaintenanceLoopAsync(ct);
 
 		Interlocked.Exchange(ref _lastActivityTicks, DateTime.UtcNow.Ticks);
 
@@ -104,7 +114,10 @@ public sealed class DaemonServer : IAsyncDisposable
 				if (conn == null) continue; // idle tick — recheck timeout
 
 				TouchActivity();
-				_ = HandleConnectionAsync(conn, ct);
+				// Off the accept loop: if the request is already buffered, the handler
+				// runs synchronously up to and through a compile, and the next client
+				// would not be accepted until it finished.
+				_ = Task.Run(() => HandleConnectionAsync(conn, ct));
 			}
 			catch (OperationCanceledException) when (ct.IsCancellationRequested)
 			{
@@ -190,6 +203,11 @@ public sealed class DaemonServer : IAsyncDisposable
 						await conn.Channel.SendAsync(MakePingResponse(), ct);
 						break;
 
+					case MessageType.CacheTouchRequest:
+						var touch = (CacheTouchRequest)message;
+						await conn.Channel.SendAsync(new CacheTouchResponse(_compiler.TouchCache(touch.OutputDir)), ct);
+						break;
+
 					case MessageType.StopRequest:
 						_log.Information("Stop requested");
 						Environment.SetEnvironmentVariable("SEASHELL_STOP", "1");
@@ -223,15 +241,17 @@ public sealed class DaemonServer : IAsyncDisposable
 
 	private async Task HandleElevatorHello(TransportStream conn, ElevatorHello hello, CancellationToken ct)
 	{
+		// Acknowledge before publishing: once this is _elevator a spawn may use it,
+		// and the elevator expects ElevatorAck as the first message it receives.
+		await conn.Channel.SendAsync(new ElevatorAck(true, null), ct);
+
+		TransportStream? replaced;
 		await _elevatorLock.WaitAsync(ct);
 		try
 		{
-			// Dispose old elevator connection if any
-			if (_elevator != null)
-			{
+			replaced = _elevator;
+			if (replaced != null)
 				_log.Information("Replacing existing elevator connection");
-				await _elevator.DisposeAsync();
-			}
 
 			_elevator = conn;
 			_elevatorIsElevated = hello.IsElevated;
@@ -249,7 +269,10 @@ public sealed class DaemonServer : IAsyncDisposable
 		// Signal anyone waiting for elevator (e.g. SpawnRequest with AwaitElevatorMs)
 		_elevatorArrived?.TrySetResult(true);
 
-		await conn.Channel.SendAsync(new ElevatorAck(true, null), ct);
+		// Tear down the old connection outside the lock. An exchange still running on
+		// it fails and reports MayHaveStarted; the new elevator is already usable.
+		if (replaced != null)
+			await replaced.DisposeAsync();
 
 		// The connection stays open. The Elevator sits in a receive loop
 		// on its end, waiting for SpawnRequests from us.
@@ -285,23 +308,38 @@ public sealed class DaemonServer : IAsyncDisposable
 	}
 
 	/// <summary>
-	/// Periodically touch the version's cache directory while the daemon is alive.
-	/// This keeps LastWriteTime fresh so CleanupCaches won't remove active caches.
+	/// Persist the cache tracker when it changed (write-behind; the in-memory copy is
+	/// authoritative) and sweep expired cache entries hourly. The first sweep waits
+	/// until every running script has had a chance to send a keep-alive
+	/// (<see cref="CacheKeepAliveInterval"/>): after a daemon restart the tracker only
+	/// knows the hit times it last saved.
 	/// </summary>
-	private async Task RunCacheTouchLoopAsync(CancellationToken ct)
+	private async Task RunCacheMaintenanceLoopAsync(CancellationToken ct)
 	{
-		var cacheDir = SeaShellPaths.CacheDir(Version);
+		var firstSweep = CacheKeepAliveInterval + TimeSpan.FromMinutes(5);
+		var lastSweep = DateTime.MinValue;
 		while (!ct.IsCancellationRequested)
 		{
-			try { await Task.Delay(TimeSpan.FromMinutes(30), ct); }
-			catch (OperationCanceledException) { return; }
+			try { await Task.Delay(TimeSpan.FromSeconds(30), ct); }
+			catch (OperationCanceledException) { break; }
 
 			try
 			{
-				if (Directory.Exists(cacheDir))
-					Directory.SetLastWriteTimeUtc(cacheDir, DateTime.UtcNow);
+				var now = DateTime.UtcNow;
+				if (now - _startTime >= firstSweep && now - lastSweep >= TimeSpan.FromHours(1))
+				{
+					lastSweep = now;
+					var removed = await Task.Run(_compiler.SweepCache, ct);
+					if (removed > 0)
+						_log.Information("Cache sweep removed {Count} expired entries", removed);
+				}
+				await _compiler.Tracker.SaveAsync();
 			}
-			catch { }
+			catch (OperationCanceledException) { break; }
+			catch (Exception ex)
+			{
+				_log.Warning(ex, "Cache maintenance failed");
+			}
 		}
 	}
 
@@ -322,6 +360,12 @@ public sealed class DaemonServer : IAsyncDisposable
 		var pendingClearCache = false;
 		var lastReason = "file_changed";
 
+		// Cancelled when the CLI goes away. Without it the loop below only notices a
+		// disconnect on the next file change, holding the connection (and the active
+		// connection count that gates idle shutdown) until then.
+		using var sessionCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+		var sessionCt = sessionCts.Token;
+
 		watcher.Changed += file =>
 		{
 			_log.Information("File changed: {FileName}", Path.GetFileName(file));
@@ -330,13 +374,13 @@ public sealed class DaemonServer : IAsyncDisposable
 		};
 
 		// Background: read CLI messages (RecompileRequest from script-initiated reload)
-		_ = Task.Run(async () =>
+		var reader = Task.Run(async () =>
 		{
 			try
 			{
-				while (!ct.IsCancellationRequested)
+				while (!sessionCt.IsCancellationRequested)
 				{
-					var msg = await conn.Channel.ReceiveAsync(ct);
+					var msg = await conn.Channel.ReceiveAsync(sessionCt);
 					if (msg == null) break;
 					if (msg.Value.Type == MessageType.RecompileRequest)
 					{
@@ -347,76 +391,91 @@ public sealed class DaemonServer : IAsyncDisposable
 						changeSignal.Release();
 					}
 				}
+				_log.Information("CLI disconnected, ending watch");
 			}
 			catch (OperationCanceledException) { }
-			catch { }
-		}, ct);
+			catch (Exception ex)
+			{
+				_log.Warning(ex, "Watch connection failed, ending watch");
+			}
+			finally
+			{
+				sessionCts.Cancel();
+			}
+		}, CancellationToken.None);
 
 		await using (conn)
 		{
-			while (!ct.IsCancellationRequested)
+			try
 			{
-				// Wait for file change or recompile request
-				try
+				while (!sessionCt.IsCancellationRequested)
 				{
-					await changeSignal.WaitAsync(ct);
-				}
-				catch (OperationCanceledException) { break; }
-
-				// Drain any extra signals from rapid saves
-				while (changeSignal.CurrentCount > 0)
-					await changeSignal.WaitAsync(TimeSpan.Zero);
-
-				var reason = lastReason;
-
-				// Clear cache if script requested it
-				if (pendingClearCache)
-				{
-					pendingClearCache = false;
-					_compiler.NuGetResolver.InvalidateCache();
-					CompilationCache.ClearScript(
-						SeaShellPaths.CacheDir(Version),
-						Path.GetFileNameWithoutExtension(request.ScriptPath));
-				}
-
-				// Recompile
-				_log.Information("Recompiling {ScriptName} ({Reason})", Path.GetFileName(request.ScriptPath), reason);
-				var recompile = _compiler.Compile(request.ScriptPath, request.Args);
-
-				if (!recompile.Success)
-				{
-					_log.Warning("Recompile failed: {Error}", recompile.Error);
-					// For script-requested reloads, notify CLI so it doesn't hang
-					if (reason == "script_requested")
+					// Wait for file change or recompile request
+					try
 					{
-						try { await conn.Channel.SendAsync(
-							new HotSwapNotify("", null, null, null, "compile_failed"), ct); }
-						catch { break; }
+						await changeSignal.WaitAsync(sessionCt);
 					}
-					continue; // keep watching, don't swap
-				}
+					catch (OperationCanceledException) { break; }
 
-				// Push HotSwapNotify to CLI
-				var notify = new HotSwapNotify(
-					recompile.AssemblyPath!,
-					recompile.DepsJsonPath,
-					recompile.RuntimeConfigPath,
-					recompile.ManifestPath,
-					reason,
-					recompile.StartupHookPath,
-					recompile.DirectExe,
-					recompile.Restart);
+					// Drain any extra signals from rapid saves
+					while (changeSignal.CurrentCount > 0)
+						await changeSignal.WaitAsync(TimeSpan.Zero);
 
-				try
-				{
-					await conn.Channel.SendAsync(notify, ct);
-					_log.Debug("Hot-swap notify sent");
+					var reason = lastReason;
+
+					// Clear cache if script requested it
+					if (pendingClearCache)
+					{
+						pendingClearCache = false;
+						_compiler.NuGetResolver.InvalidateCache();
+						_compiler.ClearCache(request.ScriptPath);
+					}
+
+					// Recompile
+					_log.Information("Recompiling {ScriptName} ({Reason})", Path.GetFileName(request.ScriptPath), reason);
+					var recompile = _compiler.Compile(request.ScriptPath, request.Args);
+
+					if (!recompile.Success)
+					{
+						_log.Warning("Recompile failed: {Error}", recompile.Error);
+						// For script-requested reloads, notify CLI so it doesn't hang
+						if (reason == "script_requested")
+						{
+							try { await conn.Channel.SendAsync(
+								new HotSwapNotify("", null, null, null, "compile_failed"), sessionCt); }
+							catch { break; }
+						}
+						continue; // keep watching, don't swap
+					}
+
+					// Push HotSwapNotify to CLI
+					var notify = new HotSwapNotify(
+						recompile.AssemblyPath!,
+						recompile.DepsJsonPath,
+						recompile.RuntimeConfigPath,
+						recompile.ManifestPath,
+						reason,
+						recompile.StartupHookPath,
+						recompile.DirectExe,
+						recompile.Restart);
+
+					try
+					{
+						await conn.Channel.SendAsync(notify, sessionCt);
+						_log.Debug("Hot-swap notify sent");
+					}
+					catch
+					{
+						_log.Information("CLI disconnected, ending watch");
+						break;
+					}
 				}
-				catch
-				{
-					_log.Information("CLI disconnected, ending watch");
-					break;
-				}
+			}
+			finally
+			{
+				// Stop the reader before the connection is disposed under it.
+				sessionCts.Cancel();
+				await reader;
 			}
 		}
 
@@ -486,9 +545,7 @@ public sealed class DaemonServer : IAsyncDisposable
 		{
 			_log.Information("Clearing cache for {ScriptName}", Path.GetFileNameWithoutExtension(request.ScriptPath));
 			_compiler.NuGetResolver.InvalidateCache();
-			CompilationCache.ClearScript(
-				SeaShellPaths.CacheDir(Version),
-				Path.GetFileNameWithoutExtension(request.ScriptPath));
+			_compiler.ClearCache(request.ScriptPath);
 		}
 
 		var result = _compiler.Compile(request.ScriptPath, request.Args);
@@ -558,43 +615,90 @@ public sealed class DaemonServer : IAsyncDisposable
 		if (elevator == null)
 			return new SpawnResponse(false, 0, "No elevator connected");
 
+		// Everything up to the send is "not forwarded": failures are safe to retry.
+		// Queue at most ElevatorQueueTimeout, and never past the CLI's forward deadline.
+		var queueWait = ElevatorQueueTimeout;
+		if (request.ForwardDeadlineTickCount > 0)
+		{
+			var untilDeadline = TimeSpan.FromMilliseconds(request.ForwardDeadlineTickCount - Environment.TickCount64);
+			if (untilDeadline < queueWait)
+				queueWait = untilDeadline > TimeSpan.Zero ? untilDeadline : TimeSpan.Zero;
+		}
+		if (!await _elevatorExchangeLock.WaitAsync(queueWait, ct))
+			return new SpawnResponse(false, 0, "Elevator busy: earlier elevated spawns did not finish in time");
+		var sent = false;
 		try
 		{
-			await elevator.Channel.SendAsync(request, ct);
-			var reply = await elevator.Channel.ReceiveAsync(ct);
+			if (request.ForwardDeadlineTickCount > 0 && Environment.TickCount64 > request.ForwardDeadlineTickCount)
+				return new SpawnResponse(false, 0, "Spawn request expired before it could be forwarded");
+
+			// A failed exchange ahead of us may have detached the elevator, or it
+			// may have re-registered on a new connection — use the current one.
+			await _elevatorLock.WaitAsync(ct);
+			try { elevator = _elevator; }
+			finally { _elevatorLock.Release(); }
+			if (elevator == null)
+				return new SpawnResponse(false, 0, "No elevator connected");
+
+			// The elevator only starts a process, so a reply is near-immediate. A
+			// timeout leaves the channel mid-frame — the connection is unusable after.
+			// From here on the elevator may already have started the process.
+			using var replyCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+			replyCts.CancelAfter(ElevatorReplyTimeout);
+
+			sent = true;
+			await elevator.Channel.SendAsync(request, replyCts.Token);
+			var reply = await elevator.Channel.ReceiveAsync(replyCts.Token);
 			if (reply == null)
 			{
 				// Elevator disconnected
-				await DetachElevator();
-				return new SpawnResponse(false, 0, "Elevator disconnected during spawn");
+				await DetachElevator(elevator);
+				return new SpawnResponse(false, 0, "Elevator disconnected during spawn", MayHaveStarted: true);
 			}
 			Interlocked.Exchange(ref _elevatorLastActivityTicks, DateTime.UtcNow.Ticks);
 			return (SpawnResponse)reply.Value.Message;
 		}
 		catch (Exception ex)
 		{
-			await DetachElevator();
-			return new SpawnResponse(false, 0, $"Elevator communication error: {ex.Message}");
+			_log.Warning(ex, "Elevator spawn exchange failed");
+			// Only a failed exchange says anything about the connection's health.
+			if (sent && elevator != null)
+				await DetachElevator(elevator);
+			return new SpawnResponse(false, 0, $"Elevator communication error: {ex.Message}", MayHaveStarted: sent);
+		}
+		finally
+		{
+			_elevatorExchangeLock.Release();
 		}
 	}
 
-	private async Task DetachElevator()
+	/// <summary>
+	/// Drop <paramref name="failed"/> if it is still the registered elevator. If the
+	/// elevator re-registered meanwhile, HandleElevatorHello already disposed the old
+	/// connection and the new one stays.
+	/// </summary>
+	private async Task DetachElevator(TransportStream failed)
 	{
+		var detached = false;
 		await _elevatorLock.WaitAsync();
 		try
 		{
-			if (_elevator != null)
+			if (_elevator == failed)
 			{
 				_log.Information("Elevator disconnected");
-				await _elevator.DisposeAsync();
 				_elevator = null;
 				_elevatorConnectedTime = null;
+				detached = true;
 			}
 		}
 		finally
 		{
 			_elevatorLock.Release();
 		}
+
+		// Tear down outside the lock so a replacement elevator can register meanwhile.
+		if (detached)
+			await failed.DisposeAsync();
 	}
 
 	public async ValueTask DisposeAsync()
@@ -602,6 +706,7 @@ public sealed class DaemonServer : IAsyncDisposable
 		if (_elevator != null)
 			await _elevator.DisposeAsync();
 		await _server.DisposeAsync();
+		await _compiler.Tracker.SaveAsync();
 
 		// Clean up marker files
 		var versionDir = SeaShellPaths.VersionDir(Version);

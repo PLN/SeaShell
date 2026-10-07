@@ -127,4 +127,24 @@ public class MessageRoundtripTests
 		Assert.Equal(0, result.ElevatorUptimeSeconds);
 		Assert.Equal(0, result.ElevatorIdleSeconds);
 	}
+
+	[Fact]
+	public void SpawnMessages_FromOlderPeer_DefaultNewFields()
+	{
+		// Payloads as a pre-0.6.2 peer sends them: maps without the newer keys.
+		var oldResponse = new Dictionary<string, object?> { ["Success"] = false, ["ProcessId"] = 0, ["Error"] = "x" };
+		var response = MessagePackSerializer.Deserialize<SpawnResponse>(
+			MessagePackSerializer.Serialize(oldResponse, Opts), Opts);
+		Assert.False(response.MayHaveStarted); // old daemons keep the old retry behaviour
+
+		var oldRequest = new Dictionary<string, object?>
+		{
+			["AssemblyPath"] = "a.dll", ["DepsJsonPath"] = null, ["RuntimeConfigPath"] = null,
+			["Args"] = new string[0], ["WorkingDirectory"] = "/", ["EnvironmentVars"] = new string[0],
+			["CliPid"] = 1, ["AwaitElevatorMs"] = 0, ["DirectExe"] = false,
+		};
+		var request = MessagePackSerializer.Deserialize<SpawnRequest>(
+			MessagePackSerializer.Serialize(oldRequest, Opts), Opts);
+		Assert.Equal(0, request.ForwardDeadlineTickCount); // no deadline from old CLIs
+	}
 }

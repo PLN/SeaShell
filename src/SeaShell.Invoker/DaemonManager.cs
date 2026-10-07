@@ -34,8 +34,7 @@ public static class DaemonManager
 		try
 		{
 			await using var conn = await TransportClient.ConnectAsync(daemonAddress, timeoutMs: 2000);
-			await conn.Channel.SendAsync(new PingRequest());
-			var reply = await conn.Channel.ReceiveAsync();
+			var reply = await conn.RequestAsync(new PingRequest(), TimeSpan.FromSeconds(5));
 			if (reply == null) return null;
 
 			var ping = (PingResponse)reply.Value.Message;
@@ -59,8 +58,7 @@ public static class DaemonManager
 		try
 		{
 			await using var conn = await TransportClient.ConnectAsync(address, timeoutMs: 2000);
-			await conn.Channel.SendAsync(new StopRequest());
-			await conn.Channel.ReceiveAsync();
+			await conn.RequestAsync(new StopRequest(), TimeSpan.FromSeconds(10));
 			return true;
 		}
 		catch
@@ -188,18 +186,41 @@ public static class DaemonManager
 	/// <summary>Ask the daemon to spawn a process via the Elevator.</summary>
 	public static async Task<SpawnResponse> RequestElevatedSpawnAsync(string daemonAddress, SpawnRequest request)
 	{
+		TransportStream conn;
 		try
 		{
-			await using var conn = await TransportClient.ConnectAsync(daemonAddress, timeoutMs: 5000);
-			await conn.Channel.SendAsync(request);
-			var reply = await conn.Channel.ReceiveAsync();
-			if (reply == null)
-				return new SpawnResponse(false, 0, "Daemon disconnected");
-			return (SpawnResponse)reply.Value.Message;
+			conn = await TransportClient.ConnectAsync(daemonAddress, timeoutMs: 5000);
 		}
 		catch (Exception ex)
 		{
 			return new SpawnResponse(false, 0, $"Elevator not available: {ex.Message}");
+		}
+
+		await using (conn)
+		{
+			// The daemon needs at most AwaitElevatorMs + 20s queue + 15s reply
+			// (DaemonServer.SpawnElevatedAsync). The forward deadline leaves the
+			// elevator's 15s reply plus margin inside our own timeout, so the daemon
+			// never starts a request after we have given up on it.
+			var replyTimeout = TimeSpan.FromMilliseconds(request.AwaitElevatorMs) + TimeSpan.FromSeconds(45);
+			request = request with
+			{
+				ForwardDeadlineTickCount = Environment.TickCount64
+					+ (long)(replyTimeout - TimeSpan.FromSeconds(20)).TotalMilliseconds,
+			};
+
+			try
+			{
+				var reply = await conn.RequestAsync(request, replyTimeout);
+				if (reply == null)
+					return new SpawnResponse(false, 0, "Daemon disconnected", MayHaveStarted: true);
+				return (SpawnResponse)reply.Value.Message;
+			}
+			catch (Exception ex)
+			{
+				// The request may have been forwarded — the outcome is unknown.
+				return new SpawnResponse(false, 0, $"Elevator request failed: {ex.Message}", MayHaveStarted: true);
+			}
 		}
 	}
 }

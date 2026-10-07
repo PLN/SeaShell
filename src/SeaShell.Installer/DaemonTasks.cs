@@ -94,8 +94,7 @@ public static class DaemonTasks
 		try
 		{
 			await using var conn = await TransportClient.ConnectAsync(address, timeoutMs: 2000);
-			await conn.Channel.SendAsync(new StopRequest());
-			await conn.Channel.ReceiveAsync();
+			await conn.RequestAsync(new StopRequest(), TimeSpan.FromSeconds(10));
 			return true;
 		}
 		catch { return false; }

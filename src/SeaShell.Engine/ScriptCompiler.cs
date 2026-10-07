@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
@@ -26,13 +27,24 @@ public sealed class ScriptCompiler
 	public readonly NuGetResolver NuGetResolver;
 
 	// Track last resolved source list per script (for watch mode file list)
-	private readonly Dictionary<string, string[]> _lastSourcesByScript = new(StringComparer.OrdinalIgnoreCase);
+	private readonly ConcurrentDictionary<string, string[]> _lastSourcesByScript = new(StringComparer.OrdinalIgnoreCase);
 
-	public ScriptCompiler(string? cacheDir = null)
+	// One lock object per output dir (see Compile)
+	private readonly ConcurrentDictionary<string, object> _compileLocks = new(CacheTracker.PathComparer);
+
+	/// <summary>Creation and hit times of this cache dir's entries; drives <see cref="SweepCache"/>.</summary>
+	public readonly CacheTracker Tracker;
+
+	public ScriptCompiler(string? cacheDir = null) : this(cacheDir, clock: null) { }
+
+	internal ScriptCompiler(string? cacheDir, Func<DateTime>? clock)
 	{
 		var version = typeof(ScriptCompiler).Assembly.GetName().Version?.ToString(4) ?? "0.0.0";
-		_cacheDir = cacheDir ?? SeaShellPaths.CacheDir(version);
+		// One spelling for every path derived from it: the per-dir compile locks are keyed
+		// by path, so a relative or "/"-separated variant would get a lock of its own.
+		_cacheDir = Path.TrimEndingDirectorySeparator(Path.GetFullPath(cacheDir ?? SeaShellPaths.CacheDir(version)));
 		Directory.CreateDirectory(_cacheDir);
+		Tracker = new CacheTracker(_cacheDir, clock);
 
 		// Secure the data root on Linux — owner-only access
 		if (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
@@ -124,9 +136,144 @@ public sealed class ScriptCompiler
 		var dllPath = Path.Combine(outputDir, $"{scriptName}.dll");
 		var runtimeConfigPath = Path.Combine(outputDir, $"{scriptName}.runtimeconfig.json");
 
-		if (File.Exists(dllPath) && File.Exists(runtimeConfigPath))
+		// Same script and inputs → same output dir. Serialize work on it: a concurrent
+		// request must not take a half-staged dir for a cache hit or race its copies.
+		// Different scripts still compile in parallel.
+		lock (_compileLocks.GetOrAdd(outputDir, _ => new object()))
+			return CompileInto(scriptPath, scriptName, language, resolved, hash, outputDir, dllPath, runtimeConfigPath);
+	}
+
+	/// <summary>
+	/// Delete all cached output dirs for a script. Takes the same per-dir lock as
+	/// <see cref="Compile"/>, so a clear cannot interleave with a compile that is
+	/// still staging or publishing that dir.
+	/// </summary>
+	public void ClearCache(string scriptPath)
+	{
+		var scriptName = Path.GetFileNameWithoutExtension(scriptPath);
+		string[] dirs;
+		try { dirs = Directory.GetDirectories(_cacheDir, $"{scriptName}_*"); }
+		catch { return; }
+		foreach (var dir in dirs)
+		{
+			lock (_compileLocks.GetOrAdd(dir, _ => new object()))
+			{
+				// The script that asked for the clear usually still runs from this dir. If
+				// that blocks the move, fall back to deleting what can be deleted (marker
+				// first): the recompile that follows repairs the dir in place.
+				if (!TryMoveToTrash(dir))
+					CompilationCache.ClearDir(dir);
+				Tracker.RecordRemoved(Path.GetFileName(dir), explicitClear: true);
+			}
+		}
+		EmptyTrash();
+	}
+
+	/// <summary>
+	/// Delete expired entries (see <see cref="CacheTracker"/>). Each delete holds the
+	/// per-dir compile lock and re-checks expiry under it, so a hit or keep-alive that
+	/// lands meanwhile wins. An entry still in use — files loaded by a running process
+	/// that sent no keep-alive (its invoker was killed, an older CLI, a direct launch) —
+	/// counts as a hit instead. Returns the number of dirs removed.
+	/// </summary>
+	public int SweepCache()
+	{
+		var removed = 0;
+		var candidates = Tracker.SweepCandidates();
+		if (candidates.Count > 0)
+		{
+			var inUse = CacheDirsInUse.Find(_cacheDir);
+			foreach (var key in candidates)
+			{
+				var dir = Path.Combine(_cacheDir, key);
+				lock (_compileLocks.GetOrAdd(dir, _ => new object()))
+				{
+					if (!Tracker.ShouldDelete(key)) continue;
+
+					// Linux: a process maps files from the dir. Windows: the move fails while
+					// any file in the dir is open. Either way the entry is in use.
+					if (inUse.Contains(key) || !TryMoveToTrash(dir))
+					{
+						Tracker.Touch(key);
+						_log.Debug("Cache entry {Entry} expired but in use; kept", key);
+						continue;
+					}
+
+					Tracker.RecordRemoved(key, explicitClear: false);
+					removed++;
+					_log.Debug("Cache entry expired: {Entry}", key);
+				}
+			}
+		}
+		EmptyTrash();
+		return removed;
+	}
+
+	/// <summary>
+	/// Keep-alive for a running script's output dir. False when the dir is not one of
+	/// this cache's entries, or no longer exists. Holds the per-dir lock, so it either
+	/// lands before the sweep's re-check (and wins) or reports the dir as gone.
+	/// </summary>
+	public bool TouchCache(string outputDir)
+	{
+		var full = Path.TrimEndingDirectorySeparator(Path.GetFullPath(outputDir));
+		if (!CacheTracker.PathComparer.Equals(Path.GetDirectoryName(full), _cacheDir))
+			return false;
+		var key = Path.GetFileName(full);
+		lock (_compileLocks.GetOrAdd(Path.Combine(_cacheDir, key), _ => new object()))
+			return Tracker.Touch(key);
+	}
+
+	private string TrashDir => Path.Combine(_cacheDir, CacheTracker.TrashDirName);
+
+	/// <summary>
+	/// Take an entry out of the cache in one step: a rename either moves the whole dir or
+	/// nothing, unlike a recursive delete that a locked file stops halfway. On Windows the
+	/// rename fails while any file in the dir is open.
+	/// </summary>
+	private bool TryMoveToTrash(string dir)
+	{
+		try
+		{
+			Directory.CreateDirectory(TrashDir);
+			Directory.Move(dir, Path.Combine(TrashDir, $"{Path.GetFileName(dir)}.{Guid.NewGuid():N}"));
+			return true;
+		}
+		catch (IOException) { return false; }
+		catch (UnauthorizedAccessException) { return false; }
+	}
+
+	/// <summary>Delete trashed dirs; anything still locked is retried next sweep.</summary>
+	private void EmptyTrash()
+	{
+		try
+		{
+			foreach (var dir in Directory.GetDirectories(TrashDir))
+			{
+				try { Directory.Delete(dir, recursive: true); }
+				catch { }
+			}
+		}
+		catch (DirectoryNotFoundException) { }
+	}
+
+	private CompileResult CompileInto(
+		string scriptPath, string scriptName, ScriptLanguage language,
+		IncludeResolver.ResolvedScript resolved, string hash,
+		string outputDir, string dllPath, string runtimeConfigPath)
+	{
+		// Written last: dll + runtimeconfig alone do not make a usable output dir
+		// (staging, manifest and apphost follow), e.g. after a crash mid-compile.
+		var completePath = Path.Combine(outputDir, $"{scriptName}.complete");
+		var dirWasAbsent = !Directory.Exists(outputDir);
+
+		if (File.Exists(completePath)
+			&& File.Exists(dllPath) && File.Exists(runtimeConfigPath)
+			&& ArtifactWriter.FindDepsJson(outputDir, scriptName) != null
+			&& ArtifactWriter.FindManifest(outputDir, scriptName) != null)
 		{
 			_log.Debug("Cache hit for {ScriptName} ({Hash})", scriptName, hash[..8]);
+			Tracker.RecordHit(Path.GetFileName(outputDir), scriptPath);
 			var cachedAppHost = AppHostWriter.FindExisting(outputDir, scriptName);
 			return new CompileResult
 			{
@@ -145,9 +292,9 @@ public sealed class ScriptCompiler
 		}
 
 		// ── Resolve NuGet packages (cache miss only) ────────────────────
-		var resolvedPackages = ResolveNuGetPackages(resolved.Directives.NuGets);
+		var resolvedPackages = ResolveNuGetPackages(resolved.Directives.NuGets, out var nugetError);
 		if (resolvedPackages == null)
-			return _lastNuGetError!; // error already logged
+			return nugetError!; // error already logged
 
 		// ── Parse syntax trees ──────────────────────────────────────────
 		var trees = new List<SyntaxTree>();
@@ -289,14 +436,13 @@ public sealed class ScriptCompiler
 		if (!File.Exists(depsPath))
 			DepsJsonWriter.Write(depsPath, assemblyName, resolvedPackages, _engineDir);
 
+		// Everything below is staged flat into one directory, so assets from
+		// different sources can claim the same filename. First staged wins.
+		var staged = new Dictionary<string, string>(CacheTracker.PathComparer);
+
 		// Copy SeaShell runtime DLLs to output dir (startup hook + transitive deps)
 		foreach (var dllName in new[] { "SeaShell.Script.dll", "SeaShell.Common.dll", "MessagePack.dll", "MessagePack.Annotations.dll" })
-		{
-			var src = Path.Combine(_engineDir, dllName);
-			var dest = Path.Combine(outputDir, dllName);
-			if (File.Exists(src) && !File.Exists(dest))
-				File.Copy(src, dest);
-		}
+			StageFlat(Path.Combine(_engineDir, dllName), outputDir, staged);
 
 		// Copy NuGet package DLLs to output dir — makes the output self-contained.
 		// No runtime dependency on the NuGet cache (which may be cleared, or belong
@@ -305,11 +451,7 @@ public sealed class ScriptCompiler
 		{
 			// Managed DLLs — copy flat (bare filename)
 			foreach (var asset in pkg.RuntimeAssets)
-			{
-				var dest = Path.Combine(outputDir, Path.GetFileName(asset.FullPath));
-				if (File.Exists(asset.FullPath) && !File.Exists(dest))
-					File.Copy(asset.FullPath, dest);
-			}
+				StageFlat(asset.FullPath, outputDir, staged);
 			// Native DLLs — copy flat like the managed ones. The deps.json declares
 			// every library as type:"project", and for project libraries the host
 			// resolves assets against the app directory root — a nested
@@ -317,11 +459,7 @@ public sealed class ScriptCompiler
 			// NATIVE_DLL_SEARCH_DIRECTORIES, so P/Invoke fails (DllNotFoundException)
 			// even though the file is on disk.
 			foreach (var asset in pkg.NativeAssets)
-			{
-				var dest = Path.Combine(outputDir, Path.GetFileName(asset.FullPath));
-				if (File.Exists(asset.FullPath) && !File.Exists(dest))
-					File.Copy(asset.FullPath, dest);
-			}
+				StageFlat(asset.FullPath, outputDir, staged);
 		}
 
 		// Write manifest — all the metadata the Sea class needs at runtime
@@ -331,6 +469,9 @@ public sealed class ScriptCompiler
 		// ── Generate apphost (best-effort) ──────────────────────────────
 		var appHostPath = AppHostWriter.Generate(
 			outputDir, $"{scriptName}.dll", resolved.Directives.Window);
+
+		File.WriteAllBytes(completePath, Array.Empty<byte>());
+		Tracker.RecordCreated(Path.GetFileName(outputDir), scriptPath, dirWasAbsent);
 
 		return new CompileResult
 		{
@@ -346,6 +487,37 @@ public sealed class ScriptCompiler
 			DepsJsonPath = depsPath,
 			ManifestPath = manifestPath,
 		};
+	}
+
+	/// <summary>
+	/// Copy <paramref name="source"/> into <paramref name="outputDir"/> under its bare
+	/// filename. When an earlier source already claimed that filename the first one
+	/// stays; a differing duplicate is logged instead of being dropped silently.
+	/// </summary>
+	internal static void StageFlat(string source, string outputDir, Dictionary<string, string> staged)
+	{
+		if (!File.Exists(source)) return;
+
+		var fileName = Path.GetFileName(source);
+		if (staged.TryGetValue(fileName, out var winner))
+		{
+			if (!FilesEqual(winner, source))
+				_log.Warning("Staging collision on {FileName}: kept {Winner}, ignored differing {Source}",
+					fileName, winner, source);
+			return;
+		}
+
+		staged[fileName] = source;
+		var dest = Path.Combine(outputDir, fileName);
+		if (File.Exists(dest)) return;
+		try { File.Copy(source, dest); }
+		catch (IOException) when (File.Exists(dest)) { } // another process staged it meanwhile
+	}
+
+	private static bool FilesEqual(string a, string b)
+	{
+		if (new FileInfo(a).Length != new FileInfo(b).Length) return false;
+		return File.ReadAllBytes(a).AsSpan().SequenceEqual(File.ReadAllBytes(b));
 	}
 
 	private static void WriteIfMissing(string path, byte[] data)
@@ -449,11 +621,10 @@ public sealed class ScriptCompiler
 
 	// ── NuGet resolution (extracted for use before cache check) ────────
 
-	private CompileResult? _lastNuGetError;
-
 	private List<NuGetResolver.ResolvedPackage>? ResolveNuGetPackages(
-		List<DirectiveParser.NuGetRef> nugets)
+		List<DirectiveParser.NuGetRef> nugets, out CompileResult? error)
 	{
+		error = null;
 		foreach (var nuget in nugets)
 		{
 			_log.Debug("Resolving NuGet {Package} {Version}", nuget.PackageName, nuget.Version ?? "latest");
@@ -465,7 +636,7 @@ public sealed class ScriptCompiler
 				if (!dl.Success)
 				{
 					_log.Error("Download failed for {Package}: {Error}", nuget.PackageName, dl.Error);
-					_lastNuGetError = new CompileResult { Error = dl.Error };
+					error = new CompileResult { Error = dl.Error };
 					return null;
 				}
 
@@ -485,7 +656,7 @@ public sealed class ScriptCompiler
 					|| string.Equals(p.Version, expectedVersion, StringComparison.OrdinalIgnoreCase))))
 			{
 				_log.Error("Package {Package} downloaded but could not be resolved", nuget.PackageName);
-				_lastNuGetError = new CompileResult
+				error = new CompileResult
 				{
 					Error = $"Package '{nuget.PackageName}' was downloaded but could not be resolved."
 				};
@@ -555,40 +726,89 @@ public sealed class ScriptCompiler
 		// Compute cache hash
 		var hash = CompilationCache.ComputeBinaryHash(binaryPath);
 		var outputDir = Path.Combine(_cacheDir, $"{name}_{hash[..8]}");
-		Directory.CreateDirectory(outputDir);
-
-		_log.Debug("Binary staging for {Name} in {OutputDir}", name, outputDir);
-
-		// Copy SeaShell runtime DLLs to staging
-		foreach (var dll in new[] { "SeaShell.Script.dll", "SeaShell.Common.dll",
-		                             "MessagePack.dll", "MessagePack.Annotations.dll" })
+		// Staging writes into the dir that the sweep and explicit clears delete: take the
+		// same per-dir lock (see Compile).
+		lock (_compileLocks.GetOrAdd(outputDir, _ => new object()))
 		{
-			var src = Path.Combine(_engineDir, dll);
-			var dest = Path.Combine(outputDir, dll);
-			if (File.Exists(src)) WriteIfMissing(dest, File.ReadAllBytes(src));
-		}
+			var staged = Directory.Exists(outputDir);
+			Directory.CreateDirectory(outputDir);
+			void Track()
+			{
+				if (staged) Tracker.RecordHit(Path.GetFileName(outputDir), binaryPath);
+				else Tracker.RecordCreated(Path.GetFileName(outputDir), binaryPath, dirWasAbsent: true);
+			}
 
-		// Manifest
-		var manifestPath = Path.Combine(outputDir, $"{name}.sea.json");
-		ArtifactWriter.WriteBinaryManifest(manifestPath, binaryPath);
+			_log.Debug("Binary staging for {Name} in {OutputDir}", name, outputDir);
 
-		// Track for watch mode
-		var watchFiles = new List<string> { binaryPath };
-		if (File.Exists(seaJsonPath)) watchFiles.Add(seaJsonPath);
+			// Copy SeaShell runtime DLLs to staging
+			foreach (var dll in new[] { "SeaShell.Script.dll", "SeaShell.Common.dll",
+			                             "MessagePack.dll", "MessagePack.Annotations.dll" })
+			{
+				var src = Path.Combine(_engineDir, dll);
+				var dest = Path.Combine(outputDir, dll);
+				if (File.Exists(src)) WriteIfMissing(dest, File.ReadAllBytes(src));
+			}
 
-		// StartupHookPath: set when a .dll binary doesn't reference SeaShell.Script.
-		// For directExe (Tier 2/3 single-file), we don't set startup hooks because:
-		// - Tier 3 (self-contained): bundled runtime can't resolve hook deps from staging
-		// - If the binary bundles SeaShell.Script, it already has the module initializer
-		// - If it doesn't, graceful degradation (pipe connect timeout, runs without Sea context)
-		string? startupHookPath = (!directExe && info is { HasSeaShellRef: false })
-			? Path.Combine(outputDir, "SeaShell.Script.dll")
-			: null;
+			// Manifest
+			var manifestPath = Path.Combine(outputDir, $"{name}.sea.json");
+			ArtifactWriter.WriteBinaryManifest(manifestPath, binaryPath);
 
-		if (directExe)
-		{
-			// Tier 2/3: run .exe directly
+			// Track for watch mode
+			var watchFiles = new List<string> { binaryPath };
+			if (File.Exists(seaJsonPath)) watchFiles.Add(seaJsonPath);
+
+			// StartupHookPath: set when a .dll binary doesn't reference SeaShell.Script.
+			// For directExe (Tier 2/3 single-file), we don't set startup hooks because:
+			// - Tier 3 (self-contained): bundled runtime can't resolve hook deps from staging
+			// - If the binary bundles SeaShell.Script, it already has the module initializer
+			// - If it doesn't, graceful degradation (pipe connect timeout, runs without Sea context)
+			string? startupHookPath = (!directExe && info is { HasSeaShellRef: false })
+				? Path.Combine(outputDir, "SeaShell.Script.dll")
+				: null;
+
+			if (directExe)
+			{
+				// Tier 2/3: run .exe directly
+				_lastSourcesByScript[binaryPath] = watchFiles.ToArray();
+				Track();
+
+				return new CompileResult
+				{
+					Success = true,
+					Watch = watch,
+					Elevate = elevate,
+					Restart = restart,
+				MutexScope = mutexScope,
+				MutexAttach = mutexAttach,
+					AssemblyPath = binaryPath,
+					ManifestPath = manifestPath,
+					StartupHookPath = startupHookPath,
+					DirectExe = true,
+				};
+			}
+
+			// Tier 1 / .dll: stage for dotnet exec
+			var stagedDll = Path.Combine(outputDir, $"{name}.dll");
+			WriteIfMissing(stagedDll, File.ReadAllBytes(binaryPath));
+
+			var stagedRtc = Path.Combine(outputDir, $"{name}.runtimeconfig.json");
+			var companionRtc = Path.Combine(binDir, $"{name}.runtimeconfig.json");
+			if (File.Exists(companionRtc))
+				ArtifactWriter.MergeRuntimeConfig(companionRtc, stagedRtc, _engineDir);
+			else
+				ArtifactWriter.WriteRuntimeConfig(stagedRtc, info!.HasAspNetRef);
+
+			var stagedDeps = Path.Combine(outputDir, $"{name}.deps.json");
+			var companionDeps = Path.Combine(binDir, $"{name}.deps.json");
+			if (File.Exists(companionDeps))
+				DepsJsonWriter.Merge(companionDeps, stagedDeps, _engineDir);
+			else
+				DepsJsonWriter.Write(stagedDeps, name, new List<NuGetResolver.ResolvedPackage>(), _engineDir);
+
+			if (File.Exists(companionRtc)) watchFiles.Add(companionRtc);
+			if (File.Exists(companionDeps)) watchFiles.Add(companionDeps);
 			_lastSourcesByScript[binaryPath] = watchFiles.ToArray();
+			Track();
 
 			return new CompileResult
 			{
@@ -596,51 +816,15 @@ public sealed class ScriptCompiler
 				Watch = watch,
 				Elevate = elevate,
 				Restart = restart,
-			MutexScope = mutexScope,
-			MutexAttach = mutexAttach,
-				AssemblyPath = binaryPath,
+				MutexScope = mutexScope,
+				MutexAttach = mutexAttach,
+				AssemblyPath = stagedDll,
+				RuntimeConfigPath = stagedRtc,
+				DepsJsonPath = stagedDeps,
 				ManifestPath = manifestPath,
 				StartupHookPath = startupHookPath,
-				DirectExe = true,
 			};
 		}
-
-		// Tier 1 / .dll: stage for dotnet exec
-		var stagedDll = Path.Combine(outputDir, $"{name}.dll");
-		WriteIfMissing(stagedDll, File.ReadAllBytes(binaryPath));
-
-		var stagedRtc = Path.Combine(outputDir, $"{name}.runtimeconfig.json");
-		var companionRtc = Path.Combine(binDir, $"{name}.runtimeconfig.json");
-		if (File.Exists(companionRtc))
-			ArtifactWriter.MergeRuntimeConfig(companionRtc, stagedRtc, _engineDir);
-		else
-			ArtifactWriter.WriteRuntimeConfig(stagedRtc, info!.HasAspNetRef);
-
-		var stagedDeps = Path.Combine(outputDir, $"{name}.deps.json");
-		var companionDeps = Path.Combine(binDir, $"{name}.deps.json");
-		if (File.Exists(companionDeps))
-			DepsJsonWriter.Merge(companionDeps, stagedDeps, _engineDir);
-		else
-			DepsJsonWriter.Write(stagedDeps, name, new List<NuGetResolver.ResolvedPackage>(), _engineDir);
-
-		if (File.Exists(companionRtc)) watchFiles.Add(companionRtc);
-		if (File.Exists(companionDeps)) watchFiles.Add(companionDeps);
-		_lastSourcesByScript[binaryPath] = watchFiles.ToArray();
-
-		return new CompileResult
-		{
-			Success = true,
-			Watch = watch,
-			Elevate = elevate,
-			Restart = restart,
-			MutexScope = mutexScope,
-			MutexAttach = mutexAttach,
-			AssemblyPath = stagedDll,
-			RuntimeConfigPath = stagedRtc,
-			DepsJsonPath = stagedDeps,
-			ManifestPath = manifestPath,
-			StartupHookPath = startupHookPath,
-		};
 	}
 
 	private static (bool watch, bool elevate, bool restart, byte mutexScope, bool mutexAttach) ReadCompanionSeaJson(string path)

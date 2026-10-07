@@ -1,5 +1,57 @@
 # History
 
+## v0.6.2 (2026-10-07)
+
+**Self-cleaning compile cache, concurrency and IPC hardening.**
+
+- **The compile cache cleans itself up.** Every distinct script version left an
+  output dir behind forever (one machine: 466 entries, 439 MB in five weeks). The
+  daemon now tracks when each entry was created and last hit and sweeps hourly:
+  entries unused for 24 hours are deleted, an entry that comes back within 30 days
+  (a weekly job) is promoted and kept until it goes 30 days unused, and running
+  scripts keep their entry alive with a 10-minute ping from `sea`/the host. The
+  sweep also skips entries whose files a running process has loaded.
+- **Concurrent compiles in the daemon are safe.** Scripts compiled at the same
+  time shared per-request state: two scripts with different `//sea_incdir`
+  directories could resolve each other's same-named include, and concurrent
+  first runs of one script could be handed its output directory before the
+  NuGet assets and manifest were staged. Include directories are now local
+  to each resolution, the NuGet resolver cache is concurrent, compiles of the
+  same script are serialized, and an output directory only counts as a cache
+  hit once a completion marker is written last — which also repairs entries
+  left half-staged by a crash.
+- **Concurrent elevated scripts no longer cross responses.** The daemon now
+  runs one elevator exchange at a time (replies carry no request id). Queueing
+  and the reply are both bounded, and the CLI stamps each request with a
+  forward-by deadline, so a request is never started after the CLI gave up.
+  The CLI's start-the-elevator-and-retry path now only retries failures that
+  provably never reached an elevator, so an elevated script cannot start
+  twice. A new elevator is acknowledged before it is used, and a failed
+  exchange no longer discards an elevator that re-registered meanwhile.
+- **No more unbounded IPC waits.** Status, stop, daemon discovery and elevated
+  spawns now time out when the peer accepts the connection but never replies,
+  and closing a connection after a cancelled send no longer blocks on flushing
+  to a peer that stopped reading;
+  watch sessions end as soon as the CLI disconnects instead of on the next
+  file change, so they no longer block the daemon's idle shutdown. A compile
+  no longer runs on the daemon's accept loop, where it could keep other
+  clients from connecting until it finished.
+- **Linux scripts get the real implementation of RID-specific packages.** The
+  RID fallback chain stopped at the OS name and never reached `unix`, so
+  packages whose Linux build ships under `runtimes/unix/lib/` (e.g.
+  Microsoft.Data.SqlClient) fell back to the `lib/` stub that throws
+  `PlatformNotSupportedException`. Selection now walks the portable RID graph
+  the way NuGet does (`linux-musl-x64 → linux-musl → linux-x64 → linux →
+  unix-x64 → unix → any`), uses the process architecture, accepts versioned
+  `libfoo.so.N` natives, and logs flat-staging filename collisions instead of
+  dropping the second file silently. New end-to-end SQLite and SqlClient
+  tests run on all three CI platforms.
+- **SeaShell.Host depends on stable Microsoft.Extensions.Hosting 10.0.12**
+  instead of the 10.0.0-preview.5 packages.
+- **CI runs the unit tests again.** `dotnet test --no-build` on a fresh
+  checkout skipped restore and silently ran nothing, and the Windows `seaw`
+  tests probed a pre-0.5.0 path and skipped. Both now run and fail loudly.
+
 ## v0.6.1 (2026-07-08)
 
 **NuGet dependency resolution fix for DacFx and runtime-specific assets.**

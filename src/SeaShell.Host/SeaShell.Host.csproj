@@ -19,9 +19,9 @@
 		</ProjectReference>
 		<PackageReference Include="MessagePack" Version="3.1.8" PrivateAssets="all" />
 		<!-- ServiceHost dependencies (merged from SeaShell.ServiceHost) -->
-		<PackageReference Include="Microsoft.Extensions.Hosting" Version="10.0.0-preview.5.25277.114" />
-		<PackageReference Include="Microsoft.Extensions.Hosting.WindowsServices" Version="10.0.0-preview.5.25277.114" />
-		<PackageReference Include="Microsoft.Extensions.Hosting.Systemd" Version="10.0.0-preview.5.25277.114" />
+		<PackageReference Include="Microsoft.Extensions.Hosting" Version="10.0.12" />
+		<PackageReference Include="Microsoft.Extensions.Hosting.WindowsServices" Version="10.0.12" />
+		<PackageReference Include="Microsoft.Extensions.Hosting.Systemd" Version="10.0.12" />
 	</ItemGroup>
 	<ItemGroup>
 		<EmbeddedResource Include="Templates\*.template" />
