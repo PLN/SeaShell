@@ -223,7 +223,7 @@ public sealed class ScriptInvoker
 						var delaySec = Math.Min(1 << consecutiveFastExits, 8); // 2, 4, 8, 8...
 						_log?.Invoke($"restarting in {delaySec}s (fast exit #{consecutiveFastExits})...");
 						try { await Task.Delay(delaySec * 1000, ct); }
-						catch (OperationCanceledException) { return new ScriptResult(result.ExitCode, result.Stdout, result.Stderr, result.ExitDelay); }
+						catch (OperationCanceledException) { return new ScriptResult(result.ExitCode, result.Stdout, result.Stderr, result.ExitDelay) { Cancelled = true }; }
 					}
 					else
 					{
@@ -234,12 +234,12 @@ public sealed class ScriptInvoker
 					continue;
 				}
 
-				return new ScriptResult(result.ExitCode, result.Stdout, result.Stderr, result.ExitDelay);
+				return new ScriptResult(result.ExitCode, result.Stdout, result.Stderr, result.ExitDelay) { Cancelled = result.Cancelled };
 			}
 
 			// Script requested reload — recompile via daemon
 			if (daemonAddress == null || scriptPath == null)
-				return new ScriptResult(result.ExitCode, result.Stdout, result.Stderr, result.ExitDelay);
+				return new ScriptResult(result.ExitCode, result.Stdout, result.Stderr, result.ExitDelay) { Cancelled = ct.IsCancellationRequested };
 
 			_log?.Invoke($"reload requested ({result.ReloadReason ?? "script"})...");
 
@@ -263,7 +263,7 @@ public sealed class ScriptInvoker
 			catch { }
 
 			if (recompiled == null)
-				return new ScriptResult(result.ExitCode, result.Stdout, result.Stderr, result.ExitDelay);
+				return new ScriptResult(result.ExitCode, result.Stdout, result.Stderr, result.ExitDelay) { Cancelled = ct.IsCancellationRequested };
 
 			stateBase64 = result.State;
 			currentCompiled = recompiled;
@@ -347,6 +347,13 @@ public sealed class ScriptInvoker
 
 				var (exitCode, _, exitDelay, scriptRestart) = await ReceiveUntilExitAsync(channel, ct);
 
+				// Cancelled: the elevated script cannot be terminated from here, only asked to stop
+				if (ct.IsCancellationRequested)
+				{
+					await TrySendAsync(channel, new ScriptStop());
+					return new ScriptResult(exitCode, "", "", exitDelay) { Cancelled = true };
+				}
+
 				// Check restart
 				if (compiled.Restart && scriptRestart && !ct.IsCancellationRequested)
 				{
@@ -397,6 +404,10 @@ public sealed class ScriptInvoker
 		string? stateBase64 = null;
 		await using var keepAlive = await CacheKeepAlive.StartAsync(daemonAddress, initial, touchNow: false, ct);
 
+		// One receive on the daemon connection at a time, kept across script instances:
+		// a second one would queue behind it and the notification it gets would be lost
+		var hotSwapTask = daemonConn.Channel.ReceiveAsync().AsTask();
+
 		try
 		{
 			while (!ct.IsCancellationRequested)
@@ -406,32 +417,38 @@ public sealed class ScriptInvoker
 				var psi = BuildProcessStartInfo(currentCompiled, args, output, workingDirectory, environmentVars, windowMode);
 				psi.Environment["SEASHELL_PIPE"] = pipeName;
 
-				using var proc = Process.Start(psi)!;
-
-				try
-				{
+				using var script = ScriptProcess.Start(psi, containTree: output == OutputMode.Capture);
+				var proc = script.Process;
 
 				var pipe = new NamedPipeClientStream(".", pipeName, PipeDirection.InOut, PipeOptions.Asynchronous);
-				pipe.Connect(5000);
-				var scriptChannel = new MessageChannel(pipe);
+				MessageChannel scriptChannel;
+				try
+				{
+					await pipe.ConnectAsync(5000, ct);
+					scriptChannel = new MessageChannel(pipe);
 
-				if (connection != null) connection.Channel = scriptChannel;
+					if (connection != null) connection.Channel = scriptChannel;
 
-				await scriptChannel.SendAsync(BuildScriptInit(currentCompiled, args,
-					reloadCount: reloadCount, stateBase64: stateBase64, watch: true,
-					restart: initial.Restart, restartCount: restartCount,
-					mutexScope: initial.MutexScope, mutexAttach: initial.MutexAttach,
-					windowMode: windowMode, log: _log), ct);
+					await scriptChannel.SendAsync(BuildScriptInit(currentCompiled, args,
+						reloadCount: reloadCount, stateBase64: stateBase64, watch: true,
+						restart: initial.Restart, restartCount: restartCount,
+						mutexScope: initial.MutexScope, mutexAttach: initial.MutexAttach,
+						windowMode: windowMode, log: _log), ct);
+				}
+				catch (OperationCanceledException) when (ct.IsCancellationRequested)
+				{
+					if (connection != null) connection.Channel = null;
+					return await StopCancelledAsync(script, channel: null);
+				}
 
 				// Channel reader with reload request signaling
 				var reloadRequests = Channel.CreateUnbounded<(string? reason, bool clearCache)>();
 				var channelTask = ReceiveUntilExitOrStateAsync(scriptChannel, connection, reloadRequests.Writer, ct);
 				HotSwapNotify? swapNotify = null;
+				var restarting = false;
 
-				var hotSwapTask = daemonConn.Channel.ReceiveAsync().AsTask();
-
-				// Inner event loop for this process instance
-				while (!ct.IsCancellationRequested)
+				// Inner event loop for this process instance. Cancellation ends channelTask.
+				while (true)
 				{
 					var reloadTask = reloadRequests.Reader.ReadAsync().AsTask();
 					var completed = await Task.WhenAny(channelTask, hotSwapTask, reloadTask);
@@ -464,18 +481,15 @@ public sealed class ScriptInvoker
 								_log?.Invoke("restarting...");
 							}
 
+							restarting = true;
 							break; // break inner loop, outer while creates new process
 						}
 
-						if (output == OutputMode.Capture)
-						{
-							var so = await proc.StandardOutput.ReadToEndAsync();
-							var se = await proc.StandardError.ReadToEndAsync();
-							await proc.WaitForExitAsync();
-							return new ScriptResult(proc.ExitCode, so, se, exitDelay);
-						}
-						await proc.WaitForExitAsync();
-						return new ScriptResult(proc.ExitCode, "", "", exitDelay);
+						// Cancellation ends the channel read without telling the script: stop it
+						if (!await script.WaitForExitAsync(ct))
+							return await StopCancelledAsync(script, scriptChannel);
+						var (so, se) = await script.CollectOutputAsync();
+						return new ScriptResult(script.ExitCode, so, se, exitDelay);
 					}
 
 					if (completed == reloadTask)
@@ -483,6 +497,10 @@ public sealed class ScriptInvoker
 						var (reason, clearCache) = await reloadTask;
 						_log?.Invoke($"reload requested ({reason ?? "script"})...");
 						try { await daemonConn.Channel.SendAsync(new RecompileRequest(clearCache), ct); }
+						catch (OperationCanceledException) when (ct.IsCancellationRequested)
+						{
+							continue; // channelTask ends too: the script is stopped there
+						}
 						catch
 						{
 							_log?.Invoke("daemon disconnected");
@@ -498,6 +516,7 @@ public sealed class ScriptInvoker
 						_log?.Invoke("daemon disconnected during watch");
 						return new ScriptResult(1, "", "Daemon disconnected during watch");
 					}
+					hotSwapTask = daemonConn.Channel.ReceiveAsync().AsTask(); // this one is consumed
 
 					if (swapResult.Value.Type != MessageType.HotSwapNotify) continue;
 
@@ -505,7 +524,6 @@ public sealed class ScriptInvoker
 					if (string.IsNullOrEmpty(notify.AssemblyPath))
 					{
 						_log?.Invoke("recompile failed, continuing...");
-						hotSwapTask = daemonConn.Channel.ReceiveAsync().AsTask();
 						continue;
 					}
 
@@ -513,13 +531,17 @@ public sealed class ScriptInvoker
 					break;
 				}
 
-				if (swapNotify == null) break;
+				if (swapNotify == null)
+				{
+					if (restarting) continue; // a new process for the same compiled script
+					break;
+				}
 
 				reloadCount++;
 				_log?.Invoke($"reloading ({swapNotify.Reason})...");
 
 				// Signal old script to reload, collect state, kill
-				try { await scriptChannel.SendAsync(new ScriptReload()); } catch { }
+				await TrySendAsync(scriptChannel, new ScriptReload());
 
 				stateBase64 = null;
 				try
@@ -533,8 +555,9 @@ public sealed class ScriptInvoker
 				if (connection != null) connection.Channel = null;
 				await scriptChannel.DisposeAsync();
 
-				TryKillAfterTimeout(proc);
-				await proc.WaitForExitAsync();
+				// Cancelled meanwhile: end this instance and what it started instead of swapping
+				if (await EndForReloadAsync(script, ct))
+					return await StopCancelledAsync(script, channel: null);
 
 				currentCompiled = new CompiledScript(
 					swapNotify.AssemblyPath,
@@ -546,12 +569,6 @@ public sealed class ScriptInvoker
 					false, true,
 					swapNotify.Restart);
 				keepAlive.Update(currentCompiled);
-
-				}
-				finally
-				{
-					TryKillIfRunning(proc);
-				}
 			}
 		}
 		finally
@@ -559,7 +576,7 @@ public sealed class ScriptInvoker
 			await daemonConn.DisposeAsync();
 		}
 
-		return new ScriptResult(0, "", "");
+		return new ScriptResult(0, "", "") { Cancelled = ct.IsCancellationRequested };
 	}
 
 	// ── Single instance ─────────────────────────────────────────────────
@@ -567,7 +584,7 @@ public sealed class ScriptInvoker
 	private sealed record InstanceResult(
 		int ExitCode, string Stdout, string Stderr, int ExitDelay,
 		bool ReloadRequested, bool ClearCache, string? ReloadReason, string? State,
-		bool Restart = true);
+		bool Restart = true, bool Cancelled = false);
 
 	private async Task<InstanceResult> RunOneInstanceAsync(
 		CompiledScript compiled, string[] args,
@@ -581,16 +598,26 @@ public sealed class ScriptInvoker
 		var psi = BuildProcessStartInfo(compiled, args, output, workingDirectory, environmentVars, windowMode);
 		psi.Environment["SEASHELL_PIPE"] = pipeName;
 
-		using var proc = Process.Start(psi)!;
+		// A captured run (Host) is cancelled together with everything the script started.
+		// The CLI leaves that to the console: Ctrl+C reaches the script's children too.
+		using var script = ScriptProcess.Start(psi, containTree: output == OutputMode.Capture);
 
-		try
+		async Task<InstanceResult> CancelledAsync(MessageChannel? channel)
 		{
+			var r = await StopCancelledAsync(script, channel);
+			if (connection != null) connection.Channel = null;
+			return new InstanceResult(r.ExitCode, r.StandardOutput, r.StandardError, 0, false, false, null, null, Cancelled: true);
+		}
 
 		// Connect to script's pipe server
 		var pipe = new NamedPipeClientStream(".", pipeName, PipeDirection.InOut, PipeOptions.Asynchronous);
 		try
 		{
-			pipe.Connect(5000);
+			await pipe.ConnectAsync(5000, ct);
+		}
+		catch (OperationCanceledException) when (ct.IsCancellationRequested)
+		{
+			return await CancelledAsync(channel: null);
 		}
 		catch
 		{
@@ -598,44 +625,40 @@ public sealed class ScriptInvoker
 			if (restart)
 			{
 				_log?.Invoke("IPC pipe failed — //sea_restart requires IPC, aborting");
-				TryKillAfterTimeout(proc);
+				TryKillAfterTimeout(script.Process);
 				return new InstanceResult(1, "", "IPC pipe failed — //sea_restart requires IPC", 0, false, false, null, null, false);
 			}
 
 			// No directives need IPC — run without Sea context
-			if (output == OutputMode.Capture)
-			{
-				var o = await proc.StandardOutput.ReadToEndAsync();
-				var e = await proc.StandardError.ReadToEndAsync();
-				await proc.WaitForExitAsync();
-				return new InstanceResult(proc.ExitCode, o, e, 0, false, false, null, null);
-			}
-			await proc.WaitForExitAsync();
-			return new InstanceResult(proc.ExitCode, "", "", 0, false, false, null, null);
+			if (!await script.WaitForExitAsync(ct))
+				return await CancelledAsync(channel: null);
+			var (o, e) = await script.CollectOutputAsync();
+			return new InstanceResult(script.ExitCode, o, e, 0, false, false, null, null);
 		}
 
 		await using var channel = new MessageChannel(pipe);
 		if (connection != null) connection.Channel = channel;
 
-		await channel.SendAsync(BuildScriptInit(compiled, args,
-			reloadCount: reloadCount, stateBase64: stateBase64, watch: watch,
-			restart: restart, restartCount: restartCount,
-			mutexScope: compiled.MutexScope, mutexAttach: compiled.MutexAttach,
-			windowMode: windowMode, log: _log), ct);
+		try
+		{
+			await channel.SendAsync(BuildScriptInit(compiled, args,
+				reloadCount: reloadCount, stateBase64: stateBase64, watch: watch,
+				restart: restart, restartCount: restartCount,
+				mutexScope: compiled.MutexScope, mutexAttach: compiled.MutexAttach,
+				windowMode: windowMode, log: _log), ct);
+		}
+		catch (OperationCanceledException) when (ct.IsCancellationRequested)
+		{
+			// The script never got its init: nothing to ask it over the channel
+			return await CancelledAsync(channel: null);
+		}
 
 		// Drain channel with reload awareness
 		var reloadRequests = Channel.CreateUnbounded<(string?, bool)>();
 		var channelTask = ReceiveUntilExitOrStateAsync(channel, connection, reloadRequests.Writer, CancellationToken.None);
 
-		Task<string>? stdoutTask = null, stderrTask = null;
-		if (output == OutputMode.Capture)
-		{
-			stdoutTask = proc.StandardOutput.ReadToEndAsync();
-			stderrTask = proc.StandardError.ReadToEndAsync();
-		}
-
 		var reloadTask = reloadRequests.Reader.ReadAsync(CancellationToken.None).AsTask();
-		var exitTask = proc.WaitForExitAsync();
+		var exitTask = script.Process.WaitForExitAsync();
 
 		var cancelTcs = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
 		using var ctReg = ct.Register(() => cancelTcs.TrySetResult());
@@ -644,51 +667,85 @@ public sealed class ScriptInvoker
 
 		if (completed == exitTask)
 		{
-			var stdout = stdoutTask != null ? await stdoutTask : "";
-			var stderr = stderrTask != null ? await stderrTask : "";
+			var (stdout, stderr) = await script.CollectOutputAsync();
 			var (_, _, exitDelay, scriptRestart) = await channelTask;
 			if (connection != null) connection.Channel = null;
-			return new InstanceResult(proc.ExitCode, stdout, stderr, exitDelay, false, false, null, null, scriptRestart);
+			return new InstanceResult(script.ExitCode, stdout, stderr, exitDelay, false, false, null, null, scriptRestart);
 		}
 
 		if (completed == cancelTcs.Task)
-		{
-			// Graceful shutdown
-			try { await channel.SendAsync(new ScriptStop()); } catch { }
-			TryKillAfterTimeout(proc, 5000);
-
-			var stdout = stdoutTask != null ? await stdoutTask : "";
-			var stderr = stderrTask != null ? await stderrTask : "";
-			if (connection != null) connection.Channel = null;
-			return new InstanceResult(proc.HasExited ? proc.ExitCode : -1, stdout, stderr, 0, false, false, null, null);
-		}
+			return await CancelledAsync(channel);
 
 		// Script requested reload
 		var (reason, clearCache) = await reloadTask;
 
 		// Signal script to save state and exit
 		string? state = null;
-		try { await channel.SendAsync(new ScriptReload()); } catch { }
+		await TrySendAsync(channel, new ScriptReload());
 		try
 		{
-			using var cts = new CancellationTokenSource(5000);
+			using var cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+			cts.CancelAfter(5000);
 			var (_, s, _, _) = await channelTask.WaitAsync(cts.Token);
 			state = s;
 		}
 		catch { }
 
-		TryKillAfterTimeout(proc);
+		// Cancelled during the reload: end the script and what it started instead
+		if (await EndForReloadAsync(script, ct))
+			return await CancelledAsync(channel);
 
-		var so2 = stdoutTask != null ? await stdoutTask : "";
-		var se2 = stderrTask != null ? await stderrTask : "";
+		var (so2, se2) = await script.CollectOutputAsync();
+		// The run goes on with the reloaded instance, so a cancellation while this one's
+		// output drained (a child holding it) still ends what it started
+		if (ct.IsCancellationRequested)
+			return await CancelledAsync(channel);
 		if (connection != null) connection.Channel = null;
 		return new InstanceResult(0, so2, se2, 0, true, clearCache, reason, state);
+	}
 
-		}
-		finally
+	/// <summary>
+	/// End a cancelled run: ask the script to stop when it is running and there is a channel
+	/// to ask it over, give it the grace period, then terminate it — a captured run with
+	/// everything it started — and collect its output.
+	/// </summary>
+	private static async Task<ScriptResult> StopCancelledAsync(ScriptProcess script, MessageChannel? channel)
+	{
+		if (channel != null && !script.Process.HasExited)
+			await TrySendAsync(channel, new ScriptStop());
+		await script.StopAsync(ScriptProcess.StopGracePeriod);
+		var (stdout, stderr) = await script.CollectOutputAsync();
+		return new ScriptResult(script.ExitCode, stdout, stderr) { Cancelled = true };
+	}
+
+	/// <summary>
+	/// Make way for the reloaded instance: give the script three seconds to exit, then kill
+	/// it. True if <paramref name="ct"/> fired before or during this — the caller then ends
+	/// the script and what it started as for any cancellation, even if the script is gone.
+	/// </summary>
+	private static async Task<bool> EndForReloadAsync(ScriptProcess script, CancellationToken ct)
+	{
+		using (var exitWait = CancellationTokenSource.CreateLinkedTokenSource(ct))
 		{
-			TryKillIfRunning(proc);
+			exitWait.CancelAfter(3000);
+			await script.WaitForExitAsync(exitWait.Token);
 		}
+		if (ct.IsCancellationRequested)
+			return true;
+
+		TryKillAfterTimeout(script.Process, 0);
+		await script.WaitForExitAsync(ScriptProcess.KillWaitTimeout);
+		return ct.IsCancellationRequested;
+	}
+
+	/// <summary>
+	/// Send a control message (ScriptStop, ScriptReload) to the script. Bounded: a script
+	/// that stopped reading, or a large host message ahead of it, cannot hold this up.
+	/// </summary>
+	private static async Task TrySendAsync<T>(MessageChannel channel, T message) where T : notnull
+	{
+		using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(2));
+		try { await channel.SendAsync(message, timeout.Token); } catch { }
 	}
 
 	// ── Attach client ───────────────────────────────────────────────────
@@ -763,17 +820,6 @@ public sealed class ScriptInvoker
 		try
 		{
 			if (!proc.WaitForExit(timeoutMs))
-				proc.Kill(entireProcessTree: false);
-		}
-		catch { }
-	}
-
-	/// <summary>Kill the process if it hasn't exited yet (for finally blocks).</summary>
-	private static void TryKillIfRunning(Process proc)
-	{
-		try
-		{
-			if (!proc.HasExited)
 				proc.Kill(entireProcessTree: false);
 		}
 		catch { }

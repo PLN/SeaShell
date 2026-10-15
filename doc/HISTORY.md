@@ -51,6 +51,22 @@
 - **CI runs the unit tests again.** `dotnet test --no-build` on a fresh
   checkout skipped restore and silently ran nothing, and the Windows `seaw`
   tests probed a pre-0.5.0 path and skipped. Both now run and fail loudly.
+- **A script's leftover child no longer holds a ScriptHost run open.** A child
+  process inherits the script's captured stdout/stderr, and `RunAsync` waited
+  for those to close: a run whose script had exited, or whose token had fired,
+  returned only once every such child was gone — in one case 15 minutes past a
+  60-second timeout — and nothing stopped the child. Output is now read as it
+  arrives and collected for at most two seconds after the script exits.
+  Cancelling a run asks the script to stop, waits up to five seconds, then
+  terminates it together with every process it started (a job object on
+  Windows, an environment marker on Linux), also during a reload, and returns
+  the output captured so far with the new `ScriptResult.Cancelled` set. A child
+  left behind by a script that exits on its own keeps running. Unit tests and an
+  end-to-end ScriptHost test run on all three CI platforms.
+- **`//sea_restart` works in watch mode.** A `//sea_watch` script that exited
+  for a restart announced it, waited out the backoff, and then ended the
+  session with exit code 0 instead of starting again. It now restarts, and
+  the first file change after a restart is no longer lost.
 
 ## v0.6.1 (2026-07-08)
 

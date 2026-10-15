@@ -52,6 +52,15 @@ public sealed class ScriptHost
 	/// <summary>
 	/// Compile and run a script file. Captures stdout/stderr.
 	/// Handles elevation, watch mode, and script-initiated reload automatically.
+	///
+	/// Cancelling <paramref name="ct"/> while the script runs asks it to stop
+	/// (<c>Sea.ShutdownToken</c>), waits up to five seconds, then terminates the script and
+	/// every process it started, and returns a result with <see cref="ScriptResult.Cancelled"/>
+	/// set and the output captured until then. (A <c>//sea_elevate</c> script started from a
+	/// non-elevated host runs under the elevator and is only asked to stop.)
+	///
+	/// A child the script leaves running when it exits keeps running, but does not hold the
+	/// call open: output is collected for at most two seconds after the script exits.
 	/// </summary>
 	public async Task<ScriptResult> RunAsync(
 		string scriptPath,
@@ -70,7 +79,8 @@ public sealed class ScriptHost
 
 	/// <summary>
 	/// Compile and run a code snippet. Uses content-based hashing so identical
-	/// snippets are cached by the daemon without redundant compilation.
+	/// snippets are cached by the daemon without redundant compilation. Cancellation
+	/// behaves as for <see cref="RunAsync"/>.
 	/// </summary>
 	public async Task<ScriptResult> RunSnippetAsync(
 		string code,
@@ -97,7 +107,7 @@ public sealed class ScriptHost
 	/// and run multiple times. The compiled output lives in the daemon's cache, which
 	/// deletes entries unused for 24 hours: if a <see cref="CompiledScript"/> may sit
 	/// longer than that between runs, call <see cref="CompileAsync"/> again first
-	/// (a cache hit, so cheap).
+	/// (a cache hit, so cheap). Cancellation behaves as for <see cref="RunAsync"/>.
 	/// </summary>
 	public async Task<ScriptResult> ExecuteAsync(
 		CompiledScript compiled,

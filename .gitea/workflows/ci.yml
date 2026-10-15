@@ -450,6 +450,9 @@ jobs:
       - name: "Test: host-in-host-nuget (nested ScriptHost + NuGet)"
         run: sea test/host-in-host-nuget/host-in-host-nuget.cs
 
+      - name: "Test: host-child-process (a script's leftover child does not hold ScriptHost runs open)"
+        run: sea test/host-child-process/host-child-process.cs
+
       - name: "Test: binary-deps (companion deps.json pass-through)"
 
         run: |
@@ -752,6 +755,12 @@ jobs:
 
       - name: "Test: restart_opt_out_test.cs"
         run: sea test/restart_opt_out_test.cs
+
+      - name: "Test: watch_restart_test.cs (//sea_restart in watch mode)"
+        run: |
+          OUT=$(sea test/watch_restart_test.cs)
+          echo "$OUT"
+          echo "$OUT" | grep -q "reached count=2" || { echo "watch session ended without restarting"; exit 1; }
 
       # ── Mutex tests ────────────────────────────────────────────────
 
