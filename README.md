@@ -4,40 +4,198 @@ A C# and VB.NET scripting engine with a persistent daemon, NuGet support, hot-sw
 
 ## Install
 
-Requires .NET 10 SDK.
+Requires the .NET 10 SDK.
+
+```
+dnx SeaShell install --all
+```
+
+This fetches the latest SeaShell package and installs everything the platform
+supports, then remembers that scope:
+
+- **Windows**, behind a single UAC prompt: the per-user install, the elevator
+  task (for UAC-free `//sea_elevate` scripts), the Windows Event Log source,
+  and the SYSTEM install (so Windows services running as LocalSystem can use
+  SeaShell). From a non-elevated console it self-elevates and streams the
+  elevated output back, then starts the daemon and elevator and verifies the
+  whole chain.
+- **Linux**: the per-user install, then root's own install (for services
+  running as root) through `sudo`.
+
+`dnx SeaShell install` (without a scope flag) installs the remembered scope
+(see [Scope](#scope)). On a first install there is none, so it is the user-only
+install: no elevation, daemon task and file associations registered, elevator
+skipped unless the console is already elevated. Later, a plain `install` or
+`update` covers whatever was installed before — including the elevator and
+SYSTEM after an `install --all`, with one UAC prompt — and `--user` narrows the
+scope back to the user install.
+
+The install ships its own `seashell`, next to `sea` in `current/bin` (on the
+Windows user PATH, and symlinked into `~/.local/bin` on Linux). Later updates
+are one command:
+
+```
+seashell update                   # latest version, same scope as before
+seashell                          # dashboard: versions, scope, daemon/elevator state
+```
+
+`seashell update` fetches the latest package into a temporary tool directory
+(`dotnet tool install SeaShell --tool-path <temp>`, so it needs NuGet access at
+that moment), runs that bootstrapper's install for every target that is not
+already on that version, and removes the directory again. It prints
+`Up to date` when there was nothing to do. `--version <v>` picks a version,
+`--source <feed>` replaces the configured NuGet sources.
+
+### Scope
+
+The scope — which parts an install consists of: `user`, `elevator` (Windows),
+`system` (the Windows SYSTEM install or the Linux root install) — is recorded
+in `{DataDir}/install.scope` after each install. `seashell install` and
+`seashell update` without flags reuse it, so a plain update after
+`install --all` updates the elevator and SYSTEM too (one UAC prompt or `sudo`
+password, only when the install has such parts). The flags override and
+re-record it:
+
+| Flag | Scope |
+|------|-------|
+| `--all` | everything the platform supports |
+| `--user` | user only; prints what it leaves behind and how to remove that |
+| `--system` | the SYSTEM / root install only (run elevated: `gsudo` / `sudo`); the user's recorded scope is not changed |
+
+Installs made by 0.6.2 or earlier have no recorded scope; it is detected from
+what is installed (the elevator task, a SYSTEM daemon task or running SYSTEM
+daemon, `/var/lib/seashell/current`). Where a non-elevated console cannot see
+whether a SYSTEM install exists, the run updates the user install only, as
+0.6.2 did, says so, and records nothing; `seashell install --all` records the
+full scope.
+
+When the UAC prompt is answered with a different (administrator) account, the
+elevated part installs SYSTEM only and says so; the original console then
+installs the user part itself, without the elevator. A standard user cannot
+have an elevator: it runs with the user's own elevated token.
+
+The SYSTEM install lives under SYSTEM's own user profile
+(`%SystemRoot%\System32\config\systemprofile\AppData\Local\seashell\`) with a
+boot-triggered daemon task (`S-1-5-18` principal), started right away. The
+elevated bootstrapper performs it directly — identity-derived values (data dir,
+pipe names, task principals) are computed from SIDs, so nothing needs to
+execute as SYSTEM. The Linux root install lives in root's own data directory
+(`/var/lib/seashell/`); like every SeaShell install it belongs to one identity
+and is not shared with other users.
+
+### Alternative: global tool
 
 ```
 dotnet tool install -g SeaShell
 seashell install --all
 ```
 
-On Windows, `install --all` does everything in one pass behind a single UAC
-prompt: the per-user install, the elevator task (for UAC-free `//sea_elevate`
-scripts), the Windows Event Log source, and the SYSTEM install — then starts
-the daemon and elevator immediately and verifies the whole chain. From a
-non-elevated console it self-elevates and streams the elevated output back.
+A global tool carries its own version: `seashell install` installs exactly that
+version (also to repair or reinstall). `seashell update` from it fetches the
+latest, like the installed copy does. Once a newer version is installed, an
+older global tool is removed (`dotnet tool uninstall -g SeaShell`) because the
+installed `seashell` supersedes it; on Windows `current\bin` is kept ahead of
+`%USERPROFILE%\.dotnet\tools` in the user PATH. When the global tool is in use
+by the running command, the one-line fix is printed instead.
 
-`seashell install` (without `--all`) is the user-only install: no elevation
-needed, daemon task and file associations registered, elevator skipped unless
-the console is already elevated.
+Which `seashell` runs: after the first install, `seashell` on PATH is the
+installed copy (`current/bin`), not the global tool. The installed copy carries
+no package of its own, so its `install` normally fetches the latest version
+from the configured NuGet sources — like `update`, it prints which sources it
+searches and which version it resolved, and every configured feed counts (a
+private feed with newer CI builds wins over nuget.org; pass
+`--source https://api.nuget.org/v3/index.json` to use nuget.org only). The
+classic route still means what it did: when a global SeaShell tool newer than
+the installed version is present (`dotnet tool update -g SeaShell`), the
+installed copy's `install` runs that global tool instead of fetching, so
+`dotnet tool update -g SeaShell && seashell install --all` installs exactly
+the global tool's version.
 
-The parts are also available separately. For just the SYSTEM install (so
-Windows services running as LocalSystem can use SeaShell):
+### Automatic updates
+
+Off by default. `seashell update --auto on` schedules a daily `seashell update`
+for the remembered scope, one entry per target, each updating only itself:
+
+- **Windows**: task `SeaShell Update ({user})` in `\SeaShell\` (runs while you are
+  logged on; with highest privileges when the scope has the elevator, so the
+  elevator is re-registered without a prompt), and `SeaShell Update (SYSTEM)`
+  when the scope has the SYSTEM install. Enabling either needs the one UAC
+  prompt.
+- **Linux**: one line in your crontab tagged `# seashell-auto-update`, and one
+  in root's crontab (through `sudo`) for the root install.
+
+Each entry runs the installed `current/bin/seashell` (so it survives version
+changes) with an absolute `dotnet` path checked when you enable it, at a time of
+day derived from the machine and account. Windows Task Scheduler catches up a
+run missed while the machine was off or you were logged off; plain Linux cron
+does not (the next day's run updates). A `--source <feed>` given with
+`--auto on` is stored in the entry (a local path as an absolute path); otherwise
+each identity uses its own NuGet configuration (SYSTEM and root: usually
+nuget.org only).
+
+The SYSTEM / root entry runs as SYSTEM / root, so it records a `dotnet` that
+only administrators can change: one under `%ProgramFiles%`, or on Linux one
+owned by root all the way up (`/usr/bin/dotnet`, `/usr/share/dotnet`,
+`/usr/lib/dotnet`, ...) — never an SDK in your profile (`~/.dotnet`). With only
+a per-user SDK, `--auto on` turns on your own entry, says why the SYSTEM / root
+one was not created, and exits with code 3; install the .NET SDK machine-wide
+and run it again.
+
+An update is skipped while the target's daemon has connected sessions (watch
+sessions, REPLs, compiles that an update would cut off); plain running scripts
+keep running from their own directory, as with a manual update. A scheduled run
+prints nothing unless it installed something or failed. Every run appends its
+complete outcome — time, command line, exit code and all output — to
+`update.log` in the data directory (`%LOCALAPPDATA%\seashell`,
+`~/.local/share/seashell`; rolled over to `update.log.1` at 1 MB), and also
+writes it to the Windows Event Log (source `SeaShell`, registered by an elevated
+install) or syslog. `seashell status` shows whether automatic updates are on and
+points to `update.log` when the last scheduled run failed;
+`seashell update --auto off` removes the entries, and so does
+`seashell uninstall`. See [doc/SECURITY.md](doc/SECURITY.md#automatic-updates).
+
+### Uninstall
+
 ```
-gsudo seashell install --system      # Windows
-sudo seashell install --system       # Linux
+seashell uninstall
 ```
-On Windows this installs under SYSTEM's own user profile
-(`%SystemRoot%\System32\config\systemprofile\AppData\Local\seashell\`) and
-registers the daemon task with a boot trigger and an `S-1-5-18` principal,
-then starts it. The elevated bootstrapper performs the install directly —
-identity-derived values (data dir, pipe names, task principals) are computed
-from SIDs, so nothing needs to execute as SYSTEM. On Linux, `--system`
-installs to root's standard location (`/var/lib/seashell/`).
 
-Run `seashell` with no arguments to see a dashboard with version, platform,
-daemon/elevator state, and idle time. Use `seashell start` / `seashell stop`
-to manage daemon lifecycle.
+removes the remembered scope — with the same one UAC prompt (Windows) or
+`sudo` (Linux) as install when it has elevated parts: binaries and version
+directories, the daemon, elevator and automatic-update tasks or crontab line,
+the PATH entry / `~/.local/bin` symlinks, file associations, `install.scope`
+and `update.check`. `--user` removes the user install (and its elevator) and
+leaves SYSTEM / root; `--system` removes only that; `--all` everything.
+
+Scripts scheduled with `seashell schedule` are listed and **kept** — they work
+again after a reinstall; `seashell uninstall --purge` removes them as well,
+listing each. The NuGet global packages cache and the Windows Event Log source
+`SeaShell` stay. Run from the installed `seashell` on Windows, the uninstall
+continues from a temporary copy and its own version directory is removed after
+it exits — unless a reinstall of that version has made it current again by
+then. A version directory that a running script or `seaw` window still
+executes from is left untouched and named; the uninstall then reports
+"incomplete" with a non-zero exit code instead of "Uninstalled.". The
+`dotnet tool uninstall -g SeaShell` hint appears only when a global tool is
+installed.
+
+### What stays manual
+
+- Installing the .NET 10 SDK (the installer checks for it before changing
+  anything).
+- One migration run for installs made by 0.6.2 or earlier, whose `seashell
+  update` cannot fetch a newer version: `dnx SeaShell install` (it detects and
+  records the existing scope), or the old two commands once more
+  (`dotnet tool update -g SeaShell`, `seashell install --all`).
+- Opening a new terminal after a PATH change. On Linux, `~/.local/bin` must be
+  on PATH; the installer prints the `export PATH=...` line when it is not.
+- Opting in to automatic updates (`seashell update --auto on`).
+- NuGet source configuration for SYSTEM / root when you use a private feed:
+  they use their own NuGet configuration.
+- Rebuilding services to opt in to the builder option for package-update
+  reloads (see [Service Hosting](#service-hosting)).
+
+Use `seashell start` / `seashell stop` to manage the daemon lifecycle.
 
 ## Quick Start
 
@@ -67,8 +225,8 @@ SeaShell is inspired by and grateful to [CS-Script](https://github.com/oleg-shil
 - **Elevation** — `//sea_elevate` scripts run elevated via a pre-registered Task Scheduler worker. No UAC prompts. Requires a running or registered elevator unless the CLI is already elevated. Ignored on Linux.
 - **Binary running** — Run pre-compiled `.dll` and `.exe` files with full Sea context. Single-file executables, apphosts, and plain DLLs all supported. Companion `.sea.json` enables directives for binaries.
 - **Script-initiated reload** — `Sea.RequestReload()` triggers recompilation and hot-swap from within a script. Optional `clearCache` for forced fresh builds. Works in both direct and watch mode.
-- **Service hosting** — `SeaShell.Host` includes service hosting (namespace `SeaShell.ServiceHost`). Runs scripts as system services. Windows Service, systemd, runit, OpenRC, sysvinit — auto-detected. Zero-locking automatic updates via NuGet.
-- **Embeddable** — `SeaShell.Host` lets you compile and run scripts from your own application. No daemon required. Supports reload and watch mode internally.
+- **Service hosting** — `SeaShell.Host` includes service hosting (namespace `SeaShell.ServiceHost`). Runs scripts as system services. Windows Service, systemd, runit, OpenRC, sysvinit — auto-detected. `install` registers and starts the service; optionally the script is reloaded when a package update changes its build.
+- **Embeddable** — `SeaShell.Host` lets you compile and run scripts from your own application, through the installed SeaShell daemon (started on demand). Supports reload and watch mode internally.
 - **VB.NET support** — `.vb` files compile through the same pipeline with VB-native directives (`'sea_nuget`).
 - **CS-Script compatible** — `//css_inc`, `//css_nuget` directives are recognized. Existing `.cscs` scripts work with zero changes.
 - **Cross-platform** — Named pipes on Windows, Unix domain sockets on Linux. Shebangs supported (`#!/usr/bin/env sea`).
@@ -285,6 +443,8 @@ associates it with seaw.exe.
 ## Embedding (SeaShell.Host)
 
 ```csharp
+using SeaShell.Host;
+
 var host = new ScriptHost();
 
 // Run a script file
@@ -292,21 +452,21 @@ var result = await host.RunAsync("path/to/script.cs");
 Console.WriteLine(result.StandardOutput);
 
 // Run a code snippet
-var result = await host.RunSnippetAsync("""
+var snippet = await host.RunSnippetAsync("""
     Console.WriteLine("Hello!");
     return 0;
     """);
 
-// Compile once, run many times
-var compiled = host.Compile("script.cs");
-await host.ExecuteAsync(compiled);
-await host.ExecuteAsync(compiled);
-
-// Background NuGet updates on your schedule
-var updater = host.CreateUpdater();
-updater.Log += Console.WriteLine;
-await updater.CheckForUpdatesAsync();
+// Compile once, run many times (null if compilation failed)
+var compiled = await host.CompileAsync("script.cs");
+if (compiled != null)
+{
+    await host.ExecuteAsync(compiled);
+    await host.ExecuteAsync(compiled);
+}
 ```
+
+`ScriptHost` compiles through the SeaShell daemon, so SeaShell must be installed on the machine. The daemon is started on demand; a running daemon of a newer version is used as well. Package updates need nothing from the host: the daemon keeps its NuGet cache up to date (see **Background NuGet updates** above), and a script that references a package without a version compiles against the newest cached version at the time of the compile.
 
 `Sea.IsConsoleEphemeral` is always `false` when running via Host. `Sea.ExitDelay` has no effect — the Host does not perform exit delays.
 
@@ -315,12 +475,19 @@ await updater.CheckForUpdatesAsync();
 The Host and script can exchange binary messages during execution over the existing pipe:
 
 ```csharp
-var conn = new ScriptHost.ScriptConnection();
+using System.Text;
+using SeaShell.Host;
+using SeaShell.Invoker;   // ScriptConnection
+
+var host = new ScriptHost();
+var conn = new ScriptConnection();
 conn.MessageReceived += (payload, topic) =>
     Console.WriteLine($"Script [{topic}]: {Encoding.UTF8.GetString(payload)}");
 
 var result = await host.RunAsync("script.cs", connection: conn);
 ```
+
+While the script runs, `conn.SendAsync(payload, topic)` sends to it.
 
 Script side:
 ```csharp
@@ -334,7 +501,7 @@ Messages are binary (`byte[]`) with an optional `string` topic for routing. Stri
 
 ## Service Hosting
 
-Run any script or binary as a system service with automatic updates:
+Run any script or binary as a system service:
 
 ```csharp
 using SeaShell.ServiceHost;
@@ -344,32 +511,35 @@ return await new ServiceHostBuilder()
     .DisplayName("My Service")
     .Description("Runs my-script.cs as a system service")
     .RunScript("my-script.cs")           // or .RunAssembly("myapp.dll")
-    .EnableNuGetUpdates(TimeSpan.FromHours(8))
+    .ReloadOnPackageUpdate()             // optional, RunScript only (see below)
     .RunAsync(args);
 ```
+
+Relative script and assembly paths resolve against the executable's directory, which is also the default working directory (`.WorkingDirectory(...)` changes it; `.EnvironmentVariable(...)` sets variables for the script). When the workload exits it is started again, after five seconds if it failed.
 
 The binary handles both service mode and management commands:
 
 ```
 myservice                   Run as foreground service (invoked by init system)
-myservice install           Auto-detect platform, register service
-myservice uninstall         Remove service registration
-myservice start             Start the registered service
+myservice install           Auto-detect platform, register the service and start it
+myservice uninstall         Stop the service and remove its registration
+myservice start             Start the registered service (already running is a success)
 myservice stop              Stop the registered service
 myservice status            Show service status
 ```
 
-Supported init systems (auto-detected): Windows Service, systemd, runit, OpenRC, sysvinit.
+Supported init systems (auto-detected): Windows Service, systemd, runit, OpenRC, sysvinit. `install`, `uninstall`, `start` and `stop` need administrator rights (root on Linux). If the service does not start, `install` leaves it registered and exits with the start's error code; fix the cause and run `myservice start` (running `install` again fails on Windows, where the service is already registered).
 
-**Zero-locking updates**: When `EnableNuGetUpdates` is configured, the service periodically checks for package updates. A new version produces a new compilation cache directory — the old process runs from the old directory, the new one starts from the new directory. No file locks are contested.
+**Package updates**: the daemon downloads newer package versions every 8 hours; a running service keeps the build it started with. With `.ReloadOnPackageUpdate(interval)` (default: every hour) the service asks the daemon to compile the script again — a cache hit while nothing has changed. When a newer version of a package referenced without a version (`//sea_nuget Name`) or an edited source file gives a new compilation cache directory, the running instance is reloaded as by `Sea.RequestReload()`: it gets `Sea.Reloading` (and `Sea.ShutdownToken` is cancelled), can pass state on with `Sea.SetReloadState(...)`, and the new build starts from its own directory, so no files are contested. A compile error leaves the running instance alone and is logged as a warning. There is no rollback once a reload has begun: the old instance stops before the new build is compiled again and started, so if that fails, no instance runs until the service's restart loop (every five seconds) gets one going, and that one starts without the saved state. Pinned versions (`//sea_nuget Name 1.2.3`) never change. A `//sea_elevate` script that a non-elevated service runs through the elevator is not reloaded.
 
 ## Task Scheduler (Windows)
 
 `seashell install` registers scheduled tasks automatically:
 
 - `SeaShell Daemon ({user}) {version}` — LogonTrigger, LeastPrivilege. Auto-starts the daemon at user logon.
-- `SeaShell Elevator ({user}) {version}` — LogonTrigger, HighestAvailable. Only registered when `seashell install` runs elevated.
-- `SeaShell Daemon (SYSTEM) {version}` — BootTrigger, HighestAvailable. Only registered by `seashell install --system` / `--all`.
+- `SeaShell Elevator ({user}) {version}` — LogonTrigger, HighestAvailable. Only registered when the scope includes the elevator (`--all`), or when `seashell install` runs elevated.
+- `SeaShell Daemon (SYSTEM) {version}` — BootTrigger, HighestAvailable. Only registered when the scope includes SYSTEM (`--all`, `--system`).
+- `SeaShell Update ({user})` / `SeaShell Update (SYSTEM)` — daily, only with automatic updates on (`seashell update --auto on`, see [Automatic updates](#automatic-updates)). Install and stop never end these; uninstall removes them.
 
 Use `sea --start` / `sea --stop` / `sea --status` (or `seashell start`/`stop`/`status`) for lifecycle and state. `sea --stop` uses IPC first (works on Linux too), then ends Task Scheduler tasks. The daemon also starts lazily on first `sea` invocation if no task is registered.
 
@@ -378,16 +548,26 @@ elevated CLI. When its task is registered but not running, `sea` auto-starts it 
 
 ## Bootstrapper Commands
 
-The `seashell` command (installed via `dotnet tool install -g SeaShell`) manages the
-SeaShell installation:
+`seashell` — the copy shipped in `current/bin`, a global tool, or
+`dnx SeaShell` — manages the SeaShell installation:
 
 ```
-seashell                          Dashboard: version, platform, daemon/elevator state
-seashell install                  Extract archives, register daemon, update PATH
-seashell install --all            User + elevator + SYSTEM in one pass (one UAC prompt)
-seashell install --system         SYSTEM-only install (requires elevation)
-seashell uninstall                Remove binaries, daemon task, file associations
-seashell uninstall --system       Remove SYSTEM install
+seashell                          Dashboard: version, platform, scope, daemon/elevator state
+seashell install                  Install the version this bootstrapper carries, remembered scope
+                                  (the installed copy carries none: same as update)
+seashell install --all            Everything: user + elevator + SYSTEM (Windows, one UAC prompt)
+                                  or user + root (Linux, through sudo); remembered
+seashell install --user           User only; remembered
+seashell install --system         SYSTEM / root only (requires elevation); user scope unchanged
+seashell update                   Fetch the latest version and install it, remembered scope
+seashell update --version <v>     Fetch a specific version
+seashell update --source <feed>   Fetch from this NuGet source instead of the configured ones
+seashell update --auto on|off     Daily unattended update of the remembered scope [--source <feed>]
+seashell uninstall                Remove the remembered scope (see Uninstall); lists scheduled scripts
+seashell uninstall --purge        ... and removes the scripts scheduled with seashell schedule
+seashell uninstall --user         User install (and its elevator) only; SYSTEM / root stays
+seashell uninstall --system       SYSTEM / root install only (requires elevation)
+seashell uninstall --all          Everything the platform supports
 seashell start                    Start daemon (and elevator if registered)
 seashell stop                     Stop daemon and elevator
 seashell status                   Show running state and versions
@@ -397,9 +577,9 @@ seashell schedule                 List scheduled scripts
 seashell unschedule <script>      Remove a scheduled script
 ```
 
-`seashell install` and `seashell update` are identical — both extract the latest
-archives and re-register tasks. Updating everything is the same motion:
-`dotnet tool update -g SeaShell && seashell install --all`.
+`seashell install` reinstalls (repairs) the version the bootstrapper carries;
+`seashell update` always looks for the latest one and installs it only where it
+is missing. `update` takes the same scope flags as `install`.
 
 ## Project Structure
 
@@ -446,6 +626,11 @@ Pack NuGet packages:
 ```
 dotnet pack -c Release -o ./nupkg
 ```
+The `SeaShell` tool package embeds the per-RID install archives only with
+`-p:EmbedArchives=true`, after `src/SeaShell.Bootstrapper/archives/{rid}.zip`
+has been staged (see the package job in `.gitea/workflows/ci.yml`). Without
+them the tool carries no version of its own, and `seashell install` fetches the
+latest published package, like `seashell update`.
 
 Install as a global tool (from local build):
 ```

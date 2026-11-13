@@ -16,7 +16,7 @@ PIDFILE="/var/run/$NAME.pid"
 case "$1" in
 	start)
 		echo "Starting $NAME..."
-		start-stop-daemon --start --background --make-pidfile \
+		start-stop-daemon --start --oknodo --background --make-pidfile \
 			--pidfile "$PIDFILE" --exec "$DAEMON" --chuid {user}
 		;;
 	stop)

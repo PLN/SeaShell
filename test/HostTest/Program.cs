@@ -1,12 +1,5 @@
 using SeaShell.Host;
 
-// Run update test if --update flag is passed
-if (args.Length > 0 && args[0] == "--update")
-{
-	await UpdateTest.Run();
-	return;
-}
-
 var host = new ScriptHost();
 var testDir = Path.GetFullPath(Path.Combine(AppContext.BaseDirectory, "..", "..", "..", ".."));
 
@@ -59,11 +52,14 @@ if (!r5env.StandardOutput.Contains("hello_from_host"))
 
 // Test 6: Compile once, inspect, run twice
 Console.WriteLine("\n=== Compile + run twice ===");
-var compiled = host.Compile(Path.Combine(testDir, "hello.cs"));
-Console.WriteLine($"  success:  {compiled.Success}");
-Console.WriteLine($"  assembly: {Path.GetFileName(compiled.AssemblyPath)}");
+var compiled = await host.CompileAsync(Path.Combine(testDir, "hello.cs"));
+Console.WriteLine($"  success:  {compiled != null}");
+if (compiled != null)
+{
+	Console.WriteLine($"  assembly: {Path.GetFileName(compiled.AssemblyPath)}");
 
-var r6a = await host.ExecuteAsync(compiled);
-var r6b = await host.ExecuteAsync(compiled);
-Console.WriteLine($"  run 1: {r6a.StandardOutput.Trim()}");
-Console.WriteLine($"  run 2: {r6b.StandardOutput.Trim()}");
+	var r6a = await host.ExecuteAsync(compiled);
+	var r6b = await host.ExecuteAsync(compiled);
+	Console.WriteLine($"  run 1: {r6a.StandardOutput.Trim()}");
+	Console.WriteLine($"  run 2: {r6b.StandardOutput.Trim()}");
+}

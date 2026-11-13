@@ -28,10 +28,12 @@ public sealed class ScriptHost
 {
 	private readonly ScriptInvoker _invoker;
 	private readonly string _daemonAddress;
+	private readonly Action<string>? _log;
 
 	/// <param name="log">Optional log callback for daemon/execution progress messages.</param>
 	public ScriptHost(Action<string>? log = null)
 	{
+		_log = log;
 		_invoker = new ScriptInvoker(log);
 		_daemonAddress = TransportEndpoint.GetDaemonAddress(TransportEndpoint.CurrentUserIdentity, TransportEndpoint.CurrentVersion);
 	}
@@ -39,12 +41,21 @@ public sealed class ScriptHost
 	// ── Compile ─────────────────────────────────────────────────────────
 
 	/// <summary>
-	/// Compile a script file via the daemon. Returns the compiled artifacts.
+	/// Compile a script file via the daemon. Returns the compiled artifacts, or null when
+	/// compilation failed or no daemon could be reached (the reason goes to the log callback).
+	/// Like <see cref="RunAsync"/>, starts the daemon if needed and uses a running daemon of
+	/// a newer version.
 	/// </summary>
 	public async Task<CompiledScript?> CompileAsync(
 		string scriptPath, string[]? args = null, CancellationToken ct = default)
 	{
-		return await _invoker.CompileAsync(scriptPath, args ?? Array.Empty<string>(), _daemonAddress, ct);
+		var address = await DaemonLauncher.EnsureRunningAsync(_daemonAddress, _log, ct: ct);
+		if (address == null)
+		{
+			_log?.Invoke("Daemon failed to start");
+			return null;
+		}
+		return await _invoker.CompileAsync(scriptPath, args ?? Array.Empty<string>(), address, ct);
 	}
 
 	// ── Run ─────────────────────────────────────────────────────────────

@@ -21,7 +21,7 @@ internal sealed class CacheKeepAlive : IAsyncDisposable
 {
 	public static readonly TimeSpan Interval = TimeSpan.FromMinutes(10);
 
-	private readonly string? _daemonAddress;
+	private volatile string? _daemonAddress;
 	private readonly TimeSpan _interval;
 	private readonly CancellationTokenSource _cts = new();
 	private Task _loop = Task.CompletedTask;
@@ -64,10 +64,14 @@ internal sealed class CacheKeepAlive : IAsyncDisposable
 	/// <summary>
 	/// The script now runs from another entry (reload, hot swap). The entry is the dir
 	/// holding the manifest: for a binary run in place, the assembly is outside the
-	/// cache but its staged manifest is not.
+	/// cache but its staged manifest is not. <paramref name="daemonAddress"/>: the daemon
+	/// that compiled it, when that changed (a reload after a daemon update); the pings go
+	/// there from now on. Pings are only sent when the keep-alive started with an address.
 	/// </summary>
-	public void Update(CompiledScript compiled)
+	public void Update(CompiledScript compiled, string? daemonAddress = null)
 	{
+		if (daemonAddress != null)
+			_daemonAddress = daemonAddress;
 		var anchor = compiled.ManifestPath ?? compiled.AssemblyPath;
 		_outputDir = Path.GetDirectoryName(Path.GetFullPath(anchor));
 	}

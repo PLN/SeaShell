@@ -1,6 +1,7 @@
 using System;
 using System.Diagnostics;
 using System.IO;
+using System.Threading;
 
 namespace SeaShell.ServiceHost.Installers;
 
@@ -30,7 +31,13 @@ public sealed class RunitInstaller : IServiceInstaller
 
 		Console.WriteLine($"runit service installed: {svDir}");
 		Console.WriteLine($"Activated via symlink: {servicePath}");
-		return 0;
+
+		// runsvdir picks the link up on its next scan (every five seconds) and starts the
+		// service. sv needs the supervisor that scan starts: wait for it, then sv start.
+		var supervised = Path.Combine(svDir, "supervise", "ok");
+		for (var i = 0; i < 30 && !File.Exists(supervised); i++)
+			Thread.Sleep(500);
+		return ServiceStart.AfterInstall(this, config);
 	}
 
 	public int Uninstall(ServiceConfig config)
@@ -51,6 +58,7 @@ public sealed class RunitInstaller : IServiceInstaller
 		return 0;
 	}
 
+	// sv start on a service that is up is a no-op with exit code 0
 	public int Start(ServiceConfig config) => RunCommand("sv", "start", config.Name);
 	public int Stop(ServiceConfig config) => RunCommand("sv", "stop", config.Name);
 	public int Status(ServiceConfig config) => RunCommand("sv", "status", config.Name);

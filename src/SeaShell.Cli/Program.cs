@@ -2,6 +2,7 @@ using System;
 using System.Diagnostics;
 using System.IO;
 using System.Runtime.InteropServices;
+using SeaShell;
 using SeaShell.Installer;
 using SeaShell.Protocol;
 using SeaShell.Invoker;
@@ -120,6 +121,7 @@ switch (args[0])
 			}
 			else
 				Console.WriteLine($"  elevator: not connected");
+			PrintUpdateNotice(status.Version);
 			ExitDelayIfNeeded();
 			return 0;
 		}
@@ -132,6 +134,7 @@ switch (args[0])
 		Console.WriteLine(elevatorTaskState != null
 			? $"  elevator: task {elevatorTaskState.ToLowerInvariant()}"
 			: "  elevator: not running");
+		PrintUpdateNotice(null);
 		ExitDelayIfNeeded();
 		return 1;
 
@@ -146,7 +149,11 @@ switch (args[0])
 
 	// ── Daemon/elevator task lifecycle ─────────────────────────────
 	case "--start":
-		return DaemonTasks.Start(log);
+		// Windows: the daemon and elevator tasks. Linux has no tasks: start the daemon
+		// directly, which is what `seashell start` does there (`sea --daemon-start`).
+		return OperatingSystem.IsWindows()
+			? DaemonTasks.Start(log)
+			: DaemonManager.StartDaemon(logErr, log);
 	case "--stop":
 		return await DaemonTasks.Stop(log);
 
@@ -186,6 +193,26 @@ var scriptArgs = args.Length > 1 ? args[1..] : Array.Empty<string>();
 var exitCode = await ScriptRunner.RunScriptAsync(scriptPath, scriptArgs, daemonAddress, isConsoleEphemeral, isWindowMode, verbose);
 ConsoleHelper.ExitDelay(isConsoleEphemeral);
 return exitCode;
+
+// ── Status helpers ──────────────────────────────────────────────────────
+
+// One line when the daemon's last release check (update.check) found a version newer
+// than everything this identity runs or has installed: this CLI, the running daemon,
+// and the version `current` points to. Nothing otherwise, or without the file.
+static void PrintUpdateNotice(string? daemonVersion)
+{
+	var check = UpdateCheck.Read(SeaShellPaths.DataDir);
+	if (check == null) return;
+	var known = new[]
+	{
+		typeof(Program).Assembly.GetName().Version?.ToString(4),
+		daemonVersion,
+		VersionDiscovery.GetCurrentVersion()?.ToString(),
+	};
+	foreach (var v in known)
+		if (v != null && !check.IsNewerThan(v)) return;
+	Console.WriteLine($"  update:   v{check.Latest} available (run 'seashell update')");
+}
 
 // ── seaw.exe helpers ────────────────────────────────────────────────────
 

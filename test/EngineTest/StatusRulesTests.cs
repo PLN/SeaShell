@@ -42,8 +42,36 @@ public class StatusRulesTests
 	[InlineData(true, "0.6.2.279", StatusAdvice.UpToDate)]
 	[InlineData(true, null, StatusAdvice.UpToDate)]
 	[InlineData(true, "0.6.1.250", StatusAdvice.UpdateAvailable)]
+	[InlineData(true, "0.6.2.300", StatusAdvice.BootstrapperOlder)]   // E2E defect 5: offered a downgrade
+	[InlineData(true, "0.6.2.279.0", StatusAdvice.UpToDate)]         // compared as versions, not strings
 	public void Advice_ComparesInstalledAgainstBootstrapper(bool installed, string? installedVersion, StatusAdvice expected)
 	{
 		Assert.Equal(expected, StatusRules.Advise(installed, installedVersion, "0.6.2.279"));
+	}
+
+	private static readonly DateTimeOffset CheckedAt = new(2026, 11, 12, 11, 40, 0, TimeSpan.Zero);
+
+	[Fact]
+	public void Dashboard_InstalledCopy_UsesTheDaemonsReleaseCheck()
+	{
+		// E2E defect 2: a successful update.check was ignored.
+		var newer = new SeaShell.UpdateCheckInfo(new Version(0, 6, 3, 9012), CheckedAt);
+		var same = new SeaShell.UpdateCheckInfo(new Version(0, 6, 3, 9011), CheckedAt);
+
+		Assert.Equal(new[] { "Update available: v0.6.3.9012 (run 'seashell update')" },
+			StatusRules.ClosingLines(true, "0.6.3.9011", "0.6.3.9011", carries: false, newer));
+		Assert.Equal(new[] { $"Up to date (checked {CheckedAt.ToLocalTime():yyyy-MM-dd HH:mm})" },
+			StatusRules.ClosingLines(true, "0.6.3.9011", "0.6.3.9011", carries: false, same));
+		Assert.Equal(new[] { "Run 'seashell update' to check online for a newer version" },
+			StatusRules.ClosingLines(true, "0.6.3.9011", "0.6.3.9011", carries: false, check: null));
+	}
+
+	[Fact]
+	public void Dashboard_OlderCarriedBootstrapper_OffersNoDowngrade()
+	{
+		var lines = StatusRules.ClosingLines(true, "0.6.3.9002", "0.6.3.9001", carries: true,
+			new SeaShell.UpdateCheckInfo(new Version(0, 6, 2, 283), CheckedAt));
+
+		Assert.Equal(new[] { "Installed v0.6.3.9002 is newer than this bootstrapper (v0.6.3.9001)" }, lines);
 	}
 }

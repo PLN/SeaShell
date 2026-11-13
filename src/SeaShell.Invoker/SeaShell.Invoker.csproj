@@ -6,6 +6,7 @@
 	</PropertyGroup>
 	<ItemGroup>
 		<InternalsVisibleTo Include="EngineTest" />
+		<InternalsVisibleTo Include="SeaShell.Host" />
 	</ItemGroup>
 	<ItemGroup>
 		<ProjectReference Include="..\SeaShell.Protocol\SeaShell.Protocol.csproj" />

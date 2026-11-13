@@ -288,6 +288,9 @@ public sealed class DaemonServer : IAsyncDisposable
 
 		while (!ct.IsCancellationRequested)
 		{
+			await CheckSeaShellReleaseAsync(ct);
+			if (ct.IsCancellationRequested) return;
+
 			try
 			{
 				_log.Information("Checking NuGet packages for updates...");
@@ -308,9 +311,53 @@ public sealed class DaemonServer : IAsyncDisposable
 	}
 
 	/// <summary>
+	/// Record the latest SeaShell release in <c>{DataDir}/update.check</c> for
+	/// <c>sea --status</c> and the <c>seashell</c> dashboard. Metadata only; a failed
+	/// lookup leaves the file as it is.
+	/// </summary>
+	private async Task CheckSeaShellReleaseAsync(CancellationToken ct)
+	{
+		var dataDir = SeaShellPaths.DataDir;
+		try
+		{
+			var lookup = await _updater.CheckSeaShellReleaseAsync(dataDir, ct);
+			if (lookup.Status == NuGetUpdater.LookupStatus.Found)
+				_log.Information("SeaShell release check: latest {Latest}, running {Version}{Note}; recorded in {File}",
+					lookup.Version, Version,
+					UpdateCheck.IsNewer(System.Version.Parse(lookup.Version!), Version) ? " (update available)" : "",
+					UpdateCheck.PathIn(dataDir));
+			else
+				_log.Warning("SeaShell release check: {Status} for package {Package} on sources {Sources}; {File} left unchanged",
+					lookup.Status, NuGetUpdater.SeaShellPackageId, _updater.SourceNames, UpdateCheck.PathIn(dataDir));
+		}
+		catch (OperationCanceledException) when (ct.IsCancellationRequested) { }
+		catch (Exception ex)
+		{
+			_log.Warning(ex, "SeaShell release check failed; {File} left unchanged", UpdateCheck.PathIn(dataDir));
+		}
+	}
+
+	/// <summary>
+	/// Retry removal of retired version dirs this identity left behind (see
+	/// <see cref="RetiredVersionSweeper"/>). Runs with the hourly cache sweep.
+	/// </summary>
+	private static void SweepRetiredVersions()
+	{
+		var dataDir = SeaShellPaths.DataDir;
+		var own = System.Version.TryParse(Version, out var v) ? v : null;
+		foreach (var e in RetiredVersionSweeper.Sweep(dataDir, own))
+		{
+			if (e.Outcome == RetiredVersionSweeper.Outcome.Removed)
+				_log.Information("Retired version v{RetiredVersion} removed: {Directory} ({Detail})", e.Version, e.Directory, e.Detail);
+			else
+				_log.Information("Retired version v{RetiredVersion} {Outcome}: {Directory} ({Detail})", e.Version, e.Outcome, e.Directory, e.Detail);
+		}
+	}
+
+	/// <summary>
 	/// Persist the cache tracker when it changed (write-behind; the in-memory copy is
-	/// authoritative) and sweep expired cache entries hourly. The first sweep waits
-	/// until every running script has had a chance to send a keep-alive
+	/// authoritative) and sweep expired cache entries and retired version dirs hourly.
+	/// The first sweep waits until every running script has had a chance to send a keep-alive
 	/// (<see cref="CacheKeepAliveInterval"/>): after a daemon restart the tracker only
 	/// knows the hit times it last saved.
 	/// </summary>
@@ -332,6 +379,11 @@ public sealed class DaemonServer : IAsyncDisposable
 					var removed = await Task.Run(_compiler.SweepCache, ct);
 					if (removed > 0)
 						_log.Information("Cache sweep removed {Count} expired entries", removed);
+					try { await Task.Run(SweepRetiredVersions, ct); }
+					catch (Exception ex) when (ex is not OperationCanceledException)
+					{
+						_log.Warning(ex, "Retired version sweep failed");
+					}
 				}
 				await _compiler.Tracker.SaveAsync();
 			}

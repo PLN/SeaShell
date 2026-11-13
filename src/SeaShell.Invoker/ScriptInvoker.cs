@@ -145,7 +145,7 @@ public sealed class ScriptInvoker
 			await conn.DisposeAsync();
 
 			if (IsCurrentProcessElevated())
-				return await ExecuteDirectAsync(compiled, args, resolvedAddress, scriptPath, output, connection, workingDirectory, environmentVars, windowMode, ct);
+				return await ExecuteDirectAsync(compiled, args, resolvedAddress, scriptPath, output, connection, workingDirectory, environmentVars, windowMode, ct, lookupAddress: daemonAddress);
 
 			return await ExecuteElevatedAsync(compiled, args, resolvedAddress, output, ct);
 		}
@@ -157,7 +157,7 @@ public sealed class ScriptInvoker
 		}
 
 		await conn.DisposeAsync();
-		return await ExecuteDirectAsync(compiled, args, resolvedAddress, scriptPath, output, connection, workingDirectory, environmentVars, windowMode, ct);
+		return await ExecuteDirectAsync(compiled, args, resolvedAddress, scriptPath, output, connection, workingDirectory, environmentVars, windowMode, ct, lookupAddress: daemonAddress);
 	}
 
 	/// <summary>Execute an already-compiled script.</summary>
@@ -175,12 +175,16 @@ public sealed class ScriptInvoker
 
 	// ── Direct execution ────────────────────────────────────────────────
 
+	// daemonAddress: the daemon that compiled `compiled`. lookupAddress: the address that
+	// daemon was looked up from (default: daemonAddress). A reload looks the daemon up again
+	// from there, as the run did at its start: the daemon that compiled the first build may
+	// have been replaced by a newer version since.
 	private async Task<ScriptResult> ExecuteDirectAsync(
 		CompiledScript compiled, string[] args,
 		string? daemonAddress, string? scriptPath,
 		OutputMode output, ScriptConnection? connection,
 		string? workingDirectory, Dictionary<string, string>? environmentVars,
-		bool windowMode, CancellationToken ct, bool precompiled = false)
+		bool windowMode, CancellationToken ct, bool precompiled = false, string? lookupAddress = null)
 	{
 		var reloadCount = 0;
 		var restartCount = 0;
@@ -246,6 +250,17 @@ public sealed class ScriptInvoker
 			CompiledScript? recompiled = null;
 			try
 			{
+				// Not the saved address: that daemon may have been replaced by a newer version
+				var address = await DaemonLauncher.EnsureRunningAsync(lookupAddress ?? daemonAddress, _log, _verboseLog, ct);
+				if (address == null)
+				{
+					_log?.Invoke("recompile failed: daemon failed to start");
+					return new ScriptResult(result.ExitCode, result.Stdout, result.Stderr, result.ExitDelay) { Cancelled = ct.IsCancellationRequested };
+				}
+				if (address != daemonAddress)
+					_verboseLog?.Invoke($"reload: daemon now at {address}");
+				daemonAddress = address;
+
 				await using var conn = await TransportClient.ConnectAsync(daemonAddress, ct: ct);
 				var runReq = new RunRequest(scriptPath, args, Environment.CurrentDirectory,
 					Array.Empty<string>(), Environment.ProcessId, result.ClearCache);
@@ -267,7 +282,7 @@ public sealed class ScriptInvoker
 
 			stateBase64 = result.State;
 			currentCompiled = recompiled;
-			keepAlive.Update(currentCompiled);
+			keepAlive.Update(currentCompiled, daemonAddress);
 			reloadCount++;
 		}
 	}
@@ -443,6 +458,7 @@ public sealed class ScriptInvoker
 
 				// Channel reader with reload request signaling
 				var reloadRequests = Channel.CreateUnbounded<(string? reason, bool clearCache)>();
+				connection?.SetRunning(currentCompiled, reloadRequests.Writer);
 				var channelTask = ReceiveUntilExitOrStateAsync(scriptChannel, connection, reloadRequests.Writer, ct);
 				HotSwapNotify? swapNotify = null;
 				var restarting = false;
@@ -655,6 +671,7 @@ public sealed class ScriptInvoker
 
 		// Drain channel with reload awareness
 		var reloadRequests = Channel.CreateUnbounded<(string?, bool)>();
+		connection?.SetRunning(compiled, reloadRequests.Writer);
 		var channelTask = ReceiveUntilExitOrStateAsync(channel, connection, reloadRequests.Writer, CancellationToken.None);
 
 		var reloadTask = reloadRequests.Reader.ReadAsync(CancellationToken.None).AsTask();

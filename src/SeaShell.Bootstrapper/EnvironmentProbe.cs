@@ -39,6 +39,33 @@ internal static class EnvironmentProbe
 		return "linux-x64";
 	}
 
+	/// <summary>
+	/// Linux: owner and permission bits of <paramref name="path"/> itself (not a
+	/// symlink's target), from <c>stat(1)</c> (coreutils and BusyBox alike); null
+	/// when it does not exist or cannot be examined.
+	/// </summary>
+	public static SeaShell.Installer.PosixStat? Stat(string path)
+	{
+		try
+		{
+			var psi = new ProcessStartInfo("stat")
+			{
+				UseShellExecute = false,
+				RedirectStandardOutput = true,
+				RedirectStandardError = true,
+			};
+			foreach (var a in new[] { "-c", "%u %a", "--", path }) psi.ArgumentList.Add(a);
+			using var proc = Process.Start(psi)!;
+			var output = proc.StandardOutput.ReadToEnd().Trim();
+			proc.StandardError.ReadToEnd();
+			proc.WaitForExit(10_000);
+			var fields = output.Split(' ');
+			if (proc.ExitCode != 0 || fields.Length != 2 || !int.TryParse(fields[0], out var uid)) return null;
+			return new SeaShell.Installer.PosixStat(uid, Convert.ToInt32(fields[1], 8));
+		}
+		catch { return null; }
+	}
+
 	/// <summary>Run a process and return stdout+stderr. Empty string on any failure.</summary>
 	public static string RunProcess(string exe, string args)
 	{

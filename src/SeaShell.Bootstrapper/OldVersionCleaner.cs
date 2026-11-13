@@ -23,6 +23,7 @@ internal sealed class OldVersionCleaner
 
 	public async Task CleanAsync()
 	{
+		RetryLeftovers();
 		var mine = System.Version.TryParse(_target.Version, out var mv) ? mv : null;
 		var uninstallable = VersionCleanupPlan.SelectOldestFirst(
 			VersionDiscovery.EnumerateVersions(_target.DataDir), mine);
@@ -71,16 +72,32 @@ internal sealed class OldVersionCleaner
 				}
 			}
 
-			// Step d: remove version directory.
-			try
+			// Step d: remove the version directory as a whole, or not at all: a
+			// running script or seaw window that still executes from it keeps
+			// every file it may still load. The daemon's hourly sweep retries.
+			var (result, detail) = VersionDirRemoval.Remove(dir);
+			Console.WriteLine(result switch
 			{
-				Directory.Delete(dir, true);
-				Console.WriteLine("removed");
-			}
-			catch (Exception ex)
-			{
-				Console.WriteLine($"failed ({ex.Message})");
-			}
+				VersionDirRemovalResult.Removed => "removed",
+				VersionDirRemovalResult.PartlyRemoved => $"partly removed ({detail})",
+				_ => $"{detail}; kept for now (removed by a later install or the daemon's sweep)",
+			});
+		}
+	}
+
+	// `.removing-` directories an earlier cleanup moved aside but could not
+	// delete: probed again, removed only once nothing uses them.
+	private void RetryLeftovers()
+	{
+		string[] leftovers;
+		try { leftovers = Directory.GetDirectories(_target.DataDir, "*" + VersionDirRemoval.RemovingMarker + "*"); }
+		catch { return; }
+		foreach (var dir in leftovers)
+		{
+			var (result, detail) = VersionDirRemoval.RemoveLeftover(dir);
+			Console.WriteLine(result == VersionDirRemovalResult.Removed
+				? $"  Removed {Path.GetFileName(dir)} (left by an earlier cleanup)"
+				: $"  {Path.GetFileName(dir)} (left by an earlier cleanup): {detail}; kept for now");
 		}
 	}
 

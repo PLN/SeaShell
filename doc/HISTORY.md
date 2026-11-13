@@ -1,5 +1,56 @@
 # History
 
+## v0.6.3 (2026-11-13)
+
+**Simpler install, update and uninstall.**
+
+- **One command to install, one to update.** `dnx SeaShell install --all` installs
+  the latest version without a global tool; `seashell` now ships inside the install
+  (`current/bin`), and `seashell update` really updates: it fetches the latest
+  package and runs that version's installer. It reports "Up to date" — without a
+  UAC or sudo prompt — only when every installed part is current. The classic
+  `dotnet tool install -g SeaShell` + `seashell install` route still works.
+- **The install scope is remembered.** `install`, `update` and `uninstall` without
+  flags act on what is installed (user, elevator, SYSTEM/root) instead of the user
+  part only. Previously a plain `seashell install` after `install --all` left the
+  elevator unregistered for the new version and SYSTEM on the old one. `--user`,
+  `--system` and `--all` override. Installs made by 0.6.2 and older are detected.
+- **Linux `--all`** installs for the user and, through `sudo`, for root from the
+  same bootstrapper — no second tool install as root. `sea --start` works on Linux.
+- **Opt-in automatic updates.** `seashell update --auto on` registers one scheduled
+  entry per installed part (Task Scheduler / crontab); each runs
+  `update --if-idle --quiet` daily and logs to the Event Log / syslog and
+  `update.log`. Off by default; SYSTEM/root entries require a machine-wide .NET SDK.
+  See `doc/SECURITY.md`.
+- **Update notice.** The daemon checks for a newer SeaShell release every 8 hours;
+  `sea --status` and the `seashell` dashboard show it. (It does not see
+  authenticated private feeds.)
+- **Uninstall removes what was installed**, including the SYSTEM/root part, the
+  scheduled update entries and — on Windows — the `seashell` it is running from.
+  It reports "incomplete" with a non-zero exit when something is still in use.
+  Scheduled scripts are kept unless `--purge` is given.
+- **Installing over files in use no longer crashes.** Extraction died with an
+  unhandled exception when a running script held a file (also in 0.6.2); identical
+  files are now skipped and held ones moved aside.
+- **Old version directories are only removed when nothing runs from them.** The
+  installer used to delete them file by file under running scripts; installer,
+  uninstaller and the daemon's hourly sweep now prove a directory unused first, and
+  the sweep retries retired directories later.
+- **The user PATH keeps its registry type and `%VAR%` entries** when SeaShell adds,
+  moves or removes its entry.
+- **Service hosting.** `myservice install` also starts the service, and `start` on a
+  running service succeeds. New `.ReloadOnPackageUpdate()` on `ServiceHostBuilder`
+  (opt-in) reloads a running workload when its build changes, e.g. after the daemon
+  downloaded a newer package. The README Host examples match the API again.
+- **Release tooling.** CI runs on branch pushes only, so a tag no longer consumes a
+  build number; the release sequence is scripted (workspace `tool/release.cs`). CI
+  now tests migration from the previous release, update, automatic updates and a
+  full uninstall on all three platforms.
+- **CI test job scoped to its own install.** It runs on dedicated test runners only,
+  and its cleanup ends and unregisters only the runner account's and the SYSTEM /
+  root install's SeaShell processes and tasks, listing each, instead of every
+  SeaShell process and task on the machine.
+
 ## v0.6.2 (2026-10-07)
 
 **Self-cleaning compile cache, concurrency and IPC hardening.**

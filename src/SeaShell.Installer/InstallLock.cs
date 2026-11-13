@@ -20,6 +20,27 @@ public sealed class InstallLock : IDisposable
 
 	private InstallLock() { }
 
+	/// <summary>Linux: the lock file in the target's data directory.</summary>
+	public const string FileName = "install.lock";
+
+	/// <summary>
+	/// <see cref="TryAcquire(SeaShellIdentity)"/>, retried for up to
+	/// <paramref name="wait"/>; <paramref name="waiting"/> runs once when the
+	/// first attempt finds the lock held (the deferred removal after an
+	/// uninstall holds it for a moment).
+	/// </summary>
+	public static InstallLock? TryAcquire(SeaShellIdentity target, TimeSpan wait, Action? waiting = null)
+	{
+		var deadline = DateTime.UtcNow + wait;
+		for (var attempt = 0; ; attempt++)
+		{
+			if (TryAcquire(target) is { } acquired) return acquired;
+			if (DateTime.UtcNow >= deadline) return null;
+			if (attempt == 0) waiting?.Invoke();
+			Thread.Sleep(500);
+		}
+	}
+
 	public static InstallLock? TryAcquire(SeaShellIdentity target)
 	{
 		if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
@@ -46,7 +67,7 @@ public sealed class InstallLock : IDisposable
 
 	private static InstallLock? TryAcquireUnix(SeaShellIdentity target)
 	{
-		var path = Path.Combine(target.DataDir, "install.lock");
+		var path = Path.Combine(target.DataDir, FileName);
 		try
 		{
 			Directory.CreateDirectory(target.DataDir);

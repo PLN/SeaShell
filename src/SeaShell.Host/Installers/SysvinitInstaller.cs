@@ -25,8 +25,7 @@ public sealed class SysvinitInstaller : IServiceInstaller
 		RunCommand("update-rc.d", config.Name, "defaults");
 
 		Console.WriteLine($"sysvinit service installed: {initPath}");
-		Console.WriteLine($"Run: service {config.Name} start");
-		return 0;
+		return ServiceStart.AfterInstall(this, config);
 	}
 
 	public int Uninstall(ServiceConfig config)
@@ -42,7 +41,11 @@ public sealed class SysvinitInstaller : IServiceInstaller
 		return 0;
 	}
 
+	// The init script's start is start-stop-daemon --start --oknodo: success when a process
+	// of this executable already runs under the pidfile's PID. A stale pidfile whose PID was
+	// reused by another program does not match --exec, so the service is started.
 	public int Start(ServiceConfig config) => RunCommand("service", config.Name, "start");
+
 	public int Stop(ServiceConfig config) => RunCommand("service", config.Name, "stop");
 	public int Status(ServiceConfig config) => RunCommand("service", config.Name, "status");
 

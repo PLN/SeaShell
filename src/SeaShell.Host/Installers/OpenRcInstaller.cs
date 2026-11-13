@@ -25,8 +25,7 @@ public sealed class OpenRcInstaller : IServiceInstaller
 		RunCommand("rc-update", "add", config.Name, "default");
 
 		Console.WriteLine($"OpenRC service installed: {initPath}");
-		Console.WriteLine($"Run: rc-service {config.Name} start");
-		return 0;
+		return ServiceStart.AfterInstall(this, config);
 	}
 
 	public int Uninstall(ServiceConfig config)
@@ -42,7 +41,10 @@ public sealed class OpenRcInstaller : IServiceInstaller
 		return 0;
 	}
 
+	// rc-service start on a service OpenRC has marked started warns "has already been
+	// started" and exits 0, so it needs no status check first
 	public int Start(ServiceConfig config) => RunCommand("rc-service", config.Name, "start");
+
 	public int Stop(ServiceConfig config) => RunCommand("rc-service", config.Name, "stop");
 	public int Status(ServiceConfig config) => RunCommand("rc-service", config.Name, "status");
 

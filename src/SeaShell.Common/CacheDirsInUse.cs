@@ -4,26 +4,33 @@ using System.IO;
 using System.Linq;
 using System.Runtime.InteropServices;
 
-namespace SeaShell.Engine;
+namespace SeaShell;
 
 /// <summary>
-/// Which cache entry dirs a running process uses. Linux only (on Windows the sweep
-/// detects use by the rename failing). Two sources per process:
+/// Which cache entry dirs a running process uses. Linux only (on Windows the sweeps
+/// detect use by failing file opens and renames). Sources per process:
 /// <list type="bullet">
 /// <item><c>/proc/PID/cmdline</c> — readable even for processes that made themselves
 ///   non-dumpable; a script's apphost path or <c>dotnet exec &lt;dll&gt;</c> names its entry.</item>
 /// <item><c>/proc/PID/maps</c> — every mapped assembly, native library and apphost, as the
 ///   kernel's resolved path.</item>
+/// <item><c>/proc/PID/cwd</c> — only with <c>includeCwd</c> (the version sweep): a process whose
+///   working directory is inside an entry. Linux lets that dir be removed under it.</item>
 /// </list>
 /// Paths are matched against the cache dir as configured and as resolved by
 /// <c>realpath</c>, since maps report symlink-free paths. Processes in another mount
 /// namespace (containers) may see the cache under a different path and are not
 /// detected; their invoker's keep-alives still protect them. Other users' processes
 /// are unreadable and skipped — their scripts don't run from this user's cache.
+/// Shared by the daemon's sweeps and the installer's version-directory removal
+/// (see <see cref="DirectoryInUse"/>).
 /// </summary>
-internal static class CacheDirsInUse
+public static class CacheDirsInUse
 {
-	public static HashSet<string> Find(string cacheDir)
+	/// <param name="cacheDir">The directory whose direct children are reported by name.</param>
+	/// <param name="includeCwd">Also count a process whose working directory is inside a child.</param>
+	/// <param name="ignorePid">A process not to count (the installer itself, which may run from the dir it removes).</param>
+	public static HashSet<string> Find(string cacheDir, bool includeCwd = false, int? ignorePid = null)
 	{
 		var result = new HashSet<string>(StringComparer.Ordinal);
 		if (!OperatingSystem.IsLinux()) return result;
@@ -40,7 +47,7 @@ internal static class CacheDirsInUse
 
 		foreach (var pidDir in pids)
 		{
-			if (!int.TryParse(Path.GetFileName(pidDir), out _)) continue;
+			if (!int.TryParse(Path.GetFileName(pidDir), out var pid) || pid == ignorePid) continue;
 			try
 			{
 				foreach (var arg in File.ReadAllText(Path.Combine(pidDir, "cmdline")).Split('\0'))
@@ -53,6 +60,13 @@ internal static class CacheDirsInUse
 					AddIfUnder(MapsPath(line), prefixes, result);
 			}
 			catch { } // exited, or not ours to read (cmdline above still covered it)
+			if (includeCwd)
+			{
+				// The link target is the kernel's resolved path; the trailing slash makes a cwd
+				// that is the entry dir itself count, not only one below it.
+				try { AddIfUnder(new FileInfo(Path.Combine(pidDir, "cwd")).LinkTarget + "/", prefixes, result); }
+				catch { } // exited, or another user's process
+			}
 		}
 		return result;
 	}
@@ -79,7 +93,8 @@ internal static class CacheDirsInUse
 		}
 	}
 
-	private static string? RealPath(string path)
+	/// <summary>realpath(3): the symlink-free absolute path; null when it does not resolve (or off Linux libc).</summary>
+	public static string? RealPath(string path)
 	{
 		try
 		{

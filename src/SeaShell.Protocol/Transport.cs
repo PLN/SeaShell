@@ -557,7 +557,10 @@ public static class TransportClient
 		return new TransportStream(stream, socket);
 	}
 
-	/// <summary>Check if the daemon is reachable.</summary>
+	/// <summary>
+	/// Check if the daemon is reachable. Cancellation of <paramref name="ct"/> is thrown, not
+	/// reported as unreachable: a caller must not take a cancelled probe for a missing daemon.
+	/// </summary>
 	public static async Task<bool> ProbeAsync(string address, CancellationToken ct = default)
 	{
 		try
@@ -565,6 +568,10 @@ public static class TransportClient
 			await using var conn = await ConnectAsync(address, timeoutMs: 1000, ct);
 			var reply = await conn.RequestAsync(new PingRequest(), TimeSpan.FromSeconds(5), ct);
 			return reply != null;
+		}
+		catch (OperationCanceledException) when (ct.IsCancellationRequested)
+		{
+			throw;
 		}
 		catch
 		{

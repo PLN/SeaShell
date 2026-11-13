@@ -383,6 +383,7 @@ public static class ScriptScheduler
 				// Skip daemon/elevator infrastructure tasks
 				if (taskName.StartsWith("SeaShell Daemon", StringComparison.OrdinalIgnoreCase)) continue;
 				if (taskName.StartsWith("SeaShell Elevator", StringComparison.OrdinalIgnoreCase)) continue;
+				if (taskName.StartsWith("SeaShell Update", StringComparison.OrdinalIgnoreCase)) continue;
 
 				// Only show current user's tasks
 				if (!taskName.StartsWith($"{user} - ", StringComparison.OrdinalIgnoreCase)) continue;
@@ -552,6 +553,10 @@ public static class ScriptScheduler
 
 	// ── Linux: crontab ─────────────────────────────────────────────────
 
+	// Scheduled scripts are tagged "# seashell:{stem}". The automatic-update
+	// line ("# seashell-auto-update", SeaShell.Installer.AutoUpdatePlan) is
+	// deliberately outside this namespace: listing, replacing and removing
+	// scripts here never match it.
 	private const string CronTag = "# seashell:";
 
 	private static int ScheduleLinux(string scriptPath, ScheduleSpec spec, Action<string>? log)

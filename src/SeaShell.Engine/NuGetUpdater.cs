@@ -28,15 +28,27 @@ public sealed class NuGetUpdater
 	public event Action<string>? Log;
 
 	public NuGetUpdater(NuGetResolver resolver)
+		: this(resolver, new HttpClient(), sources: null)
+	{
+	}
+
+	/// <summary>Test seam: a fixed source list and a fake HTTP handler.</summary>
+	internal NuGetUpdater(NuGetResolver resolver, HttpClient http, List<NuGetSources.PackageSource>? sources)
 	{
 		_cacheRoot = Path.Combine(
 			Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
 			".nuget", "packages");
-		_http = new HttpClient();
+		_http = http;
 		_http.DefaultRequestHeaders.Add("User-Agent", "SeaShell/1.0");
 		_resolver = resolver;
-		_sources = new NuGetSources(_http);
+		_sources = new NuGetSources(_http, sources);
 	}
+
+	/// <summary>Names of the sources a lookup queries, for diagnostics.</summary>
+	public string SourceNames => string.Join(", ", _sources.GetSources().Select(s => $"{s.Name} ({s.ServiceIndexUrl})"));
+
+	/// <summary>NuGet package id of the SeaShell release (the <c>seashell</c> tool).</summary>
+	public const string SeaShellPackageId = "SeaShell";
 
 	public sealed record UpdateResult
 	{
@@ -144,6 +156,19 @@ public sealed class NuGetUpdater
 		};
 	}
 
+	/// <summary>
+	/// Look up the latest stable SeaShell release and, when found, record it in
+	/// <c>{dataDir}/update.check</c> (see <see cref="UpdateCheck"/>). Not found or a
+	/// failed lookup leaves the file as it is.
+	/// </summary>
+	public async Task<VersionLookup> CheckSeaShellReleaseAsync(string dataDir, CancellationToken ct = default)
+	{
+		var lookup = await GetLatestVersionAsync(SeaShellPackageId, ct);
+		if (lookup.Status == LookupStatus.Found)
+			UpdateCheck.Write(dataDir, lookup.Version!, DateTimeOffset.Now);
+		return lookup;
+	}
+
 	/// <summary>Get the latest version directory in the local cache for a package.</summary>
 	private static string? GetLatestCachedVersion(string packageDir)
 	{
@@ -155,11 +180,26 @@ public sealed class NuGetUpdater
 		return versions;
 	}
 
-	private enum LookupStatus { Found, NotFound, ServiceError }
-	private sealed record VersionLookup(LookupStatus Status, string? Version);
+	/// <summary>Outcome of a latest-version lookup.</summary>
+	public enum LookupStatus
+	{
+		/// <summary>A stable version was found on at least one source.</summary>
+		Found,
+		/// <summary>No source has a stable version (sources answered, or only some failed).</summary>
+		NotFound,
+		/// <summary>Every source failed (network, HTTP error, bad service index).</summary>
+		ServiceError,
+	}
 
-	/// <summary>Query all configured NuGet sources for the latest stable version.</summary>
-	private async Task<VersionLookup> GetLatestVersionAsync(string packageName, CancellationToken ct)
+	/// <summary>Result of <see cref="GetLatestVersionAsync"/>; <see cref="Version"/> is set only when <see cref="Status"/> is Found.</summary>
+	public sealed record VersionLookup(LookupStatus Status, string? Version);
+
+	/// <summary>
+	/// Query all configured NuGet sources (HTTP V3 sources from the user's nuget.config,
+	/// plus nuget.org) for the latest stable version of a package. Metadata only —
+	/// downloads nothing, and works for packages not in the global packages folder.
+	/// </summary>
+	public async Task<VersionLookup> GetLatestVersionAsync(string packageName, CancellationToken ct = default)
 	{
 		string? bestVersion = null;
 		bool anyServiceError = false;

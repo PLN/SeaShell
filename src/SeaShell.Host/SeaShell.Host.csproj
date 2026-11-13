@@ -11,6 +11,9 @@
 		<None Include="..\..\README.md" Pack="true" PackagePath="/" />
 	</ItemGroup>
 	<ItemGroup>
+		<InternalsVisibleTo Include="EngineTest" />
+	</ItemGroup>
+	<ItemGroup>
 		<ProjectReference Include="..\SeaShell.Invoker\SeaShell.Invoker.csproj">
 			<PrivateAssets>all</PrivateAssets>
 		</ProjectReference>

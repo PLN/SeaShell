@@ -1,9 +1,6 @@
 using System;
 using System.Diagnostics;
 using System.IO;
-using System.IO.Compression;
-using System.Linq;
-using System.Reflection;
 using System.Threading.Tasks;
 using SeaShell;
 using SeaShell.Installer;
@@ -11,13 +8,24 @@ using SeaShell.Installer;
 namespace SeaShell.Bootstrapper;
 
 /// <summary>
-/// One install pass's outcome: the exit code it contributes, and whether it
-/// installed nothing because a newer version is already active on the target.
-/// The second half is what <c>install --all</c> needs to know before starting
-/// the daemon/elevator chain — passed back explicitly instead of living in a
-/// captured flag the caller has to remember to reset.
+/// One install pass's outcome: the exit code it contributes, how the pass
+/// ended (installed, already satisfied, skipped because a newer version is
+/// active, failed), and whether it registered the elevator. The caller needs
+/// these before starting the daemon/elevator chain and when recording the
+/// scope — passed back explicitly instead of living in captured flags.
 /// </summary>
-internal readonly record struct InstallOutcome(int ExitCode, bool SkippedNewerVersion);
+internal readonly record struct InstallOutcome(int ExitCode, PassResult Result, bool ElevatorRegistered = false)
+{
+	public bool SkippedNewerVersion => Result == PassResult.SkippedNewer;
+
+	public static InstallOutcome Failed => new(1, PassResult.Failed);
+}
+
+/// <summary>What one pass is asked to do beyond the target's own step matrix.</summary>
+/// <param name="RegisterElevator">User pass: register the elevator task (the process is elevated).</param>
+/// <param name="IfNeeded">Skip the target when it already has this version and every requested part.</param>
+/// <param name="KeepGlobalTool">The run that started this one executes from the global tool.</param>
+internal sealed record InstallPassOptions(bool RegisterElevator, bool IfNeeded, bool KeepGlobalTool);
 
 /// <summary>
 /// The install flow for a single target: gate on version, stop what is
@@ -28,11 +36,13 @@ internal sealed class InstallRunner
 {
 	private readonly InstallTarget _target;
 	private readonly BootstrapperOptions _options;
+	private readonly InstallPassOptions _pass;
 
-	public InstallRunner(InstallTarget target, BootstrapperOptions options)
+	public InstallRunner(InstallTarget target, BootstrapperOptions options, InstallPassOptions pass)
 	{
 		_target = target;
 		_options = options;
+		_pass = pass;
 	}
 
 	public async Task<InstallOutcome> RunAsync()
@@ -40,16 +50,17 @@ internal sealed class InstallRunner
 		if (!ElevationPolicy.IsSatisfied(_options.SystemMode, Elevation.IsElevatedOrRoot(_target.IsWindows)))
 		{
 			Console.Error.WriteLine("  ERROR: --system requires elevation (gsudo on Windows, sudo on Linux).");
-			return new InstallOutcome(1, false);
+			return InstallOutcome.Failed;
 		}
 
 		// Lock is scoped to the TARGET identity — two elevated admins racing a
 		// --system install contend on the same lock.
-		using var installLock = InstallLock.TryAcquire(_target.Identity);
+		using var installLock = InstallLock.TryAcquire(_target.Identity, TimeSpan.FromSeconds(30),
+			() => Console.WriteLine("  Waiting for another install, uninstall or removal to finish..."));
 		if (installLock == null)
 		{
 			Console.Error.WriteLine("seashell: another install or uninstall is in progress");
-			return new InstallOutcome(1, false);
+			return InstallOutcome.Failed;
 		}
 
 		Console.WriteLine($"{{~}} SeaShell Installer v{_target.Version}{(_options.SystemMode ? " (system)" : "")}");
@@ -73,7 +84,23 @@ internal sealed class InstallRunner
 			Console.WriteLine($"  Newer version already active: v{gate.ActiveVersion}");
 			Console.WriteLine($"  Skipping v{_target.Version} for {_target.DisplayName}; no binaries, tasks, or running processes were changed.");
 			Console.WriteLine($"  Use a v{gate.ActiveVersion} or newer bootstrapper to update or repair this target.");
-			return new InstallOutcome(0, true);
+			return new InstallOutcome(0, PassResult.SkippedNewer);
+		}
+
+		// Update mode: decided here, under this target's lock, from what is on
+		// the target now — another install may have finished in the meantime.
+		if (_pass.IfNeeded)
+		{
+			var parts = _pass.RegisterElevator ? ScopeParts.Elevator : ScopeParts.None;
+			var facts = ScopeProbe.ReadFacts(_target.DataDir, _target.IsWindows,
+				EmbeddedArchive.Manifest(EnvironmentProbe.CurrentRid(_target.IsWindows)));
+			var passScope = _target.IsSystemTarget ? InstallPassScope.System : InstallPassScope.User;
+			if (UpdateDecision.Decide(passScope, parts, facts, _target.Version, _target.IsWindows) == UpdateTargetAction.Skip)
+			{
+				Console.WriteLine();
+				Console.WriteLine($"  Already at v{_target.Version} with every requested part; nothing to do for {_target.DisplayName}.");
+				return new InstallOutcome(0, PassResult.Satisfied);
+			}
 		}
 
 		// 2. Stop running daemons/elevators and wipe any pre-0.5.0 flat-layout state.
@@ -99,19 +126,20 @@ internal sealed class InstallRunner
 		Console.WriteLine("  Created version directory");
 
 		// 4. Extract the matching embedded archive into bin/
-		if (!ExtractArchive())
-			return new InstallOutcome(1, false);
+		if (!EmbeddedArchive.ExtractTo(EnvironmentProbe.CurrentRid(_target.IsWindows), _target.BinDir))
+			return InstallOutcome.Failed;
 
-		// 5. Set execute bits on Linux
+		// 5. Set execute bits on Linux (zip extraction does not carry them).
 		if (!OperatingSystem.IsWindows())
 		{
-			foreach (var name in new[] { "sea", "seashell-daemon", "seashell-elevator" })
+			foreach (var name in new[] { "sea", "seashell", "seashell-daemon", "seashell-elevator" })
 			{
 				var path = Path.Combine(_target.BinDir, name);
 				if (File.Exists(path))
 				{
-					// All three exec bits: a --system install lives in /var/lib/seashell
-					// and is executed by every user, not just root.
+					// The root install in /var/lib/seashell is root's own and is not
+					// shared with other users; group/other bits only mirror the usual
+					// 0755 of an installed executable.
 					try
 					{
 						File.SetUnixFileMode(path, File.GetUnixFileMode(path)
@@ -148,7 +176,12 @@ internal sealed class InstallRunner
 		//    SYSTEM target — that would edit the invoking admin's HKCU, not SYSTEM's,
 		//    and SYSTEM consumers find binaries via markers, not PATH.
 		if (_target.Scope.EditUserProfilePath)
+		{
 			PathEnvironment.Add(_target);
+			// The installed seashell supersedes an older global tool, which would
+			// otherwise answer `seashell update` with its old alias.
+			GlobalTool.HandleOlderThan(_target.Version, _pass.KeepGlobalTool);
+		}
 
 		// 8b. Refresh baked-in paths in user-scheduled tasks / crontab entries so
 		//     schedules created under a prior layout keep pointing at the current
@@ -165,10 +198,11 @@ internal sealed class InstallRunner
 		if (!File.Exists(seaPath))
 		{
 			Console.Error.WriteLine("  ERROR: sea not found after extraction.");
-			return new InstallOutcome(1, false);
+			return InstallOutcome.Failed;
 		}
 
 		Action<string> taskLog = msg => Console.WriteLine($"  {msg}");
+		var elevatorRegistered = false;
 
 		// 9. Register scheduled tasks (Windows only)
 		if (_target.Scope.RegisterSystemDaemon)
@@ -189,17 +223,19 @@ internal sealed class InstallRunner
 			Console.WriteLine("  Registering daemon...");
 			DaemonTasks.InstallDaemon(_target.Identity, taskLog);
 
-			if (Elevation.IsElevated(true))
+			if (_pass.RegisterElevator)
 			{
 				Console.WriteLine("  Registering elevator (elevated)...");
-				DaemonTasks.InstallElevator(_target.Identity, taskLog);
+				elevatorRegistered = DaemonTasks.InstallElevator(_target.Identity, taskLog) == 0;
 				RegisterEventLogSource();
 			}
-			else
+			else if (!Elevation.IsElevated(true))
 			{
-				Console.WriteLine("  Elevator skipped (not elevated). Run elevated to register:");
-				Console.WriteLine("    seashell install");
+				Console.WriteLine("  Elevator skipped (not elevated). To register it (one UAC prompt):");
+				Console.WriteLine("    seashell install --all");
 			}
+			else
+				Console.WriteLine("  Elevator skipped (not in the requested scope).");
 		}
 
 		// 10. File associations — user-context only. SYSTEM's HKCU isn't useful.
@@ -217,49 +253,12 @@ internal sealed class InstallRunner
 
 		// 12. End-to-end verification.
 		Console.WriteLine();
-		if (!await new InstallationVerifier(_target).VerifyAsync(seaPath))
-			return new InstallOutcome(1, false);
+		if (!await new InstallationVerifier(_target).VerifyAsync(seaPath, _pass.RegisterElevator))
+			return InstallOutcome.Failed with { ElevatorRegistered = elevatorRegistered };
 
 		Console.WriteLine();
 		Console.WriteLine("  {~} Done! Run 'sea' to start.");
-		return new InstallOutcome(0, false);
-	}
-
-	/// <summary>
-	/// Extract the embedded archive for the current RID into this pass's bin
-	/// directory. False when the package carries no archive for this RID.
-	/// </summary>
-	private bool ExtractArchive()
-	{
-		var rid = EnvironmentProbe.CurrentRid(_target.IsWindows);
-		var assembly = Assembly.GetExecutingAssembly();
-		var resourceName = assembly.GetManifestResourceNames()
-			.FirstOrDefault(n => n.Contains(rid, StringComparison.OrdinalIgnoreCase) && n.EndsWith(".zip"));
-
-		if (resourceName == null)
-		{
-			Console.Error.WriteLine($"  ERROR: No embedded archive for {rid}");
-			Console.Error.WriteLine($"  Available: {string.Join(", ", assembly.GetManifestResourceNames())}");
-			return false;
-		}
-
-		Console.WriteLine($"  Extracting {rid} archive...");
-		using (var stream = assembly.GetManifestResourceStream(resourceName)!)
-		using (var zip = new ZipArchive(stream, ZipArchiveMode.Read))
-		{
-			var count = 0;
-			foreach (var entry in zip.Entries)
-			{
-				if (entry.FullName.EndsWith('/')) continue;
-				var dest = Path.Combine(_target.BinDir, entry.FullName);
-				var destDir = Path.GetDirectoryName(dest);
-				if (destDir != null) Directory.CreateDirectory(destDir);
-				entry.ExtractToFile(dest, overwrite: true);
-				count++;
-			}
-			Console.WriteLine($"  Extracted {count} files.");
-		}
-		return true;
+		return new InstallOutcome(0, PassResult.Installed, elevatorRegistered);
 	}
 
 	/// <summary>Event Log source registration — needs elevation on Windows.</summary>

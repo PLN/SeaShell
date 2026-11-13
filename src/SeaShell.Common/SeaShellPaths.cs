@@ -63,6 +63,23 @@ public static class SeaShellPaths
 	public static string CacheDirIn(string dataDir, string version) => Path.Combine(VersionDirIn(dataDir, version), "cache");
 
 
+	/// <summary>
+	/// Linux: the lock files of user-scope script mutexes (<c>//sea_mutex user</c>),
+	/// <c>$XDG_DATA_HOME/seashell/mutex</c> (or <c>~/.local/share/seashell/mutex</c>)
+	/// of the current account — also for root, whose data dir is elsewhere. Shared
+	/// by every SeaShell version the account runs scripts with (0.4.0 used the same
+	/// path), so a lock file in it may belong to a script of another version.
+	/// Not affected by <c>SEASHELL_DATA</c>.
+	/// </summary>
+	public static string UserMutexDir()
+	{
+		var xdg = Environment.GetEnvironmentVariable("XDG_DATA_HOME");
+		var baseDir = !string.IsNullOrEmpty(xdg)
+			? xdg
+			: Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".local", "share");
+		return Path.Combine(baseDir, "seashell", "mutex");
+	}
+
 	private static string ResolveDataDir()
 	{
 		// Explicit override

@@ -51,6 +51,8 @@ public static class TaskPathRefresher
 
 	/// <summary>
 	/// Rewrite the sea binary path in a crontab line tagged with <c># seashell:...</c>.
+	/// The automatic-update line (<see cref="AutoUpdatePlan.CronTag"/>) is outside
+	/// that tag and never matches.
 	/// Matches the token immediately following <c>&amp;&amp; </c> (produced by
 	/// ScriptScheduler's BuildCronLine). Returns null if the line has no seashell tag,
 	/// no matching <c>&amp;&amp; </c> prefix, or the path already equals
@@ -102,8 +104,9 @@ public static class TaskPathRefresher
 				? taskPath[TaskQuery.Folder.Length..]
 				: Path.GetFileName(taskPath);
 
-			if (name.StartsWith("SeaShell Daemon", StringComparison.OrdinalIgnoreCase)) continue;
-			if (name.StartsWith("SeaShell Elevator", StringComparison.OrdinalIgnoreCase)) continue;
+			// Scheduled scripts only: never the daemon/elevator tasks (re-registered
+			// separately) nor the automatic-update task.
+			if (SeaShellTaskNames.KindOf(taskPath) != SeaShellTaskKind.Script) continue;
 			if (!name.StartsWith(userPrefix, StringComparison.OrdinalIgnoreCase)) continue;
 
 			var xml = QueryTaskXml(taskPath);

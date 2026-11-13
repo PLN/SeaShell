@@ -23,13 +23,16 @@ internal sealed class InstallationVerifier
 
 	public InstallationVerifier(InstallTarget target) => _target = target;
 
-	public async Task<bool> VerifyAsync(string seaPath)
+	/// <param name="seaPath">The extracted <c>sea</c> launcher.</param>
+	/// <param name="expectElevator">This pass registered the elevator task, so it must be there.</param>
+	public async Task<bool> VerifyAsync(string seaPath, bool expectElevator)
 	{
 		Console.WriteLine("  Verifying installation...");
 		var ok = true;
 
 		ok &= VerifyMarkerPointsToExistingFile(MarkerFile.DaemonPath, "daemon.path");
 		ok &= VerifyMarkerPointsToExistingFile(MarkerFile.ElevatorPath, "elevator.path");
+		ok &= VerifySeashell();
 
 		var junctionTarget = JunctionHelper.ReadTarget(_target.CurrentDir);
 		if (VerificationRules.JunctionPointsToVersion(junctionTarget, _target.VersionDir))
@@ -78,7 +81,7 @@ internal sealed class InstallationVerifier
 				Console.Error.WriteLine("    daemon task → FAIL (not registered)");
 			ok &= daemonState != null;
 
-			if (Elevation.IsElevated(true))
+			if (expectElevator)
 			{
 				var elevState = DaemonTasks.QueryElevatorTaskState();
 				if (elevState != null)
@@ -128,6 +131,47 @@ internal sealed class InstallationVerifier
 		}
 		Console.Error.WriteLine($"    {label} → FAIL (daemon did not come up within 15s)");
 		return false;
+	}
+
+	/// <summary>
+	/// The install ships its own <c>seashell</c> (so <c>seashell update</c>
+	/// works without a global tool). On Unix it must be executable, and the
+	/// user-profile pass links it from <c>~/.local/bin</c> next to <c>sea</c>.
+	/// </summary>
+	private bool VerifySeashell()
+	{
+		var path = Path.Combine(_target.BinDir, _target.IsWindows ? "seashell.exe" : "seashell");
+		if (!File.Exists(path))
+		{
+			Console.Error.WriteLine($"    seashell → FAIL (not found: {path})");
+			return false;
+		}
+
+		if (OperatingSystem.IsWindows())
+		{
+			Console.WriteLine("    seashell → OK");
+			return true;
+		}
+
+		var ok = (File.GetUnixFileMode(path) & UnixFileMode.UserExecute) != 0;
+		if (!ok) Console.Error.WriteLine($"    seashell → FAIL (not executable: {path})");
+
+		if (_target.Scope.EditUserProfilePath)
+		{
+			var link = Path.Combine(PathEnvironment.LocalBinDir(), "seashell");
+			var linkTarget = new FileInfo(link).LinkTarget;
+			var expected = Path.Combine(SeaShellPaths.CurrentBinDir, "seashell");
+			if (linkTarget != null && string.Equals(linkTarget, expected, StringComparison.Ordinal))
+				Console.WriteLine($"    seashell → OK ({link} -> {linkTarget})");
+			else
+			{
+				Console.Error.WriteLine($"    seashell → FAIL ({link} -> {linkTarget ?? "<missing>"}, expected {expected})");
+				ok = false;
+			}
+		}
+		else if (ok)
+			Console.WriteLine("    seashell → OK");
+		return ok;
 	}
 
 	private bool VerifyMarkerPointsToExistingFile(string marker, string label)

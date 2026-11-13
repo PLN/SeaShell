@@ -13,5 +13,7 @@
 		<ProjectReference Include="../../src/SeaShell.Invoker/SeaShell.Invoker.csproj" />
 		<ProjectReference Include="../../src/SeaShell.Installer/SeaShell.Installer.csproj" />
 		<ProjectReference Include="../../src/SeaShell.Script/SeaShell.Script.csproj" />
+		<ProjectReference Include="../../src/SeaShell.Host/SeaShell.Host.csproj" />
+		<ProjectReference Include="../../src/SeaShell.Bootstrapper/SeaShell.Bootstrapper.csproj" />
 	</ItemGroup>
 </Project>

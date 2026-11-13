@@ -24,8 +24,7 @@ public sealed class SystemdInstaller : IServiceInstaller
 		RunCommand("systemctl", "enable", config.Name);
 
 		Console.WriteLine($"systemd unit installed: {unitPath}");
-		Console.WriteLine($"Run: systemctl start {config.Name}");
-		return 0;
+		return ServiceStart.AfterInstall(this, config);
 	}
 
 	public int Uninstall(ServiceConfig config)
@@ -42,6 +41,7 @@ public sealed class SystemdInstaller : IServiceInstaller
 		return 0;
 	}
 
+	// systemctl start on an active unit is a no-op with exit code 0
 	public int Start(ServiceConfig config) => RunCommand("systemctl", "start", config.Name);
 	public int Stop(ServiceConfig config) => RunCommand("systemctl", "stop", config.Name);
 	public int Status(ServiceConfig config) => RunCommand("systemctl", "status", config.Name);

@@ -14,17 +14,29 @@
 		<None Include="..\..\README.md" Pack="true" PackagePath="/" />
 	</ItemGroup>
 	<ItemGroup>
+		<InternalsVisibleTo Include="EngineTest" />
+	</ItemGroup>
+	<ItemGroup>
 		<ProjectReference Include="..\SeaShell.Common\SeaShell.Common.csproj" />
 		<ProjectReference Include="..\SeaShell.Protocol\SeaShell.Protocol.csproj" />
 		<ProjectReference Include="..\SeaShell.Installer\SeaShell.Installer.csproj" />
 	</ItemGroup>
 	<!--
-	Archives are embedded at pack time by pipeline-package.cs, which copies
-	the per-RID zips into archives/ before running 'dotnet pack'.
-	At dev time, the directory may not exist — that's fine, the tool just
-	won't have any embedded archives and will print an error.
+	The per-RID archives are embedded only when asked for explicitly:
+	CI's package job stages archives/{rid}.zip and runs
+	'dotnet pack -p:EmbedArchives=true'. Every other build — dev builds, and
+	the per-RID 'dotnet publish' that ships seashell[.exe] inside each archive —
+	carries no archive, whatever happens to be in archives/. A bootstrapper
+	without an archive treats 'install' as 'update' (fetch the latest package).
 	-->
-	<ItemGroup>
-		<EmbeddedResource Include="archives\*.zip" Condition="Exists('archives')" />
+	<PropertyGroup>
+		<EmbedArchives Condition="'$(EmbedArchives)' == ''">false</EmbedArchives>
+	</PropertyGroup>
+	<ItemGroup Condition="'$(EmbedArchives)' == 'true'">
+		<EmbeddedResource Include="archives\*.zip" />
 	</ItemGroup>
+	<Target Name="SeaShellRequireArchives" BeforeTargets="BeforeBuild" Condition="'$(EmbedArchives)' == 'true'">
+		<Error Condition="'@(EmbeddedResource->WithMetadataValue('Extension', '.zip'))' == ''"
+			Text="EmbedArchives=true, but there is no archives\*.zip in $(MSBuildProjectDirectory) to embed." />
+	</Target>
 </Project>

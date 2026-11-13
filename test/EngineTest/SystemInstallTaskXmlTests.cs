@@ -22,7 +22,7 @@ public class SystemInstallTaskXmlTests
 	{
 		var p = Enum.Parse(TaskPrincipal, principal);
 		var t = Enum.Parse(TaskTrigger, trigger);
-		return (string)BuildTaskXml.Invoke(null, new object?[] { "cmd.exe", null, p, t, runLevel, desc, userSid })!;
+		return (string)BuildTaskXml.Invoke(null, new object?[] { "cmd.exe", null, p, t, runLevel, desc, userSid, null, "PT0S" })!;
 	}
 
 	private static XDocument Parse(string xml) => XDocument.Parse(xml);

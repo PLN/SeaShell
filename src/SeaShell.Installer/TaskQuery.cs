@@ -120,6 +120,61 @@ public static class TaskQuery
 		catch { return null; }
 	}
 
+	/// <summary>
+	/// Whether a task is registered, distinguishing "not registered" from "could
+	/// not look": a denied or failed query is <see cref="PartPresence.Unknown"/>.
+	/// Off Windows there are no tasks, so the answer is Absent.
+	/// </summary>
+	public static PartPresence Probe(string taskPath)
+	{
+		if (!RuntimeInformation.IsOSPlatform(OSPlatform.Windows)) return PartPresence.Absent;
+		try
+		{
+			var psi = new ProcessStartInfo
+			{
+				FileName = "schtasks.exe",
+				UseShellExecute = false,
+				RedirectStandardOutput = true,
+				RedirectStandardError = true,
+				CreateNoWindow = true,
+			};
+			psi.ArgumentList.Add("/Query");
+			psi.ArgumentList.Add("/TN");
+			psi.ArgumentList.Add(taskPath);
+
+			using var proc = Process.Start(psi)!;
+			proc.StandardOutput.ReadToEnd();
+			var stderr = proc.StandardError.ReadToEnd();
+			proc.WaitForExit(5_000);
+			return ClassifyQuery(proc.ExitCode, stderr, NotFoundMessages());
+		}
+		catch { return PartPresence.Unknown; }
+	}
+
+	/// <summary>
+	/// Classify a <c>schtasks /Query /TN</c> result. schtasks reports a missing
+	/// task (or a missing <c>\SeaShell\</c> folder) with the system message for
+	/// ERROR_FILE_NOT_FOUND / ERROR_PATH_NOT_FOUND, in the user's UI language —
+	/// the same text <see cref="System.ComponentModel.Win32Exception"/> yields
+	/// for those codes. Anything else (access denied, a crash) is Unknown.
+	/// </summary>
+	public static PartPresence ClassifyQuery(int exitCode, string stderr, IEnumerable<string> notFoundMessages)
+	{
+		if (exitCode == 0) return PartPresence.Present;
+		foreach (var message in notFoundMessages)
+		{
+			if (message.Length > 0 && stderr.Contains(message.TrimEnd('.'), StringComparison.OrdinalIgnoreCase))
+				return PartPresence.Absent;
+		}
+		return PartPresence.Unknown;
+	}
+
+	private static IEnumerable<string> NotFoundMessages()
+	{
+		yield return new System.ComponentModel.Win32Exception(2).Message; // ERROR_FILE_NOT_FOUND
+		yield return new System.ComponentModel.Win32Exception(3).Message; // ERROR_PATH_NOT_FOUND
+	}
+
 	/// <summary>Trigger a task to run. Returns true on schtasks exit 0.</summary>
 	public static bool Run(string taskPath) => Invoke("/Run", taskPath);
 

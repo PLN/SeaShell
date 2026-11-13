@@ -21,4 +21,21 @@ public class TaskQueryTests
 	{
 		Assert.Null(TaskQuery.ParseVersionSuffix(taskPath));
 	}
+
+	private static readonly string[] NotFound =
+	{
+		"The system cannot find the file specified.",
+		"The system cannot find the path specified.",
+	};
+
+	[Fact]
+	public void ClassifyQuery_DistinguishesAbsentFromCouldNotLook()
+	{
+		Assert.Equal(PartPresence.Present, TaskQuery.ClassifyQuery(0, "", NotFound));
+		Assert.Equal(PartPresence.Absent, TaskQuery.ClassifyQuery(1, "ERROR: The system cannot find the file specified.\r\n", NotFound));
+		Assert.Equal(PartPresence.Absent, TaskQuery.ClassifyQuery(1, "ERROR: The system cannot find the path specified.\r\n", NotFound));
+		// A denied query is not "not registered".
+		Assert.Equal(PartPresence.Unknown, TaskQuery.ClassifyQuery(1, "ERROR: Access is denied.\r\n", NotFound));
+		Assert.Equal(PartPresence.Unknown, TaskQuery.ClassifyQuery(-1, "", NotFound));
+	}
 }

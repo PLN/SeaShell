@@ -1,7 +1,13 @@
 name: CI
 
+# Branch pushes only: a tag push starts no run and consumes no VERSION_COUNTER
+# value. tool/release.cs (workspace repo) reads this block to decide that the
+# release tag can be pushed together with master: keep a non-empty `branches`
+# filter and no `tags` / `tags-ignore`.
 on:
   push:
+    branches:
+      - '**'
 
 defaults:
   run:
@@ -94,6 +100,18 @@ jobs:
 
         run: cp -f publish/seaw-tmp/seaw.* publish/win-x64/ && rm -rf publish/seaw-tmp
 
+      # The install ships its own seashell[.exe] ({DataDir}/current/bin), so
+      # `seashell update` works without a global tool. Published per RID with
+      # an apphost and WITHOUT embedded archives (no -p:EmbedArchives): this
+      # copy carries no version of its own, and `install` on it means update.
+      # The archives are only embedded later, by the package job's pack.
+      - name: Publish bootstrapper (seashell)
+        run: |
+          dotnet publish src/SeaShell.Bootstrapper/SeaShell.Bootstrapper.csproj -c Release -r ${{ matrix.rid }} --self-contained false -o ./publish/boot-tmp
+          cp -f publish/boot-tmp/* publish/${{ matrix.rid }}/ && rm -rf publish/boot-tmp
+          if [ "${{ matrix.os }}" = "windows" ]; then BOOT=seashell.exe; else BOOT=seashell; fi
+          test -f "publish/${{ matrix.rid }}/$BOOT" || { echo "MISSING: publish/${{ matrix.rid }}/$BOOT"; exit 1; }
+
       - name: Upload binaries
         uses: http://gitea:3000/actions/upload-artifact@v3
         with:
@@ -157,8 +175,12 @@ jobs:
             Write-Host "Release:  seashell-$version-$rid.zip"
           }
 
+      # Build order: bootstrapper published without archives (build job) ->
+      # archives (above, each containing that seashell[.exe]) -> pack the tool
+      # WITH the archives embedded. Embedding is explicit; it no longer
+      # depends on whether an archives/ directory happens to exist.
       - name: Pack
-        run: dotnet pack -c Release -o ./nupkg
+        run: dotnet pack -c Release -o ./nupkg -p:EmbedArchives=true
 
       - name: Validate packages
         shell: powershell
@@ -189,9 +211,24 @@ jobs:
           $bytes = [System.IO.File]::ReadAllBytes($tmp.FullName)
           Remove-Item $tmp.FullName -Force
           $asm = [System.Reflection.Assembly]::Load($bytes)
-          $archives = ($asm.GetManifestResourceNames() | Where-Object { $_ -like '*.zip' }).Count
-          Write-Host "  Embedded archives: $archives"
-          if ($archives -lt 3) { Write-Host "  Expected 3 archives" -ForegroundColor Red; $failed = $true }
+          $archiveNames = @($asm.GetManifestResourceNames() | Where-Object { $_ -like '*.zip' })
+          Write-Host "  Embedded archives: $($archiveNames.Count)"
+          if ($archiveNames.Count -lt 3) { Write-Host "  Expected 3 archives" -ForegroundColor Red; $failed = $true }
+
+          # Each archive ships the installed copy of the bootstrapper.
+          Add-Type -AssemblyName System.IO.Compression
+          foreach ($rid in @('win-x64', 'linux-x64', 'linux-musl-x64')) {
+            $name = $archiveNames | Where-Object { $_ -like "*.$rid.zip" } | Select-Object -First 1
+            if (-not $name) { Write-Host "  MISSING archive: $rid" -ForegroundColor Red; $failed = $true; continue }
+            $exe = if ($rid -eq 'win-x64') { '.exe' } else { '' }
+            $archive = New-Object System.IO.Compression.ZipArchive($asm.GetManifestResourceStream($name))
+            $entries = $archive.Entries | ForEach-Object { $_.FullName }
+            $archive.Dispose()
+            foreach ($e in @("seashell$exe", 'seashell.dll', "sea$exe")) {
+              if ($entries -contains $e) { Write-Host "  OK: $rid.zip/$e" }
+              else { Write-Host "  MISSING: $rid.zip/$e" -ForegroundColor Red; $failed = $true }
+            }
+          }
 
           Write-Host "`n=== SeaShell.Host ==="
           $pkg = (Get-ChildItem nupkg/SeaShell.Host.*.nupkg).FullName
@@ -249,19 +286,216 @@ jobs:
 
   test:
     needs: [version, package]
+    # Dedicated test VMs only (seashell-test-* labels). This job installs and
+    # uninstalls SeaShell machine-wide (the runner account plus SYSTEM / root)
+    # and on Windows needs an interactive logon of the runner account, so it
+    # must not land on a general runner such as a workstation with its own
+    # SeaShell install. build / package only need the SDK and run anywhere.
+    # Alpine has a single runner, dedicated already.
     strategy:
       matrix:
         include:
-          - runner: win-x64
+          - runner: seashell-test-win-x64
             rid: win-x64
             os: windows
-          - runner: linux-x64
+          - runner: seashell-test-linux-x64
             rid: linux-x64
             os: linux
           - runner: linux-musl-x64
             rid: linux-musl-x64
             os: linux
     runs-on: ${{ matrix.runner }}
+
+    # Cleanup helpers, used by the steps that end SeaShell processes. They
+    # touch only what this job owns — never another user's processes, nor the
+    # runner account's own scripts that have nothing to do with this job
+    # (e.g. an operational script run from the SeaShell cache). Ended are:
+    # - the runner account's daemon and elevator (so the install can be
+    #   replaced),
+    # - the runner account's scripts and launchers (sea, seaw, seashell, a
+    #   script hosted by dotnet or run as an exe from the data dir) whose
+    #   command line or working directory is in this job's checkout
+    #   (GITHUB_WORKSPACE), RUNNER_TEMP or a seashell-* dir under temp (the
+    #   tests', the update / uninstall copies),
+    # - the processes of the SYSTEM / root install the job replaces (owner
+    #   SYSTEM / root and run from that install's data dir).
+    # Each process and task is printed with its owner, ended or left alone.
+    #
+    # Windows: & ([scriptblock]::Create($env:SEASHELL_CI_CLEANUP_PS1)) [-Apply] [-Tasks] [-UserOnly] [-Names a.exe,b.exe]
+    #   Without -Apply it only lists. -Tasks: also the \SeaShell\ tasks of the
+    #   runner account and SYSTEM (daemon, elevator, update) and the test's
+    #   own scheduled script; other tasks in the folder are left alone.
+    #   -Names / -UserOnly: only those executables, only the runner account's.
+    # Linux: printf '%s\n' "$SEASHELL_CI_CLEANUP_SH" | sudo bash -s -- list|apply "$(id -u)" "$(id -un)" "$DATA" "$GITHUB_WORKSPACE" "${TMPDIR:-/tmp}" "${RUNNER_TEMP:-}"
+    #   As root (root's /proc entries); apply also removes the runner
+    #   account's and root's daemon sockets.
+    env:
+      SEASHELL_CI_CLEANUP_PS1: |
+        param([switch]$Apply, [switch]$Tasks, [switch]$UserOnly, [string[]]$Names)
+        $me = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+        $userRoot = Join-Path $env:LOCALAPPDATA 'seashell'
+        $systemRoots = @((Join-Path $env:SystemRoot 'System32\config\systemprofile\AppData\Local\seashell'), (Join-Path $env:ProgramData 'seashell'))
+        $services = @('seashell-daemon.exe', 'seashell-elevator.exe')
+        $launchers = @('sea.exe', 'seaw.exe', 'seashell.exe')
+        $verb = if ($Apply) { 'ended' } else { 'would end' }
+        # This job's places; an unset GITHUB_WORKSPACE / RUNNER_TEMP adds none.
+        $jobRoots = @(@($env:GITHUB_WORKSPACE, $env:RUNNER_TEMP) | Where-Object { $_ } | ForEach-Object { [IO.Path]::GetFullPath($_).TrimEnd('\') + '\' })
+        $jobRoots += Join-Path ([IO.Path]::GetTempPath()) 'seashell-'
+        function Test-Job($s) {
+          if (-not $s) { return $false }
+          $s = $s.Replace('/', '\')
+          foreach ($r in $jobRoots) { if ($s.IndexOf($r, [StringComparison]::OrdinalIgnoreCase) -ge 0) { return $true } }
+          return $false
+        }
+        # The working directory of another process (scripts are mostly started
+        # by a relative path): read from its PEB, x64. Null when not readable.
+        $haveCwd = $true
+        try {
+          if (-not ('SeaShellCi.Cwd' -as [type])) {
+            Add-Type -ErrorAction Stop -TypeDefinition @'
+        using System;
+        using System.Runtime.InteropServices;
+        namespace SeaShellCi {
+          public static class Cwd {
+            [DllImport("kernel32.dll")] static extern IntPtr OpenProcess(int access, bool inherit, int pid);
+            [DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr h);
+            [DllImport("kernel32.dll")] static extern bool ReadProcessMemory(IntPtr h, IntPtr at, byte[] buf, IntPtr size, out IntPtr read);
+            [DllImport("ntdll.dll")] static extern int NtQueryInformationProcess(IntPtr h, int infoClass, IntPtr[] info, int size, out int written);
+            static byte[] Read(IntPtr h, IntPtr at, int size) {
+              var buf = new byte[size]; IntPtr read;
+              return ReadProcessMemory(h, at, buf, (IntPtr)size, out read) && read.ToInt64() == size ? buf : null;
+            }
+            // PEB.ProcessParameters at 0x20, its CurrentDirectory.DosPath at 0x38 (x64).
+            public static string Get(int pid) {
+              if (IntPtr.Size != 8) return null;
+              var h = OpenProcess(0x0410, false, pid); // PROCESS_QUERY_INFORMATION | PROCESS_VM_READ
+              if (h == IntPtr.Zero) return null;
+              try {
+                var pbi = new IntPtr[6]; int written;
+                if (NtQueryInformationProcess(h, 0, pbi, IntPtr.Size * 6, out written) != 0) return null;
+                var p = Read(h, IntPtr.Add(pbi[1], 0x20), 8); if (p == null) return null;
+                var u = Read(h, IntPtr.Add(new IntPtr(BitConverter.ToInt64(p, 0)), 0x38), 16); if (u == null) return null;
+                int len = BitConverter.ToUInt16(u, 0);
+                if (len == 0) return null;
+                var s = Read(h, new IntPtr(BitConverter.ToInt64(u, 8)), len);
+                return s == null ? null : System.Text.Encoding.Unicode.GetString(s);
+              } finally { CloseHandle(h); }
+            }
+          }
+        }
+        '@
+          }
+        } catch { $haveCwd = $false; Write-Host "  (working directories not readable: $($_.Exception.Message))" }
+        # Run from under a data dir: the executable, or dotnet with a dll there.
+        function Test-Under($p, $roots) {
+          foreach ($r in $roots) {
+            $r = $r.TrimEnd('\') + '\'
+            if ($p.ExecutablePath -and $p.ExecutablePath.StartsWith($r, [StringComparison]::OrdinalIgnoreCase)) { return $true }
+            if ($p.Name -eq 'dotnet.exe' -and $p.CommandLine -and $p.CommandLine.IndexOf($r, [StringComparison]::OrdinalIgnoreCase) -ge 0) { return $true }
+          }
+          return $false
+        }
+        foreach ($p in @(Get-CimInstance Win32_Process)) {
+          if ($p.ProcessId -eq $PID) { continue }
+          if ($Names -and $Names -notcontains $p.Name) { continue }
+          # Daemon / elevator: by name, or dotnet hosting their dll.
+          $service = ($services -contains $p.Name) -or ($p.Name -eq 'dotnet.exe' -and $p.CommandLine -match 'seashell-(daemon|elevator)\.dll')
+          # A script: a launcher, or hosted / run as an exe from the data dir.
+          $script = -not $service -and (($launchers -contains $p.Name) -or (-not $Names -and (Test-Under $p @($userRoot))))
+          $system = -not $Names -and -not $UserOnly -and (Test-Under $p $systemRoots)
+          if (-not ($service -or $script -or $system)) { continue }
+          $sid = (Invoke-CimMethod -InputObject $p -MethodName GetOwnerSid -ErrorAction SilentlyContinue).Sid
+          $o = Invoke-CimMethod -InputObject $p -MethodName GetOwner -ErrorAction SilentlyContinue
+          $owner = if ($o -and $o.User) { "$($o.Domain)\$($o.User)" } elseif ($sid) { $sid } else { '?' }
+          $cwd = $null; $job = $false
+          if ($script -and $sid -eq $me) {
+            if ($haveCwd) { try { $cwd = [SeaShellCi.Cwd]::Get([int]$p.ProcessId) } catch { } }
+            $job = (Test-Job $p.CommandLine) -or (Test-Job $cwd)
+          }
+          $scope = $null
+          if ($sid -eq $me -and $service) { $scope = 'runner account' }
+          elseif ($sid -eq $me -and $job) { $scope = "runner account, this job's" }
+          elseif ($sid -eq 'S-1-5-18' -and $system) { $scope = 'SYSTEM install' }
+          $what = "$($p.Name) pid $($p.ProcessId) owner $owner, $(if ($p.ExecutablePath) { $p.ExecutablePath } else { '(path not visible)' })"
+          if ($script) { $what += "; command line: $($p.CommandLine)$(if ($cwd) { "; cwd: $cwd" })" }
+          if (-not $scope) { Write-Host "  left alone: $what"; continue }
+          if ($Apply) {
+            Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue
+            if (-not $?) { Write-Host "  could not end ($scope): $what"; continue }
+          }
+          Write-Host "  $verb ($scope): $what"
+        }
+        if ($Tasks) {
+          $u = [regex]::Escape($env:USERNAME)
+          $pattern = "^(SeaShell (Daemon|Elevator|Update) \(($u|SYSTEM)\)|$u - schedule_marker_test$)"
+          foreach ($t in @(Get-ScheduledTask -TaskPath '\SeaShell\' -ErrorAction SilentlyContinue)) {
+            $what = "\SeaShell\$($t.TaskName) (runs as $($t.Principal.UserId))"
+            if ($t.TaskName -notmatch $pattern) { Write-Host "  left alone: task $what"; continue }
+            if (-not $Apply) { Write-Host "  would unregister: task $what"; continue }
+            Unregister-ScheduledTask -TaskPath '\SeaShell\' -TaskName $t.TaskName -Confirm:$false -ErrorAction SilentlyContinue
+            if ($?) { Write-Host "  unregistered: task $what" } else { Write-Host "  could not unregister: task $what" }
+          }
+        }
+      SEASHELL_CI_CLEANUP_SH: |
+        MODE=$1 JOB_UID=$2 JOB_USER=$3 DATA=${4%/} WS=${5%/} TMP=${6:-/tmp} RTMP=${7%/}
+        TMP=${TMP%/}
+        ROOT_DATA=/var/lib/seashell
+        NAMES=' sea seashell seashell-daemon seashell-elevator '
+        if [ "$MODE" = apply ]; then VERB=killed; else VERB="would kill"; fi
+        # In this job's places (see above); an empty workspace matches nothing.
+        in_job() {
+          if [ -n "$WS" ]; then case "$1" in *"$WS"/*|*"$WS") return 0 ;; esac; fi
+          if [ -n "$RTMP" ]; then case "$1" in *"$RTMP"/*|*"$RTMP") return 0 ;; esac; fi
+          case "$1" in *"$TMP"/seashell-*) return 0 ;; esac
+          return 1
+        }
+        for d in /proc/[0-9]*; do
+          pid=${d#/proc/}
+          [ "$pid" = "$$" ] && continue
+          args=$(tr '\0' ' ' < "$d/cmdline" 2>/dev/null) || continue
+          [ -n "$args" ] || continue
+          uid=$(stat -c %u "$d" 2>/dev/null) || continue
+          exe=$(readlink "$d/exe" 2>/dev/null || true)
+          base=${exe##*/}; base=${base% (deleted)}
+          named=; case "$NAMES" in *" $base "*) named=1 ;; esac
+          scope= script= cwd=
+          if [ "$uid" = "$JOB_UID" ]; then
+            # Daemon / elevator: by name, or dotnet hosting their dll.
+            case "$base" in
+              seashell-daemon|seashell-elevator) scope="runner account" ;;
+              dotnet) case "$args" in *seashell-daemon.dll*|*seashell-elevator.dll*) scope="runner account" ;; esac ;;
+            esac
+            if [ -z "$scope" ]; then
+              # A script: a launcher, or hosted / run as an exe from the data dir;
+              # ended only when it is this job's (command line or working dir).
+              case "$base" in sea|seashell) script=1 ;; esac
+              case "$exe $args" in "$DATA"/*|*" $DATA/"*) script=1 ;; esac
+              if [ -n "$script" ]; then
+                cwd=$(readlink "$d/cwd" 2>/dev/null || true)
+                if in_job "$args" || in_job "$cwd"; then scope="runner account, this job's"; fi
+              fi
+            fi
+          elif [ "$uid" = 0 ]; then
+            case "$exe $args" in "$ROOT_DATA"/*|*" $ROOT_DATA/"*) scope="root install" ;; esac
+          fi
+          what="$base pid $pid owner $(stat -c %U "$d" 2>/dev/null || echo "$uid"), $exe: $args"
+          [ -z "$cwd" ] || what="$what (cwd $cwd)"
+          if [ -z "$scope" ]; then
+            [ -n "$named" ] || [ -n "$script" ] || case "$exe $args" in */seashell/*) ;; *) continue ;; esac
+            echo "  left alone: $what"; continue
+          fi
+          if [ "$MODE" = apply ] && ! kill -9 "$pid" 2>/dev/null; then echo "  could not kill ($scope): $what"; continue; fi
+          echo "  $VERB ($scope): $what"
+        done
+        # Daemon and elevator sockets of the runner account and root (named by
+        # uid since 0.6.0, by user name before), in /tmp and the runtime dir.
+        if [ "$MODE" = apply ]; then
+          for s in /tmp/seashell-*-"$JOB_UID".sock /tmp/seashell-*-"$JOB_USER".sock /tmp/seashell-*-0.sock \
+                   /tmp/seashell-*-root.sock /run/user/"$JOB_UID"/seashell-*.sock; do
+            if [ -e "$s" ]; then rm -f "$s" && echo "  removed $s"; fi
+          done
+        fi
+        exit 0
 
     steps:
       - uses: http://gitea:3000/actions/checkout@v4
@@ -273,16 +507,23 @@ jobs:
           path: nupkg/
 
       # ── Phase 1: Install ────────────────────────────────────────────
+      # Start from nothing (no daemons, tasks or data dirs), then the
+      # migration test (the previous release installed the old way, then this
+      # build's bootstrapper over it), then this build's normal install with
+      # --all, which the functional tests run on.
+      #
+      # Only the installed bin dir goes on the job PATH ($GITHUB_PATH), not
+      # ~/.dotnet/tools: `seashell` must resolve to the installed copy, and
+      # the steps that need the global tool call it by its full path.
 
       - name: "Install: Kill SeaShell processes (Windows)"
         if: matrix.os == 'windows'
         shell: powershell
         run: |
-          $ErrorActionPreference = 'SilentlyContinue'
-          taskkill /F /IM seashell-daemon.exe 2>&1 | Out-Null
-          taskkill /F /IM seashell-elevator.exe 2>&1 | Out-Null
-          Get-ScheduledTask -TaskPath '\SeaShell\' -ErrorAction SilentlyContinue |
-            Unregister-ScheduledTask -Confirm:$false -ErrorAction SilentlyContinue
+          # The runner account's and the SYSTEM install's processes and tasks
+          # only (see SEASHELL_CI_CLEANUP_PS1 above).
+          $ErrorActionPreference = 'Continue'
+          & ([scriptblock]::Create($env:SEASHELL_CI_CLEANUP_PS1)) -Apply -Tasks
           Start-Sleep -Seconds 2
           exit 0
 
@@ -290,89 +531,230 @@ jobs:
         if: matrix.os == 'linux'
 
         run: |
-          sudo pkill -9 -f seashell-daemon || true
-          sudo pkill -9 -f seashell-elevator || true
-          sudo rm -f /tmp/seashell-*.sock
-          rm -f /run/user/$(id -u)/seashell-*.sock 2>/dev/null || true
+          # The runner account's and the root install's processes and sockets
+          # only (see SEASHELL_CI_CLEANUP_SH above).
+          printf '%s\n' "$SEASHELL_CI_CLEANUP_SH" | sudo bash -s -- apply "$(id -u)" "$(id -un)" "${XDG_DATA_HOME:-$HOME/.local/share}/seashell" \
+            "$GITHUB_WORKSPACE" "${TMPDIR:-/tmp}" "${RUNNER_TEMP:-}"
           sleep 2
 
       - name: "Install: Clear caches (Windows)"
         if: matrix.os == 'windows'
         shell: powershell
         run: |
-          # Wipe entire SeaShell data dirs to remove legacy-layout bins, v* dirs,
-          # and current junctions left behind by previous CI runs. The installer
-          # will recreate everything fresh.
+          # Wipe the SeaShell data dirs of the runner account and of SYSTEM
+          # (version dirs, current junctions, install.scope) left by earlier
+          # runs, and the pre-0.5.0 ProgramData dir. The installs recreate them.
           Remove-Item "$env:LOCALAPPDATA\seashell" -Recurse -Force -ErrorAction SilentlyContinue
+          Remove-Item "$env:SystemRoot\System32\config\systemprofile\AppData\Local\seashell" -Recurse -Force -ErrorAction SilentlyContinue
           Remove-Item "C:\ProgramData\seashell" -Recurse -Force -ErrorAction SilentlyContinue
 
       - name: "Install: Clear caches (Linux)"
         if: matrix.os == 'linux'
 
         run: |
-          # Wipe entire SeaShell data dirs (legacy bin/, v*/, current) — installer recreates.
-          rm -rf "$HOME/.local/share/seashell"
+          # Wipe the user's and root's SeaShell data dirs — installers recreate.
+          rm -rf "${XDG_DATA_HOME:-$HOME/.local/share}/seashell"
           sudo rm -rf /var/lib/seashell
-          # Drop the user-PATH symlink from the legacy layout if present.
-          rm -f "$HOME/.local/bin/sea"
-          sudo rm -f /root/.local/bin/sea
-
-      - name: "Install: dotnet tool + seashell install"
-
-        run: |
-          # Add dotnet tools to PATH first so seashell is found
-          export PATH="$HOME/.dotnet/tools:$PATH"
-          dotnet tool uninstall -g SeaShell 2>/dev/null || true
-          dotnet tool install -g SeaShell --add-source "$(pwd)/nupkg"
-          seashell install
-          # Add sea to PATH for subsequent steps. The new layout uses the
-          # `current` junction/symlink so PATH stays stable across version bumps.
-          if [ "${{ matrix.os }}" = "windows" ]; then
-            SEA_BIN="$LOCALAPPDATA/seashell/current/bin"
-          else
-            SEA_BIN="$HOME/.local/share/seashell/current/bin"
+          # The ~/.local/bin symlinks of both installs.
+          rm -f "$HOME/.local/bin/sea" "$HOME/.local/bin/seashell"
+          sudo rm -f /root/.local/bin/sea /root/.local/bin/seashell
+          # An automatic-update line left by a failed earlier run (it would
+          # point at that run's workspace). Rewrite a crontab only when it has one.
+          TAG='# seashell-auto-update'
+          if crontab -l > /tmp/ci-crontab 2>/dev/null && grep -qF "$TAG" /tmp/ci-crontab; then
+            { grep -vF "$TAG" /tmp/ci-crontab || true; } | crontab -
           fi
-          echo "$SEA_BIN" >> $GITHUB_PATH
-          echo "$HOME/.dotnet/tools" >> $GITHUB_PATH
+          if sudo crontab -l > /tmp/ci-crontab 2>/dev/null && grep -qF "$TAG" /tmp/ci-crontab; then
+            { grep -vF "$TAG" /tmp/ci-crontab || true; } | sudo crontab -
+          fi
+          rm -f /tmp/ci-crontab
 
-      - name: "Install: Verify sea --version"
-        run: sea --version
+      # Migration test, part 1: the latest release from nuget.org, installed
+      # the way 0.6.2 and earlier were (global tool, then `seashell install`;
+      # --all on Windows). Skipped with a notice when nuget.org cannot be reached.
+      - name: "Install: Migration 1/2 - previous release, installed the old way"
 
-      - name: "Install: Install for root (Linux)"
-        if: matrix.os == 'linux'
-        continue-on-error: true
         run: |
-          sudo env "PATH=$HOME/.dotnet/tools:$PATH" dotnet tool uninstall -g SeaShell 2>/dev/null || true
-          sudo env "PATH=$HOME/.dotnet/tools:$PATH" dotnet tool install -g SeaShell --add-source "$(pwd)/nupkg" || true
-          sudo env "PATH=$HOME/.dotnet/tools:$PATH" seashell install || true
+          VERSION="${{ needs.version.outputs.version }}"
+          if [ "${{ matrix.os }}" = "windows" ]; then
+            TOOLS="$(cygpath -u "$USERPROFILE")/.dotnet/tools"
+          else
+            TOOLS="$HOME/.dotnet/tools"
+          fi
+          dotnet tool uninstall -g SeaShell >/dev/null 2>&1 || true
 
-      - name: "Install: Install SeaShell --system (Windows)"
+          # Highest stable version; the flat-container index lists versions in
+          # ascending order, and a prerelease ("-" suffix) does not match.
+          INDEX=$(curl -fsS --max-time 30 https://api.nuget.org/v3-flatcontainer/seashell/index.json) || INDEX=""
+          RELEASED=$(printf '%s' "$INDEX" | tr -d ' \r\n' | grep -oE '"[0-9]+(\.[0-9]+)+"' | tr -d '"' | tail -n 1 || true)
+          if [ -z "$RELEASED" ] || [ "$RELEASED" = "$VERSION" ]; then
+            echo "::notice::Migration test skipped: no previous SeaShell release found on nuget.org from this runner (got '${RELEASED}')"
+            echo "MIGRATE_FROM=" >> "$GITHUB_ENV"
+            exit 0
+          fi
+          echo "Previous release: SeaShell $RELEASED (this build: $VERSION)"
+
+          export PATH="$TOOLS:$PATH"
+          dotnet tool install -g SeaShell --version "$RELEASED" --source https://api.nuget.org/v3/index.json
+          if [ "${{ matrix.os }}" = "windows" ]; then
+            "$TOOLS/seashell" install --all
+          else
+            "$TOOLS/seashell" install
+          fi
+          echo "MIGRATE_FROM=$RELEASED" >> "$GITHUB_ENV"
+
+      # The kind of the user PATH registry value before this build's
+      # bootstrapper first edits it (after the previous release's install,
+      # whose own PATH handling is not under test). The uninstall test asserts
+      # that it is unchanged.
+      - name: "Install: Record user PATH value kind (Windows)"
         if: matrix.os == 'windows'
         shell: powershell
-        continue-on-error: true
         run: |
-          seashell install --system
+          $key = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey('Environment')
+          $name = if ($key) { $key.GetValueNames() | Where-Object { $_ -eq 'Path' } | Select-Object -First 1 }
+          $kind = if ($name) { $key.GetValueKind($name).ToString() } else { 'None' }
+          Write-Host "HKCU\Environment\Path kind: $kind"
+          [System.IO.File]::AppendAllText($env:GITHUB_ENV, "USER_PATH_KIND=$kind`n")
 
-      - name: "Install: Stage SeaShell.Service package"
+      # Migration test, part 2: this build's bootstrapper (it carries the
+      # archives) run without installing it as a tool, with no scope flags.
+      # It must take the old install's scope as it finds it and record it.
+      - name: "Install: Migration 2/2 - this build's bootstrapper, no scope flags"
 
         run: |
-          SERVICE_PKG=$(find nupkg -name 'SeaShell.Service.*.nupkg' 2>/dev/null | head -1)
-          if [ -z "$SERVICE_PKG" ]; then echo "No SeaShell.Service package found"; exit 0; fi
-
-          VERSION=$(basename "$SERVICE_PKG" | sed 's/SeaShell\.Service\.\(.*\)\.nupkg/\1/')
-          USER_CACHE="$HOME/.nuget/packages"
-          TARGET="$USER_CACHE/seashell.service/$VERSION"
-
-          rm -rf "$USER_CACHE/seashell.service" 2>/dev/null || true
-          mkdir -p "$TARGET"
-          unzip -o "$SERVICE_PKG" -d "$TARGET"
-
-          if [ "${{ matrix.os }}" = "linux" ]; then
-            sudo rm -rf /root/.nuget/packages/seashell.service 2>/dev/null || true
-            sudo mkdir -p "/root/.nuget/packages/seashell.service/$VERSION"
-            sudo cp -r "$TARGET/." "/root/.nuget/packages/seashell.service/$VERSION/"
+          if [ -z "$MIGRATE_FROM" ]; then echo "Migration test skipped (see the previous step)"; exit 0; fi
+          VERSION="${{ needs.version.outputs.version }}"
+          if [ "${{ matrix.os }}" = "windows" ]; then
+            DATA="$(cygpath -u "$LOCALAPPDATA")/seashell"
+            FEED="$(cygpath -m "$(pwd)/nupkg")"
+            EXPECTED_SCOPE="user elevator system"
+          else
+            DATA="${XDG_DATA_HOME:-$HOME/.local/share}/seashell"
+            FEED="$(pwd)/nupkg"
+            EXPECTED_SCOPE="user"
           fi
-          # Windows: skip SYSTEM NuGet cache in CI (no elevation)
+
+          echo "Migrating from $MIGRATE_FROM to $VERSION"
+          # --yes (before the package id, so it is dotnet's option, not passed
+          # to SeaShell): consent to the tool package download, which the SDK
+          # otherwise asks for when stdin is not a terminal. stdin from
+          # /dev/null: a SeaShell confirmation prompt fails instead of waiting.
+          dotnet tool exec --yes --source "$FEED" "SeaShell@$VERSION" install < /dev/null
+
+          OUT=$("$DATA/current/bin/sea" --version | tr -d '\r')
+          echo "$OUT"
+          [ "$OUT" = "{~} SeaShell v$VERSION" ] || { echo "FAIL: expected {~} SeaShell v$VERSION after the migration"; exit 1; }
+          [ -f "$DATA/install.scope" ] || { echo "FAIL: no $DATA/install.scope recorded"; exit 1; }
+          SCOPE=$(tr -s '\r\n' '  ' < "$DATA/install.scope" | sed 's/^ *//; s/ *$//')
+          echo "install.scope: $SCOPE"
+          [ "$SCOPE" = "$EXPECTED_SCOPE" ] || { echo "FAIL: expected the old install's scope '$EXPECTED_SCOPE'"; exit 1; }
+          dotnet tool list -g
+
+      # This build's install, everything: Windows user + elevator + SYSTEM
+      # (the runner is elevated, UAC off), Linux user + root (through sudo,
+      # passwordless on the runners). A failure fails the job.
+      - name: "Install: dotnet tool + seashell install --all"
+
+        run: |
+          VERSION="${{ needs.version.outputs.version }}"
+          if [ "${{ matrix.os }}" = "windows" ]; then
+            TOOL="$(cygpath -u "$USERPROFILE")/.dotnet/tools/seashell.exe"
+            FEED="$(cygpath -m "$(pwd)/nupkg")"
+            SEA_BIN="$LOCALAPPDATA/seashell/current/bin"
+          else
+            TOOL="$HOME/.dotnet/tools/seashell"
+            FEED="$(pwd)/nupkg"
+            SEA_BIN="${XDG_DATA_HOME:-$HOME/.local/share}/seashell/current/bin"
+          fi
+          dotnet tool uninstall -g SeaShell 2>/dev/null || true
+          dotnet tool install -g SeaShell --version "$VERSION" --source "$FEED"
+          # The global tool carries the archives; the installed copy does not.
+          "$TOOL" install --all
+          # The `current` junction/symlink keeps this stable across versions.
+          echo "$SEA_BIN" >> "$GITHUB_PATH"
+
+      - name: "Install: Verify (Windows)"
+        if: matrix.os == 'windows'
+        shell: powershell
+        run: |
+          $version = '${{ needs.version.outputs.version }}'
+          $data = Join-Path $env:LOCALAPPDATA 'seashell'
+          $bin = Join-Path $data 'current\bin'
+          $failed = $false
+          function Fail($m) { Write-Host "FAIL: $m"; $script:failed = $true }
+
+          $principal = [Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
+          Write-Host "Runner account: $env:USERNAME, elevated: $($principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator))"
+
+          $out = (& sea --version | Out-String).Trim()
+          Write-Host $out
+          if ($out -ne "{~} SeaShell v$version") { Fail "sea --version: expected {~} SeaShell v$version" }
+
+          foreach ($name in 'seashell', 'sea') {
+            $cmd = Get-Command $name -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+            $expected = [IO.Path]::GetFullPath((Join-Path $bin "$name.exe"))
+            $actual = if ($cmd) { [IO.Path]::GetFullPath($cmd.Source) } else { '<not found>' }
+            if ($actual -ne $expected) { Fail "$name resolves to $actual, expected $expected"; Write-Host "PATH=$env:PATH" }
+            else { Write-Host "OK: $name -> $actual" }
+          }
+
+          $scopeFile = Join-Path $data 'install.scope'
+          $scope = if (Test-Path $scopeFile) { @(Get-Content $scopeFile | Where-Object { $_.Trim() }) -join ' ' } else { '<missing>' }
+          Write-Host "install.scope: $scope"
+          if ($scope -ne 'user elevator system') { Fail "install.scope: expected 'user elevator system'" }
+
+          $sysCurrent = Join-Path $env:SystemRoot 'System32\config\systemprofile\AppData\Local\seashell\current'
+          if (Test-Path $sysCurrent) { Write-Host "OK: SYSTEM install ($sysCurrent)" } else { Fail "no SYSTEM install ($sysCurrent)" }
+
+          $tasks = @(Get-ScheduledTask -TaskPath '\SeaShell\' -ErrorAction SilentlyContinue | ForEach-Object { $_.TaskName })
+          foreach ($t in "SeaShell Daemon ($env:USERNAME) $version", "SeaShell Elevator ($env:USERNAME) $version", "SeaShell Daemon (SYSTEM) $version") {
+            if ($tasks -contains $t) { Write-Host "OK: task \SeaShell\$t" } else { Fail "task \SeaShell\$t not registered (found: $($tasks -join ', '))" }
+          }
+
+          $status = (& sea --status | Out-String)
+          Write-Host $status
+          if ($status -notmatch ', up ') { Fail 'daemon not running after the install' }
+          if ($failed) { exit 1 }
+
+      - name: "Install: Verify (Linux)"
+        if: matrix.os == 'linux'
+
+        run: |
+          VERSION="${{ needs.version.outputs.version }}"
+          DATA="${XDG_DATA_HOME:-$HOME/.local/share}/seashell"
+          SEA_BIN="$DATA/current/bin"
+          fail() { echo "FAIL: $*"; exit 1; }
+
+          OUT=$(sea --version)
+          echo "$OUT"
+          [ "$OUT" = "{~} SeaShell v$VERSION" ] || fail "sea --version: expected {~} SeaShell v$VERSION"
+
+          for name in seashell sea; do
+            RESOLVED=$(command -v "$name" || true)
+            [ "$RESOLVED" = "$SEA_BIN/$name" ] || { echo "PATH=$PATH"; fail "$name resolves to '$RESOLVED', expected $SEA_BIN/$name"; }
+            echo "OK: $name -> $RESOLVED"
+          done
+
+          [ -f "$DATA/install.scope" ] || fail "no $DATA/install.scope"
+          SCOPE=$(tr -s '\n' ' ' < "$DATA/install.scope" | sed 's/^ *//; s/ *$//')
+          echo "install.scope: $SCOPE"
+          [ "$SCOPE" = "user system" ] || fail "install.scope: expected 'user system'"
+
+          sudo test -e /var/lib/seashell/current || fail "root has no install (/var/lib/seashell/current)"
+          ROOT_CURRENT=$(sudo readlink /var/lib/seashell/current || true)
+          echo "root: /var/lib/seashell/current -> $ROOT_CURRENT"
+          case "$ROOT_CURRENT" in *"v$VERSION") ;; *) fail "root's install is not v$VERSION" ;; esac
+
+          sea --start || fail "sea --start exited $?"
+          STATUS=""
+          for i in $(seq 1 15); do
+            STATUS=$(sea --status 2>&1) || true
+            grep -q ", up " <<< "$STATUS" && break
+            sleep 1
+          done
+          echo "$STATUS"
+          grep -q ", up " <<< "$STATUS" || fail "daemon not running after sea --start"
 
       # ── Phase 2: Functional tests ──────────────────────────────────
 
@@ -508,8 +890,20 @@ jobs:
           if ($content -notmatch 'NuGet=') { Write-Host "Missing NuGet= in marker"; exit 1 }
           if ($content -match 'NuGet=FAIL') { Write-Host "NuGet=FAIL in marker"; exit 1 }
 
-          & $EXE stop 2>$null; Start-Sleep -Seconds 3
+          # Wait for the service to be stopped before deleting it, and for the
+          # deletion to complete: a service deleted while stopping stays
+          # "marked for deletion" (1072) and the next step cannot recreate it.
+          & $EXE stop 2>$null
+          foreach ($i in 1..30) {
+            $svc = Get-Service -Name seashell-cwd-test -ErrorAction SilentlyContinue
+            if (-not $svc -or $svc.Status -eq 'Stopped') { break }
+            Start-Sleep -Seconds 1
+          }
           & $EXE uninstall 2>$null
+          foreach ($i in 1..30) {
+            if (-not (Get-Service -Name seashell-cwd-test -ErrorAction SilentlyContinue)) { break }
+            Start-Sleep -Seconds 1
+          }
 
       - name: "Test: service-cwd (Linux)"
         if: matrix.os == 'linux'
@@ -694,22 +1088,41 @@ jobs:
           fi
 
           [ -f "$EXE" ] || { echo "ServiceCwdTest binary not found"; exit 1; }
-          rm -f "$MARKER_FILE"
 
-          # Clear compilation cache
+          service_running() {
+            if [ "${{ matrix.os }}" = "windows" ]; then
+              sc.exe query "$SERVICE_NAME" 2>/dev/null | grep -qE 'RUNNING|PENDING'
+            else
+              pgrep -f "service-cwd-test/ServiceCwdTest" >/dev/null
+            fi
+          }
+
+          # `install` also starts the service, as LocalSystem / root — which has
+          # a SeaShell install, so it writes the marker. Stop it and wait, and
+          # only then delete the marker and switch the account.
+          # No compile-cache clearing: caches are per identity and version
+          # ({DataDir}/v{version}/cache of the account whose daemon compiles),
+          # and the alternate account below has no SeaShell install, so it has
+          # no cache to clear; LocalSystem's / root's does not decide whether
+          # the alternate account's run writes a marker.
           if [ "${{ matrix.os }}" = "windows" ]; then
-            cmd /c 'rmdir /s /q "C:\ProgramData\seashell\cache" 2>nul'
-          else
-            sudo rm -rf /var/lib/seashell/cache
+            # The previous step deleted this service; creating it again fails
+            # with 1072 until that deletion has completed.
+            for i in $(seq 1 30); do sc.exe query "$SERVICE_NAME" >/dev/null 2>&1 || break; sleep 1; done
           fi
-
           $ELEVATE "$EXE" install || true
+          $ELEVATE "$EXE" stop || true
+          for i in $(seq 1 30); do service_running || break; sleep 1; done
+          if service_running; then echo "WARNING: $SERVICE_NAME still running 30s after stop"; fi
+          rm -f "$MARKER_FILE"
 
           if [ "${{ matrix.os }}" = "windows" ]; then
             $ELEVATE sc.exe config "$SERVICE_NAME" obj= "NT AUTHORITY\NetworkService" password= ""
           else
+            # BusyBox `adduser -S` creates no group of the user's name, which
+            # the OpenRC command_user="user:group" below needs: create it first.
             sudo useradd -r -M -s /usr/sbin/nologin seashell-test-user 2>/dev/null \
-              || sudo adduser -S -D -H -s /sbin/nologin seashell-test-user 2>/dev/null \
+              || { sudo addgroup -S seashell-test-user 2>/dev/null; sudo adduser -S -D -H -s /sbin/nologin -G seashell-test-user seashell-test-user 2>/dev/null; } \
               || true
             if [ -f "/etc/systemd/system/$SERVICE_NAME.service" ]; then
               sudo sed -i "s/^User=.*/User=seashell-test-user/" /etc/systemd/system/$SERVICE_NAME.service
@@ -719,7 +1132,21 @@ jobs:
             fi
           fi
 
-          $ELEVATE "$EXE" start || true
+          $ELEVATE "$EXE" start || echo "NOTICE: start under the alternate account exited $?"
+          sleep 2
+          # Which account the service now runs as, so a run that never started
+          # under it is visible rather than read as "isolation confirmed".
+          if [ "${{ matrix.os }}" = "windows" ]; then
+            sc.exe qc "$SERVICE_NAME" | grep -i SERVICE_START_NAME || true
+            sc.exe query "$SERVICE_NAME" | grep -i STATE || true
+          else
+            PIDS=$(pgrep -f "service-cwd-test/ServiceCwdTest" || true)
+            if [ -n "$PIDS" ]; then
+              for p in $PIDS; do echo "  ServiceCwdTest pid $p runs as $(stat -c %U "/proc/$p" 2>/dev/null || echo '?')"; done
+            else
+              echo "  no ServiceCwdTest process (exited or never started)"
+            fi
+          fi
 
           # Wait 20s — expect no marker (cache isolation)
           for i in $(seq 1 20); do
@@ -740,6 +1167,7 @@ jobs:
             sudo userdel seashell-test-user 2>/dev/null \
               || sudo deluser seashell-test-user 2>/dev/null \
               || true
+            sudo delgroup seashell-test-user 2>/dev/null || true
           fi
 
       # ── Restart tests ──────────────────────────────────────────────
@@ -847,10 +1275,10 @@ jobs:
 
           $proc1 | Stop-Process -Force -ErrorAction SilentlyContinue
 
-          # Kill any orphaned sea/daemon processes spawned by the task
-          $ErrorActionPreference = 'SilentlyContinue'
-          taskkill /F /IM sea.exe 2>&1 | Out-Null
-          taskkill /F /IM seashell-daemon.exe 2>&1 | Out-Null
+          # End orphaned sea/daemon processes spawned by the task: the runner
+          # account's only, not the SYSTEM daemon nor another user's.
+          $ErrorActionPreference = 'Continue'
+          & ([scriptblock]::Create($env:SEASHELL_CI_CLEANUP_PS1)) -Apply -UserOnly -Names sea.exe, seashell-daemon.exe
           $ErrorActionPreference = 'Stop'
 
           if (-not $found) {
@@ -943,12 +1371,10 @@ jobs:
           if ($result -ne 'PASS') { Write-Host ('Test failed: ' + $result); exit 1 }
           Write-Host 'seaw console mode OK'
 
-      # ── Elevated install tests (Windows only) ──────────────────────
-      # Elevator task + Event Log source registration is handled by
-      # `seashell install` when run elevated (see earlier step); the
-      # VerifyInstallation block there confirms the elevator task is
-      # registered. No separate `sea --install-elevator` step needed —
-      # that flag was removed when install logic moved from sea to seashell.
+      # ── Elevator (Windows only) ────────────────────────────────────
+      # The elevator task and the Event Log source are registered by
+      # `seashell install --all` (Phase 1); "Install: Verify (Windows)"
+      # checks the elevator task.
 
       - name: "Test: elevator connects to daemon"
         if: matrix.os == 'windows'
@@ -1209,40 +1635,374 @@ jobs:
           [ "$CODE" -ne 0 ] || { echo "Should have failed"; exit 1; }
           echo "$OUTPUT" | grep -qi "not supported" || { echo "Expected 'not supported' error"; exit 1; }
 
-      # ── Phase 3: Final verification ────────────────────────────────
-      # Leave the machine with a clean, working SeaShell install.
+      # ── Phase 3: Install tests ─────────────────────────────────────
+      # On the installed build, after the functional tests: update (same
+      # version: up to date, nothing restarted), automatic updates on / run /
+      # off, and uninstall of the whole remembered scope. The installed copy
+      # (current/bin/seashell, no archive of its own) is called by its full
+      # path. The uninstall leaves the runner without SeaShell; "Final"
+      # reinstalls it.
+
+      - name: "Install test: update reports up to date"
+
+        run: |
+          VERSION="${{ needs.version.outputs.version }}"
+          if [ "${{ matrix.os }}" = "windows" ]; then
+            DATA="$(cygpath -u "$LOCALAPPDATA")/seashell"
+            SEASHELL="$DATA/current/bin/seashell.exe"
+            FEED="$(cygpath -m "$(pwd)/nupkg")"
+            pids() { powershell -NoProfile -Command "(@(Get-Process seashell-daemon,seashell-elevator -ErrorAction SilentlyContinue | ForEach-Object { \$_.Id }) | Sort-Object) -join ' '" | tr -d '\r'; }
+          else
+            DATA="${XDG_DATA_HOME:-$HOME/.local/share}/seashell"
+            SEASHELL="$DATA/current/bin/seashell"
+            FEED="$(pwd)/nupkg"
+            pids() { (pgrep -f seashell-daemon || true) | sort -n | tr '\n' ' ' | sed 's/ *$//'; }
+          fi
+          fail() { echo "FAIL: $*"; exit 1; }
+
+          # A running daemon, so that a restart shows up as a different pid.
+          sea --start || true
+          STATUS=""
+          for i in $(seq 1 15); do
+            STATUS=$(sea --status 2>&1) || true
+            grep -q ", up " <<< "$STATUS" && break
+            sleep 1
+          done
+          grep -q ", up " <<< "$STATUS" || { echo "$STATUS"; fail "daemon not running before the update"; }
+
+          SCOPE_BEFORE=$(cat "$DATA/install.scope")
+          MTIME_BEFORE=$(stat -c %Y "$DATA/install.scope")
+          PIDS_BEFORE=$(pids)
+          echo "daemon/elevator pids before: $PIDS_BEFORE"
+          [ -n "$PIDS_BEFORE" ] || fail "no daemon process found"
+          sleep 1   # an install.scope rewrite must show in its 1-second mtime
+
+          CODE=0
+          OUT=$("$SEASHELL" update --source "$FEED" 2>&1) || CODE=$?
+          echo "$OUT"
+          [ "$CODE" -eq 0 ] || fail "seashell update exited $CODE"
+          grep -qF "Up to date (v$VERSION)" <<< "$OUT" || fail "no 'Up to date (v$VERSION)' in the output"
+          [ "$(cat "$DATA/install.scope")" = "$SCOPE_BEFORE" ] || fail "install.scope content changed"
+          [ "$(stat -c %Y "$DATA/install.scope")" = "$MTIME_BEFORE" ] || fail "install.scope was rewritten"
+          PIDS_AFTER=$(pids)
+          echo "daemon/elevator pids after:  $PIDS_AFTER"
+          [ "$PIDS_AFTER" = "$PIDS_BEFORE" ] || fail "daemon/elevator restarted (before: $PIDS_BEFORE, after: $PIDS_AFTER)"
+          echo "OK: up to date, install.scope untouched, nothing restarted"
+
+      - name: "Install test: automatic updates on, run, off (Windows)"
+        if: matrix.os == 'windows'
+        shell: powershell
+        run: |
+          $version = '${{ needs.version.outputs.version }}'
+          $seashell = Join-Path $env:LOCALAPPDATA 'seashell\current\bin\seashell.exe'
+          $feed = Join-Path (Get-Location).Path 'nupkg'
+          $names = @("SeaShell Update ($env:USERNAME)", 'SeaShell Update (SYSTEM)')
+          $failed = $false
+          function Fail($m) { Write-Host "FAIL: $m"; $script:failed = $true }
+          function Find-Task($name) { Get-ScheduledTask -TaskPath '\SeaShell\' -TaskName $name -ErrorAction SilentlyContinue }
+
+          # The SYSTEM task records a dotnet under %ProgramFiles% (doc/SECURITY.md).
+          # With only a per-user SDK it is refused: exit 3, the user's task is on.
+          # Either outcome is correct; say which.
+          $out = & $seashell update --auto on --source $feed 2>&1 | Out-String
+          $code = $LASTEXITCODE
+          Write-Host $out
+          $passes = @('user', 'system')
+          if ($code -eq 0) {
+            Write-Host "OUTCOME: SYSTEM task created"
+            $sysArgs = "$((Find-Task 'SeaShell Update (SYSTEM)').Actions[0].Arguments)"
+            Write-Host "SYSTEM task arguments: $sysArgs"
+            if ($sysArgs -notmatch [regex]::Escape("--dotnet `"$env:ProgramFiles\")) { Fail "the SYSTEM task does not record a dotnet under $env:ProgramFiles" }
+          } elseif ($code -eq 3) {
+            Write-Host "OUTCOME: SYSTEM task refused (no .NET SDK under $env:ProgramFiles on this runner)"
+            if ($out -notmatch 'the SYSTEM entry was not created') { Fail "exit 3 without the documented 'the SYSTEM entry was not created' message" }
+            if ($out -notmatch 'Install the \.NET 10 SDK machine-wide') { Fail "exit 3 without saying what to do" }
+            if (Find-Task 'SeaShell Update (SYSTEM)') { Fail "the SYSTEM task was refused, but \SeaShell\SeaShell Update (SYSTEM) exists" }
+            $names = @($names | Where-Object { $_ -ne 'SeaShell Update (SYSTEM)' })
+            $passes = @('user')
+          } else { Fail "update --auto on exited $code" }
+          $registered = @($names | Where-Object { Find-Task $_ })
+          foreach ($n in $names) { if ($registered -contains $n) { Write-Host "OK: \SeaShell\$n registered" } else { Fail "\SeaShell\$n not registered" } }
+          $status = & $seashell status | Out-String
+          Write-Host $status
+          $expected = if ($code -eq 3) { 'Auto-update\s+on; SYSTEM: off' } else { 'Auto-update\s+on; SYSTEM: on' }
+          if ($status -notmatch $expected) { Fail "seashell status does not show '$expected'" }
+
+          # Run each task once, as Task Scheduler would, and wait for it to finish.
+          $start = (Get-Date).AddSeconds(-2)
+          foreach ($n in $registered) {
+            schtasks /Run /TN "\SeaShell\$n"
+            if ($LASTEXITCODE -ne 0) { Fail "schtasks /Run \SeaShell\$n exited $LASTEXITCODE" }
+          }
+          foreach ($n in $registered) {
+            $info = $null
+            for ($i = 0; $i -lt 180; $i++) {
+              Start-Sleep -Seconds 1
+              $task = Find-Task $n
+              $info = $task | Get-ScheduledTaskInfo
+              if ($info.LastRunTime -ge $start -and $task.State -ne 'Running' -and $task.State -ne 'Queued') { break }
+              $info = $null
+            }
+            if (-not $info) { Fail "\SeaShell\$n did not run to completion within 180s"; continue }
+            if ($info.LastTaskResult -ne 0) { Fail "\SeaShell\$($n): last result $($info.LastTaskResult)" }
+            else { Write-Host "OK: \SeaShell\$n ran, result 0" }
+          }
+
+          # Every scheduled run appends its outcome to update.log in the data directory.
+          $log = Join-Path $env:LOCALAPPDATA 'seashell\update.log'
+          $last = @(Get-Content $log -ErrorAction SilentlyContinue | Where-Object { $_ -like '=== *' }) | Select-Object -Last 1
+          Write-Host "user update.log: $last"
+          if ($last -notmatch ' exit 0 nothing$') { Fail "$($log): no 'exit 0 nothing' entry from the user run" }
+
+          # A quiet up-to-date run leaves one Event Log entry per target (source SeaShell, id 3000).
+          $events = @(Get-WinEvent -FilterHashtable @{ LogName = 'Application'; ProviderName = 'SeaShell'; Id = 3000; StartTime = $start } -ErrorAction SilentlyContinue)
+          $events | ForEach-Object { Write-Host "  [$($_.TimeCreated)] $($_.Message)" }
+          foreach ($pass in $passes) {
+            if ($events | Where-Object { $_.Message -match "SeaShell up to date .*--pass $pass" }) { Write-Host "OK: '$pass' run reported up to date" }
+            else { Fail "no 'SeaShell up to date' Event Log entry for --pass $pass" }
+          }
+
+          & $seashell update --auto off
+          if ($LASTEXITCODE -ne 0) { Fail "update --auto off exited $LASTEXITCODE" }
+          foreach ($n in $names) { if (Find-Task $n) { Fail "\SeaShell\$n still registered after --auto off" } }
+          $status = & $seashell status | Out-String
+          Write-Host $status
+          if ($status -notmatch 'Auto-update\s+off.*; SYSTEM: off') { Fail "seashell status does not show automatic updates off" }
+          if ($failed) { exit 1 }
+
+      - name: "Install test: automatic updates on, run, off (Linux)"
+        if: matrix.os == 'linux'
+
+        run: |
+          DATA="${XDG_DATA_HOME:-$HOME/.local/share}/seashell"
+          SEASHELL="$DATA/current/bin/seashell"
+          FEED="$(pwd)/nupkg"
+          TAG='# seashell-auto-update'
+          FAILED=0
+          fail() { echo "FAIL: $*"; FAILED=1; }
+          user_lines() { (crontab -l 2>/dev/null || true) | grep -F "$TAG" || true; }
+          root_lines() { (sudo crontab -l 2>/dev/null || true) | grep -F "$TAG" || true; }
+          START=$(date +%s)
+
+          # Root's line records a dotnet only root can change (doc/SECURITY.md).
+          # With a per-user SDK and no machine-wide one, root's entry is refused:
+          # exit 3, the user's entry is on. Either outcome is correct; say which.
+          CODE=0
+          OUT=$("$SEASHELL" update --auto on --source "$FEED" 2>&1) || CODE=$?
+          echo "$OUT"
+          USER_LINE=$(user_lines)
+          ROOT_LINE=$(root_lines)
+          echo "user: $USER_LINE"
+          echo "root: $ROOT_LINE"
+          [ "$(grep -c . <<< "$USER_LINE" || true)" = "1" ] || fail "user crontab: expected one line tagged '$TAG'"
+          case "$CODE" in
+            0)
+              echo "OUTCOME: root entry created"
+              [ "$(grep -c . <<< "$ROOT_LINE" || true)" = "1" ] || fail "root crontab: expected one line tagged '$TAG'"
+              if grep -oE "PATH=[^ ]+" <<< "$ROOT_LINE" | grep -qF "$HOME"; then fail "root's line carries a PATH entry under $HOME"; fi
+              ;;
+            3)
+              echo "OUTCOME: root entry refused (no machine-wide .NET SDK on this runner)"
+              grep -qF "the root entry was not created" <<< "$OUT" || fail "exit 3 without the documented 'the root entry was not created' message"
+              grep -qF "Install the .NET 10 SDK machine-wide" <<< "$OUT" || fail "exit 3 without saying what to do"
+              [ -z "$ROOT_LINE" ] || fail "root's entry was refused, but root's crontab has a '$TAG' line"
+              ;;
+            *) fail "update --auto on exited $CODE" ;;
+          esac
+          STATUS=$("$SEASHELL" status 2>&1) || true
+          echo "$STATUS"
+          grep -qE 'Auto-update +on' <<< "$STATUS" || fail "seashell status does not show automatic updates on"
+
+          # Run each line's command as cron would: /bin/sh, an empty
+          # environment (the line sets HOME, DOTNET_ROOT and PATH itself), cwd /.
+          # A quiet run prints nothing unless it installed something or failed.
+          run_line() {
+            local who=$1 line=$2 cmd out code=0
+            [ -n "$line" ] || return 0
+            cmd=$(cut -d' ' -f6- <<< "$line")
+            echo "Running the $who entry: $cmd"
+            if [ "$who" = root ]; then
+              out=$(cd / && sudo env -i /bin/sh -c "$cmd" 2>&1) || code=$?
+            else
+              out=$(cd / && env -i /bin/sh -c "$cmd" 2>&1) || code=$?
+            fi
+            [ -z "$out" ] || echo "$out"
+            [ "$code" -eq 0 ] || { fail "$who entry exited $code"; return 0; }
+            [ -z "$out" ] || { fail "$who entry printed output: a quiet up-to-date run prints nothing"; return 0; }
+            echo "OK: $who entry exited 0, nothing to do"
+          }
+          run_line user "$USER_LINE"
+          run_line root "$ROOT_LINE"
+
+          # Every scheduled run appends its outcome to update.log in the data directory.
+          LAST=$(grep '^=== ' "$DATA/update.log" 2>/dev/null | tail -1 || true)
+          echo "user update.log: $LAST"
+          grep -qE ' exit 0 nothing$' <<< "$LAST" || fail "$DATA/update.log: no 'exit 0 nothing' entry from the user run"
+
+          # Best effort: the outcome also goes to syslog (logger -t seashell).
+          LOG=$( (sudo journalctl -t seashell --since "@$START" --no-pager -q 2>/dev/null || true; \
+                  sudo grep -h 'seashell' /var/log/messages /var/log/syslog 2>/dev/null || true) | grep -i 'up to date' || true)
+          if [ -n "$LOG" ]; then echo "syslog:"; echo "$LOG"; else echo "NOTICE: no 'up to date' syslog entry found on this runner (not asserted)"; fi
+
+          "$SEASHELL" update --auto off || fail "update --auto off exited $?"
+          [ -z "$(user_lines)" ] || fail "user crontab still has the '$TAG' line"
+          [ -z "$(root_lines)" ] || fail "root crontab still has the '$TAG' line"
+          STATUS=$("$SEASHELL" status 2>&1) || true
+          echo "$STATUS"
+          grep -qE 'Auto-update +off' <<< "$STATUS" || fail "seashell status does not show automatic updates off"
+          exit $FAILED
+
+      - name: "Install test: uninstall leaves nothing behind (Windows)"
+        if: matrix.os == 'windows'
+        shell: powershell
+        run: |
+          $data = Join-Path $env:LOCALAPPDATA 'seashell'
+          $sysData = Join-Path $env:SystemRoot 'System32\config\systemprofile\AppData\Local\seashell'
+          $seashell = Join-Path $data 'current\bin\seashell.exe'
+          $failed = $false
+          function Fail($m) { Write-Host "FAIL: $m"; $script:failed = $true }
+
+          & $seashell uninstall
+          if ($LASTEXITCODE -ne 0) { Fail "seashell uninstall exited $LASTEXITCODE" }
+
+          # The installed copy uninstalls from a temporary copy of itself; its
+          # own version directory goes once it has exited (a hidden helper).
+          for ($i = 0; $i -lt 30; $i++) {
+            if (-not (Get-ChildItem -LiteralPath $data -Directory -Filter 'v*' -ErrorAction SilentlyContinue)) { break }
+            Start-Sleep -Seconds 1
+          }
+          foreach ($dir in $data, $sysData) {
+            if (-not (Test-Path -LiteralPath $dir)) { Write-Host "OK: $dir is gone"; continue }
+            $all = @(Get-ChildItem -LiteralPath $dir -Force | ForEach-Object { $_.Name })
+            Write-Host "$dir still holds: $($all -join ', ')"
+            $left = @($all | Where-Object { $_ -match '^v\d' -or $_ -eq 'current' -or $_ -eq 'install.scope' })
+            if ($left) { Fail "$dir still has: $($left -join ', ')" }
+          }
+
+          # Daemon, elevator and update tasks of the runner account and SYSTEM.
+          # Scheduled scripts are kept on purpose (no --purge).
+          $pattern = '^SeaShell (Daemon|Elevator|Update) \((' + [regex]::Escape($env:USERNAME) + '|SYSTEM)\)'
+          $tasks = @(Get-ScheduledTask -TaskPath '\SeaShell\' -ErrorAction SilentlyContinue | ForEach-Object { $_.TaskName })
+          Write-Host "\SeaShell\ tasks left: $($tasks -join ', ')"
+          $ours = @($tasks | Where-Object { $_ -match $pattern })
+          if ($ours) { Fail "tasks left: $($ours -join ', ')" }
+
+          # User PATH: no current\bin entry, and the value kept its registry kind.
+          $key = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey('Environment')
+          $name = if ($key) { $key.GetValueNames() | Where-Object { $_ -eq 'Path' } | Select-Object -First 1 }
+          $raw = if ($name) { $key.GetValue($name, '', [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames) } else { '' }
+          $kind = if ($name) { $key.GetValueKind($name).ToString() } else { 'None' }
+          $entries = @($raw -split ';' | Where-Object { $_ })
+          $stale = @($entries | Where-Object { [Environment]::ExpandEnvironmentVariables($_).Replace('/', '\').TrimEnd('\') -like '*\seashell\current\bin' })
+          if ($stale) { Fail "user PATH still contains: $($stale -join '; ')" } else { Write-Host "OK: no seashell\current\bin in the user PATH" }
+          Write-Host "HKCU\Environment\Path kind: $kind (before this build's first install: $env:USER_PATH_KIND)"
+          if ($env:USER_PATH_KIND -and $env:USER_PATH_KIND -ne 'None' -and $kind -ne $env:USER_PATH_KIND) {
+            Fail "user PATH value kind changed from $env:USER_PATH_KIND to $kind"
+          }
+          if ($failed) { exit 1 }
+
+      - name: "Install test: uninstall leaves nothing behind (Linux)"
+        if: matrix.os == 'linux'
+
+        run: |
+          DATA="${XDG_DATA_HOME:-$HOME/.local/share}/seashell"
+          SEASHELL="$DATA/current/bin/seashell"
+          TAG='# seashell-auto-update'
+          FAILED=0
+          fail() { echo "FAIL: $*"; FAILED=1; }
+
+          CODE=0
+          "$SEASHELL" uninstall || CODE=$?
+          [ "$CODE" -eq 0 ] || fail "seashell uninstall exited $CODE"
+
+          # $3: "sudo" for root's data dir.
+          check_dir() {
+            local left
+            left=$($3 ls -A "$2" 2>/dev/null | grep -E '^(v[0-9].*|current|install\.scope)$' || true)
+            if [ -n "$left" ]; then fail "$1 data dir $2 still has: $(echo $left)"
+            else echo "OK: $1: no version dirs, current or install.scope in $2"; fi
+          }
+          check_dir user "$DATA" ""
+          check_dir root /var/lib/seashell sudo
+
+          for f in "$HOME/.local/bin/sea" "$HOME/.local/bin/seashell"; do
+            if [ -e "$f" ] || [ -L "$f" ]; then fail "$f still exists"; fi
+          done
+          for f in /root/.local/bin/sea /root/.local/bin/seashell; do
+            if sudo test -e "$f" || sudo test -L "$f"; then fail "$f still exists"; fi
+          done
+          if grep -qF "$TAG" <<< "$(crontab -l 2>/dev/null || true)"; then fail "user crontab has a '$TAG' line"; fi
+          if grep -qF "$TAG" <<< "$(sudo crontab -l 2>/dev/null || true)"; then fail "root crontab has a '$TAG' line"; fi
+          [ "$FAILED" -ne 0 ] || echo "OK: nothing left"
+          exit $FAILED
+
+      # ── Phase 4: Final verification ────────────────────────────────
+      # Leave the machine with a clean, working SeaShell install of this
+      # build, everything (user + elevator + SYSTEM / user + root).
+      #
+      # The cleanup runs also after a failed or cancelled step (always()), so
+      # a failed job leaves no test service, daemon or task of its own behind.
+      # The reinstall and its checks run only after a passing job: a failed
+      # job's runner is wiped and reinstalled by the next job's Install phase.
 
       - name: "Final: Clean up test services (Windows)"
-        if: matrix.os == 'windows'
+        if: always() && matrix.os == 'windows'
         shell: powershell
         continue-on-error: true
         run: |
-          $ErrorActionPreference = 'SilentlyContinue'
-          taskkill /F /IM seashell-daemon.exe 2>&1 | Out-Null
-          taskkill /F /IM seashell-elevator.exe 2>&1 | Out-Null
-          Get-ScheduledTask -TaskPath '\SeaShell\' 2>&1 | Out-Null
-          if ($?) { Get-ScheduledTask -TaskPath '\SeaShell\' | Unregister-ScheduledTask -Confirm:$false 2>&1 | Out-Null }
+          $ErrorActionPreference = 'Continue'
+          # The service test's service, left when that test failed half-way.
+          if (Get-Service 'seashell-cwd-test' -ErrorAction SilentlyContinue) {
+            sc.exe stop seashell-cwd-test | Out-Null
+            Start-Sleep -Seconds 3
+            sc.exe delete seashell-cwd-test
+          }
+          & ([scriptblock]::Create($env:SEASHELL_CI_CLEANUP_PS1)) -Apply -Tasks
           exit 0
 
       - name: "Final: Clean up test services (Linux)"
-        if: matrix.os == 'linux'
+        if: always() && matrix.os == 'linux'
 
         continue-on-error: true
         run: |
-          sudo pkill -9 -f seashell-daemon || true
-          sudo pkill -9 -f seashell-elevator || true
-          sudo rm -f /tmp/seashell-*.sock
-          rm -f /run/user/$(id -u)/seashell-*.sock 2>/dev/null || true
+          # The service test's service and account, left when that test failed half-way.
+          EXE=./artifacts/service-cwd-test/ServiceCwdTest
+          if [ -x "$EXE" ]; then
+            sudo "$EXE" stop 2>/dev/null || true
+            sleep 2
+            sudo "$EXE" uninstall 2>/dev/null || true
+          fi
+          if id seashell-test-user >/dev/null 2>&1; then
+            sudo userdel seashell-test-user 2>/dev/null || sudo deluser seashell-test-user 2>/dev/null || true
+            sudo delgroup seashell-test-user 2>/dev/null || true
+          fi
+          printf '%s\n' "$SEASHELL_CI_CLEANUP_SH" | sudo bash -s -- apply "$(id -u)" "$(id -un)" "${XDG_DATA_HOME:-$HOME/.local/share}/seashell" \
+            "$GITHUB_WORKSPACE" "${TMPDIR:-/tmp}" "${RUNNER_TEMP:-}"
 
+      # After the uninstall test there is no install and no install.scope:
+      # --all, from the global tool (it carries the archives; ~/.dotnet/tools
+      # is not on the job PATH, hence the full path).
       - name: "Final: Clean reinstall"
 
         run: |
+          VERSION="${{ needs.version.outputs.version }}"
+          if [ "${{ matrix.os }}" = "windows" ]; then
+            TOOL="$(cygpath -u "$USERPROFILE")/.dotnet/tools/seashell.exe"
+            FEED="$(cygpath -m "$(pwd)/nupkg")"
+          else
+            TOOL="$HOME/.dotnet/tools/seashell"
+            FEED="$(pwd)/nupkg"
+          fi
           dotnet tool uninstall -g SeaShell 2>/dev/null || true
-          dotnet tool install -g SeaShell --add-source "$(pwd)/nupkg"
-          seashell install
+          dotnet tool install -g SeaShell --version "$VERSION" --source "$FEED"
+          "$TOOL" install --all
 
       - name: "Final: Verify sea --version"
-        run: sea --version
+        run: |
+          VERSION="${{ needs.version.outputs.version }}"
+          OUT=$(sea --version | tr -d '\r')
+          echo "$OUT"
+          [ "$OUT" = "{~} SeaShell v$VERSION" ] || { echo "FAIL: expected {~} SeaShell v$VERSION"; exit 1; }
 
       - name: "Final: Start daemon and verify status"
 

@@ -129,6 +129,55 @@ model as `dotnet build` and `dotnet run`.
 The background updater downloads packages from configured NuGet sources (including
 private feeds from `nuget.config`). Downloads go through the standard NuGet HTTP API.
 
+## Automatic updates
+
+`seashell update --auto on` (off by default) schedules an unattended daily
+`seashell update`: a task per target on Windows (`SeaShell Update ({user})`,
+with highest privileges when the install has an elevator, and
+`SeaShell Update (SYSTEM)` running as LocalSystem when it has the SYSTEM
+install), a crontab line per identity on Linux (root's for the root install).
+
+New risk with this opt-in: whatever the configured NuGet sources publish as the
+package `SeaShell` — the source stored with `--source`, or the account's own
+NuGet configuration (for SYSTEM / root usually nuget.org only) — is fetched and
+installed without anyone looking, partly elevated and as SYSTEM / root. A
+compromised feed, a hijacked package ID or a malicious CI build on a private
+feed then runs with those privileges on the next update. Package signatures are
+not checked (same as `dotnet tool install`). Enable it only for sources you
+control or trust as much as the account the update runs as, and prefer an
+explicit `--source`. `seashell update --auto off` and `seashell uninstall`
+remove the entries; outcomes are logged to the Event Log (source `SeaShell`) /
+syslog.
+
+The `dotnet` an entry runs is recorded when it is enabled. For the SYSTEM task
+and root's crontab line it must be out of reach of unprivileged users, or any
+process of the enabling user could replace a per-user SDK (`~/.dotnet`,
+`%USERPROFILE%\.dotnet`) and have it run as SYSTEM / root the next night:
+
+- Windows: the muxer must lie under `%ProgramFiles%` (writable by
+  administrators only).
+- Linux: the muxer, resolved through symlinks, and every directory above it must
+  be owned by root and writable by neither group nor others. Root's line sets
+  `DOTNET_ROOT` to that muxer's directory and a fixed minimal `PATH`
+  (`/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin`, each directory
+  checked the same way and left out when it fails), never the user's inherited
+  `PATH`.
+
+When the enabling user's `dotnet` does not qualify, the machine-wide install is
+used instead (Windows `%ProgramFiles%\dotnet\dotnet.exe`; Linux `/usr/bin/dotnet`,
+`/usr/share/dotnet`, `/usr/lib/dotnet`, `/usr/local/bin/dotnet`). When none
+qualifies and has a .NET 10 SDK, the SYSTEM / root entry is not created: the
+user's entry is, the command lists why each candidate was rejected, says to
+install the SDK machine-wide, and exits with code 3. Limitation: only the muxer
+and the directories above it are checked, not the SDK tree below the dotnet
+root; installers and distribution packages make that tree administrator / root
+owned throughout.
+
+The user's own entries keep the user's `dotnet`. The highest-privileges user
+task (scope with an elevator) runs the user's install with the user's elevated
+token — the same trust boundary as the elevator itself, which also runs from
+the user's profile.
+
 ## Recommendations
 
 - **Don't run untrusted scripts.** SeaShell executes arbitrary code with your privileges.

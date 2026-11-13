@@ -1,6 +1,7 @@
 using System;
 using System.Diagnostics;
 using System.IO;
+using System.Linq;
 using System.Runtime.InteropServices;
 using System.Threading.Tasks;
 using System.Xml.Linq;
@@ -222,6 +223,34 @@ public static class DaemonTasks
 		}
 	}
 
+	// ── Automatic update ───────────────────────────────────────────────
+
+	/// <summary>
+	/// Register an automatic-update task (<see cref="AutoUpdatePlan"/>):
+	/// daily, start-when-available, running <paramref name="seashellExe"/> (the
+	/// installed copy in <c>current\bin</c>) with the entry's arguments. The
+	/// user task uses the interactive principal of the daemon task (it runs
+	/// only while the user is logged on), with highest privileges when the
+	/// scope has an elevator; the SYSTEM task runs as S-1-5-18. Registering a
+	/// highest-privileges or SYSTEM task needs elevation.
+	/// </summary>
+	public static bool RegisterUpdateTask(AutoUpdateEntry entry, string seashellExe, SeaShellIdentity user, Action<string>? log)
+	{
+		if (!RequireWindows(log)) return false;
+		var xml = BuildUpdateTaskXml(entry, seashellExe, TaskSid(user));
+		return RegisterTaskFromXml(entry.Name, xml, elevatedContext: entry.System || entry.HighestPrivileges, log);
+	}
+
+	internal static string BuildUpdateTaskXml(AutoUpdateEntry entry, string seashellExe, string userSid) =>
+		BuildTaskXml(seashellExe, WindowsCommandLine.Join(entry.Arguments),
+			principal: entry.System ? TaskPrincipal.System : TaskPrincipal.CurrentUser,
+			trigger: TaskTrigger.Daily,
+			runLevel: entry.HighestPrivileges ? "HighestAvailable" : "LeastPrivilege",
+			description: "SeaShell automatic update (seashell update --auto off removes it)",
+			userSid: userSid,
+			dailyAt: entry.Time,
+			executionTimeLimit: "PT2H");
+
 	// ── Helpers ────────────────────────────────────────────────────────
 
 	private static bool RequireWindows(Action<string>? log)
@@ -234,7 +263,7 @@ public static class DaemonTasks
 	private static (string command, string? arguments) BuildLaunch(string binaryPath)
 	{
 		if (binaryPath.EndsWith(".dll", StringComparison.OrdinalIgnoreCase))
-			return ("dotnet", $"exec \"{binaryPath}\"");
+			return ("dotnet", $"exec {WindowsCommandLine.Quote(binaryPath)}");
 		return (binaryPath, null);
 	}
 
@@ -309,7 +338,7 @@ public static class DaemonTasks
 	// ── Task XML ───────────────────────────────────────────────────────
 
 	internal enum TaskPrincipal { CurrentUser, System }
-	internal enum TaskTrigger { Logon, Boot, None }
+	internal enum TaskTrigger { Logon, Boot, None, Daily }
 
 	internal static string BuildTaskXml(
 		string command,
@@ -318,7 +347,9 @@ public static class DaemonTasks
 		TaskTrigger trigger,
 		string runLevel,
 		string description,
-		string? userSid = null)
+		string? userSid = null,
+		TimeOnly? dailyAt = null,
+		string executionTimeLimit = "PT0S")
 	{
 		XNamespace ns = "http://schemas.microsoft.com/windows/2004/02/mit/task";
 
@@ -351,6 +382,12 @@ public static class DaemonTasks
 				new XElement(ns + "Enabled", "true"),
 				new XElement(ns + "UserId", sid)),
 			TaskTrigger.None => null,
+			// The date only anchors the schedule; StartWhenAvailable catches up a
+			// run missed while the machine was off or the user logged off.
+			TaskTrigger.Daily => new XElement(ns + "CalendarTrigger",
+				new XElement(ns + "StartBoundary", $"2026-01-01T{(dailyAt ?? new TimeOnly(3, 0)):HH:mm}:00"),
+				new XElement(ns + "Enabled", "true"),
+				new XElement(ns + "ScheduleByDay", new XElement(ns + "DaysInterval", "1"))),
 			_ => throw new ArgumentOutOfRangeException(nameof(trigger)),
 		};
 
@@ -377,7 +414,7 @@ public static class DaemonTasks
 					new XElement(ns + "AllowHardTerminate", "true"),
 					new XElement(ns + "StartWhenAvailable", "true"),
 					new XElement(ns + "RunOnlyIfNetworkAvailable", "false"),
-					new XElement(ns + "ExecutionTimeLimit", "PT0S"),
+					new XElement(ns + "ExecutionTimeLimit", executionTimeLimit),
 					new XElement(ns + "AllowStartOnDemand", "true"),
 					new XElement(ns + "Hidden", "false")
 				),

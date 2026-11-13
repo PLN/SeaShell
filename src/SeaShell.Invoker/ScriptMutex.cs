@@ -130,10 +130,7 @@ public sealed class ScriptMutex : IDisposable
 						?? Path.Combine(Path.GetTempPath(), $"runtime-{Environment.UserName}"),
 					"seashell", $"{identity}.lock"),
 			DirectiveScanner.MutexScope.User =>
-				Path.Combine(
-					Environment.GetEnvironmentVariable("XDG_DATA_HOME")
-						?? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".local", "share"),
-					"seashell", "mutex", $"{identity}.lock"),
+				Path.Combine(SeaShellPaths.UserMutexDir(), $"{identity}.lock"),
 			DirectiveScanner.MutexScope.System =>
 				Path.Combine(Path.GetTempPath(), $"seashell-mutex-{identity}.lock"),
 			_ => throw new ArgumentException($"Invalid mutex scope: {scope}")

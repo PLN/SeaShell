@@ -44,6 +44,24 @@ public class CacheKeepAliveTests
 		await keepAlive.DisposeAsync();
 	}
 
+	[Fact]
+	public async Task KeepAlive_ReloadedThroughAnotherDaemon_PingsThatDaemon()
+	{
+		// Reload after a daemon update: the new build is the newer daemon's cache entry
+		var oldAddress = TransportEndpoint.GetDaemonAddress($"test{Guid.NewGuid():N}", "0.0.0.1");
+		var newAddress = TransportEndpoint.GetDaemonAddress($"test{Guid.NewGuid():N}", "0.0.0.2");
+		await using var newDaemon = new TransportServer(newAddress);
+		newDaemon.Start();
+		using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(20));
+
+		var dirB = Path.Combine(Path.GetTempPath(), "entry_bbbbbbbb");
+		await using var keepAlive = await CacheKeepAlive.StartAsync(oldAddress,
+			Compiled(Path.Combine(Path.GetTempPath(), "entry_aaaaaaaa")), touchNow: false, TimeSpan.FromMilliseconds(100), timeout.Token);
+		keepAlive.Update(Compiled(dirB), newAddress);
+
+		Assert.Equal(dirB, await NextTouchAsync(newDaemon, known: true, timeout.Token));
+	}
+
 		private static async Task<string> NextTouchAsync(TransportServer server, bool known, CancellationToken ct)
 	{
 		await using var conn = (await server.AcceptAsync(ct))!;

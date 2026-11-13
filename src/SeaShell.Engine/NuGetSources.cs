@@ -34,6 +34,13 @@ public sealed class NuGetSources
 		_http = http;
 	}
 
+	/// <summary>With a fixed source list instead of nuget.config (null = read nuget.config).</summary>
+	internal NuGetSources(HttpClient http, List<PackageSource>? sources)
+	{
+		_http = http;
+		_sources = sources;
+	}
+
 	/// <summary>Get all configured package sources.</summary>
 	public List<PackageSource> GetSources()
 	{

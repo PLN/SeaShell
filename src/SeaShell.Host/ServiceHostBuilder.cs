@@ -16,7 +16,7 @@ namespace SeaShell.ServiceHost;
 ///   return await new ServiceHostBuilder()
 ///       .ServiceName("myservice")
 ///       .RunScript("main.cs")
-///       .EnableNuGetUpdates(TimeSpan.FromHours(8))
+///       .ReloadOnPackageUpdate()
 ///       .RunAsync(args);
 /// </summary>
 public sealed class ServiceHostBuilder
@@ -29,6 +29,7 @@ public sealed class ServiceHostBuilder
 	private string[]? _scriptArgs;
 	private string? _workingDirectory;
 	private Dictionary<string, string>? _environmentVars;
+	private TimeSpan? _reloadInterval;
 
 	/// <summary>Set the service name (used for registration with the init system).</summary>
 	public ServiceHostBuilder ServiceName(string name) { _serviceName = name; return this; }
@@ -54,6 +55,27 @@ public sealed class ServiceHostBuilder
 		_assemblyPath = assemblyPath;
 		_scriptPath = null;
 		_scriptArgs = args;
+		return this;
+	}
+
+	/// <summary>
+	/// Reload the script when the daemon would now compile it differently — typically after
+	/// the daemon's background updater (every 8 hours) downloaded a newer version of a
+	/// package referenced without a version (<c>//sea_nuget Name</c>). Every
+	/// <paramref name="interval"/> (default: one hour) the service asks the daemon to compile
+	/// the script, a cache hit while nothing changed; when the answer is a different cache
+	/// directory, the running instance is reloaded as by <c>Sea.RequestReload()</c>: it gets
+	/// <c>Sea.Reloading</c> and can hand over state, and the new build starts. An edited
+	/// source file changes the compile result too and is picked up the same way; a compile
+	/// error leaves the running instance alone. Packages with a pinned version never change.
+	/// Off by default. Only for <see cref="RunScript"/>: a binary's compile result does not change.
+	/// </summary>
+	public ServiceHostBuilder ReloadOnPackageUpdate(TimeSpan? interval = null)
+	{
+		var value = interval ?? PackageUpdateReload.DefaultInterval;
+		if (value <= TimeSpan.Zero)
+			throw new ArgumentOutOfRangeException(nameof(interval), value, "The check interval must be positive.");
+		_reloadInterval = value;
 		return this;
 	}
 
@@ -89,6 +111,8 @@ public sealed class ServiceHostBuilder
 	{
 		var targetPath = _scriptPath ?? _assemblyPath
 			?? throw new InvalidOperationException("No script or assembly specified. Call RunScript() or RunAssembly().");
+		if (_reloadInterval != null && _assemblyPath != null)
+			throw new InvalidOperationException("ReloadOnPackageUpdate() applies to RunScript() workloads; a binary's compile result does not change.");
 
 		// Resolve relative script/assembly paths against the exe's directory, not CWD.
 		// When SCM/systemd starts a service, CWD is system32 or / — relative paths
@@ -120,7 +144,7 @@ public sealed class ServiceHostBuilder
 		// Register our worker
 		builder.Services.AddSingleton(new ServiceHostOptions(
 			targetPath, _scriptArgs ?? Array.Empty<string>(),
-			workingDirectory, _environmentVars));
+			workingDirectory, _environmentVars, _reloadInterval));
 		builder.Services.AddHostedService<ServiceHostWorker>();
 
 		var host = builder.Build();
@@ -171,4 +195,5 @@ internal sealed record ServiceHostOptions(
 	string TargetPath,
 	string[] Args,
 	string WorkingDirectory,
-	Dictionary<string, string>? EnvironmentVars);
+	Dictionary<string, string>? EnvironmentVars,
+	TimeSpan? ReloadInterval = null);

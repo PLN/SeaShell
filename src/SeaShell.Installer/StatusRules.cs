@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 
 namespace SeaShell.Installer;
 
@@ -13,6 +14,9 @@ public enum StatusAdvice
 
 	/// <summary>Nothing installed yet.</summary>
 	NotInstalled,
+
+	/// <summary>The installed version is newer than the bootstrapper: nothing to offer.</summary>
+	BootstrapperOlder,
 }
 
 /// <summary>
@@ -44,9 +48,61 @@ public static class StatusRules
 	public static bool TaskVersionDrifts(Version? currentVersion, Version? taskVersion) =>
 		currentVersion != null && taskVersion != null && taskVersion != currentVersion;
 
-	/// <summary>Which closing line the status view should print.</summary>
-	public static StatusAdvice Advise(bool installed, string? installedVersion, string bootstrapperVersion) =>
-		installed && installedVersion != null && installedVersion != bootstrapperVersion
-			? StatusAdvice.UpdateAvailable
-			: installed ? StatusAdvice.UpToDate : StatusAdvice.NotInstalled;
+	/// <summary>
+	/// Which closing line the status view should print. Versions are compared
+	/// as versions: an older bootstrapper (<c>dnx SeaShell@older status</c>)
+	/// must not offer a downgrade as an update.
+	/// </summary>
+	public static StatusAdvice Advise(bool installed, string? installedVersion, string bootstrapperVersion)
+	{
+		if (!installed) return StatusAdvice.NotInstalled;
+		if (!Version.TryParse(installedVersion, out var inst) || !Version.TryParse(bootstrapperVersion, out var mine))
+			return StatusAdvice.UpToDate;
+		return UpdateCheck.IsNewer(mine, inst) ? StatusAdvice.UpdateAvailable
+			: UpdateCheck.IsNewer(inst, mine) ? StatusAdvice.BootstrapperOlder
+			: StatusAdvice.UpToDate;
+	}
+
+	/// <summary>
+	/// The dashboard's closing lines. <paramref name="carries"/>: the
+	/// bootstrapper has an archive of its own to compare with.
+	/// <paramref name="check"/>: the daemon's last release check
+	/// (<c>update.check</c>, see <see cref="UpdateCheck"/>), or null when there
+	/// is none. A release newer than everything here is announced; otherwise a
+	/// check on record means "up to date" as of its time; without one the
+	/// dashboard says how to check.
+	/// </summary>
+	public static IReadOnlyList<string> ClosingLines(
+		bool installed, string? installedVersion, string bootstrapperVersion, bool carries, UpdateCheckInfo? check)
+	{
+		if (!installed) return new[] { "Run 'seashell install' to get started" };
+
+		var lines = new List<string>();
+		var advice = carries ? Advise(installed, installedVersion, bootstrapperVersion) : StatusAdvice.UpToDate;
+		if (advice == StatusAdvice.UpdateAvailable)
+			lines.Add($"Update: v{installedVersion} -> v{bootstrapperVersion}  (run 'seashell update')");
+		else if (advice == StatusAdvice.BootstrapperOlder)
+			lines.Add($"Installed v{installedVersion} is newer than this bootstrapper (v{bootstrapperVersion})");
+
+		var online = check != null
+			&& check.IsNewerThan(installedVersion)
+			&& (!carries || !Version.TryParse(bootstrapperVersion, out var mine) || check.IsNewerThan(mine));
+		if (online)
+			lines.Add($"Update available: v{check!.Latest} (run 'seashell update')");
+		else if (advice == StatusAdvice.UpToDate)
+			lines.Add(check?.CheckedAt is { } at
+				? $"Up to date (checked {at.ToLocalTime():yyyy-MM-dd HH:mm})"
+				: check != null || carries
+					? "Up to date"
+					: "Run 'seashell update' to check online for a newer version");
+		return lines;
+	}
+
+	/// <summary>
+	/// The <c>update:</c> row of <c>sea --status</c>. The dashboard forwards
+	/// that output but says the same thing in its own closing line, so it
+	/// leaves this row out instead of announcing an update twice.
+	/// </summary>
+	public static bool IsUpdateNoticeRow(string seaStatusLine) =>
+		seaStatusLine.TrimStart().StartsWith("update:", StringComparison.Ordinal);
 }

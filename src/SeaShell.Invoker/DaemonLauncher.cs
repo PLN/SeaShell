@@ -17,11 +17,16 @@ public static class DaemonLauncher
 	/// The returned address may differ from the input if a compatible higher-version
 	/// daemon is already running.
 	/// </summary>
-	public static async Task<string?> EnsureRunningAsync(
+	public static Task<string?> EnsureRunningAsync(
 		string? daemonAddress = null,
 		Action<string>? log = null,
 		Action<string>? verboseLog = null,
-		CancellationToken ct = default)
+		CancellationToken ct = default) =>
+		EnsureRunningAsync(daemonAddress, () => DaemonManager.StartDaemon(log, verboseLog), verboseLog, ct);
+
+	// startDaemon: starts a daemon, 0 on success. A cancelled call never gets there.
+	internal static async Task<string?> EnsureRunningAsync(
+		string? daemonAddress, Func<int> startDaemon, Action<string>? verboseLog, CancellationToken ct)
 	{
 		var requestedVersion = TransportEndpoint.CurrentVersion;
 		daemonAddress ??= TransportEndpoint.GetDaemonAddress(
@@ -48,8 +53,9 @@ public static class DaemonLauncher
 			}
 		}
 
-		// 3. No daemon found anywhere — cold start
-		if (DaemonManager.StartDaemon(log, verboseLog) != 0)
+		// 3. No daemon found anywhere — cold start, unless the caller has given up meanwhile
+		ct.ThrowIfCancellationRequested();
+		if (startDaemon() != 0)
 			return null;
 
 		return await PollForDaemonAsync(daemonAddress, requestedVersion, ct);

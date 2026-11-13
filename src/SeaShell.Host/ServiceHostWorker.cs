@@ -10,7 +10,9 @@ namespace SeaShell.ServiceHost;
 
 /// <summary>
 /// BackgroundService that compiles and runs a SeaShell script (or binary),
-/// with crash recovery. NuGet updates are handled by the daemon's 8-hour cycle.
+/// with crash recovery. NuGet updates are downloaded by the daemon's 8-hour cycle; with
+/// <see cref="ServiceHostBuilder.ReloadOnPackageUpdate"/> the running script is reloaded
+/// when one changes what it compiles to.
 /// </summary>
 internal sealed class ServiceHostWorker : BackgroundService
 {
@@ -28,6 +30,20 @@ internal sealed class ServiceHostWorker : BackgroundService
 
 	protected override async Task ExecuteAsync(CancellationToken stoppingToken)
 	{
+		var reloadChecks = Task.CompletedTask;
+		if (_options.ReloadInterval is { } interval)
+		{
+			_logger.LogInformation("Reload on package update: checking every {Interval}", interval);
+			// Its own host, so that a failed check's compile error is logged as a warning
+			var checkHost = new ScriptHost(msg => _logger.LogWarning("Package update check: {Message}", msg));
+			var reload = new PackageUpdateReload(
+				ct => checkHost.CompileAsync(_options.TargetPath, _options.Args, ct),
+				() => _connection.Running,
+				reason => _connection.RequestReload(reason),
+				_logger);
+			reloadChecks = reload.RunAsync(interval, stoppingToken);
+		}
+
 		// Main execution loop with crash recovery
 		while (!stoppingToken.IsCancellationRequested)
 		{
@@ -68,5 +84,7 @@ internal sealed class ServiceHostWorker : BackgroundService
 				catch (OperationCanceledException) { break; }
 			}
 		}
+
+		await reloadChecks;
 	}
 }
